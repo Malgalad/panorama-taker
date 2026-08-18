@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pano-stitch"
+version = "0.1.0"
+description = "Metadata-driven Cyberpunk 2077 panorama stitching tools"
+requires-python = ">=3.12"
+dependencies = [
+  "jsonschema>=4.20",
+  "numpy>=2.0",
+  "opencv-python>=4.10",
+  "pillow>=10.0"
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.10",
+  "pytest>=8",
+  "ruff>=0.6",
+  "types-jsonschema>=4.24"
+]
+
+[project.scripts]
+pano-stitch = "pano_stitch.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

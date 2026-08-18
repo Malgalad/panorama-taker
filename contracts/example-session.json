@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "session_id": "example",
+  "game_version": "development",
+  "red4ext_version": "development",
+  "mod_version": "0.1.0",
+  "created_utc": "2026-08-17T00:00:00Z",
+  "capture_mode": "horizontal",
+  "projection": "rectilinear",
+  "viewport": { "width": 1920, "height": 1080 },
+  "fov": {
+    "horizontal_deg": 100.0,
+    "vertical_deg": 67.67,
+    "source": "configured_value"
+  },
+  "base_pose": {
+    "position": [0.0, 0.0, 0.0],
+    "orientation_xyzw": [0.0, 0.0, 0.0, 1.0]
+  },
+  "planner": {
+    "overlap_fraction": 0.08,
+    "yaw_step_deg": 90.0,
+    "pitch_step_deg": 67.67
+  },
+  "frames": [],
+  "completed": false
+}
