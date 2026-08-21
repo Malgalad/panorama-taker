@@ -3,6 +3,7 @@ from pathlib import Path
 
 import pytest
 
+import pano_stitch.metadata as metadata_module
 from pano_stitch.metadata import CaptureMode, load_session
 from pano_stitch.planner import plan_shots
 
@@ -27,6 +28,14 @@ def test_invalid_session_reports_schema_location(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="viewport.width"):
         load_session(invalid, SCHEMA)
+
+
+def test_frozen_schema_path_uses_pyinstaller_bundle(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(metadata_module.sys, "_MEIPASS", str(tmp_path), raising=False)
+
+    assert metadata_module._default_schema_path() == tmp_path / "contracts" / "session.schema.json"
 
 
 def test_horizontal_plan_closes_without_duplicate_360_degree_pose() -> None:

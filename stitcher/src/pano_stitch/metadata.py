@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path, PureWindowsPath
@@ -61,6 +62,9 @@ def _reject_non_standard_number(value: str) -> None:
 
 
 def _default_schema_path() -> Path:
+    bundled_root = getattr(sys, "_MEIPASS", None)
+    if bundled_root is not None:
+        return Path(bundled_root) / "contracts" / "session.schema.json"
     package_root = Path(__file__).resolve().parents[3]
     return package_root / "contracts" / "session.schema.json"
 

@@ -46,14 +46,12 @@ if (-not (Test-Path $python)) {
 
 $pyInstallerWork = Join-Path $buildRoot "pyinstaller-work"
 $pyInstallerDist = Join-Path $buildRoot "pyinstaller-dist"
+# OpenEXR is loaded dynamically; the remaining runtime libraries are direct imports.
 & $python -m PyInstaller --noconfirm --clean --windowed `
     --name PanoramaCaptureStitcher `
     --workpath $pyInstallerWork `
     --distpath $pyInstallerDist `
-    --collect-all cv2 `
-    --collect-all numpy `
     --collect-all OpenEXR `
-    --collect-all PIL `
     --add-data "$projectRoot\contracts\session.schema.json;contracts" `
     "$projectRoot\stitcher\scripts\pano_stitch_gui.py"
 
@@ -63,12 +61,10 @@ $reshadeDestination = Join-Path $modStage "bin\x64"
 New-Item -ItemType Directory -Force -Path $cetDestination, $reshadeDestination | Out-Null
 Copy-Item "$projectRoot\mod\cet\PanoramaCaptureProbe\init.lua" $cetDestination
 Copy-Item $addon (Join-Path $reshadeDestination "PanoramaCaptureReShade.addon64")
-Copy-Item "$projectRoot\README.md" (Join-Path $modStage "README.md")
+Copy-Item "$projectRoot\README.md" (Join-Path $cetDestination "README.md")
 
 $stitcherStage = Join-Path $buildRoot "PanoramaCapture-Stitcher-$Version-win-x64"
 Copy-Item $pyInstallerDist $stitcherStage -Recurse
-New-Item -ItemType Directory -Force -Path (Join-Path $stitcherStage "contracts") | Out-Null
-Copy-Item "$projectRoot\contracts\session.schema.json" (Join-Path $stitcherStage "contracts")
 Copy-Item "$projectRoot\README.md" (Join-Path $stitcherStage "README.md")
 
 $modArchive = Join-Path $outputRoot "PanoramaCapture-Mod-$Version.zip"
