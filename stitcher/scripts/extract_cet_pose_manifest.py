@@ -18,9 +18,9 @@ POSE_RE = re.compile(
     r"observed_right=\((?P<right>[^)]+)\) "
     r"observed_up=\((?P<up>[^)]+)\) hfov=(?P<hfov>[-+0-9.]+) "
     r"vfov=(?P<vfov>[-+0-9.]+) "
-    r"(?:real_frames=(?P<frames>\d+) )?"
+    r"(?:real_frames=\d+ )?"
     r"settle_seconds=(?P<seconds>[-+0-9.]+) "
-    r"(?:real_fps=(?P<fps>[-+0-9.]+) )?"
+    r"(?:real_fps=[-+0-9.]+ )?"
     r"basis_valid=(?P<valid>true|false)"
 )
 IMAGE_EXTENSIONS = {".exr", ".jpeg", ".jpg", ".png"}
@@ -148,10 +148,6 @@ def build_document(
                 "settle_seconds": float(record["seconds"]),
                 "basis_valid": record["valid"] == "true",
         }
-        if record["frames"] is not None:
-            frame["settled_real_frames"] = int(record["frames"])
-        if record["fps"] is not None:
-            frame["real_fps"] = float(record["fps"])
         frames.append(frame)
     return {
         "schema_version": 1,
@@ -190,8 +186,6 @@ def build_document(
                 "observed_forward": frame["observed_forward"],
                 "observed_right": frame["observed_right"],
                 "observed_up": frame["observed_up"],
-                "settled_real_frames": frame["settled_real_frames"],
-                "real_fps_before_capture": frame["real_fps"],
                 "status": "captured",
             }
             for frame in frames

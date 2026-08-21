@@ -319,3 +319,81 @@ An in-game stock IGCS Connector panorama test completed camera movement and rest
 Scope correction: a horizontal 360-degree band is diagnostic only. The MVP requires a complete 360×180 sphere. The published IGCS Connector ABI has yaw but no pitch command, so IGCS remains a candidate rather than the accepted production backend until Packet 5 proves precise pitch control.
 
 New primary path: use the already working normal FPP yaw/pitch controller outside Photo Mode. Installed CET mods prove access to near-zero time dilation (`SetTimeDilation`/`UnsetTimeDilation`), HUD hiding through `inkHUDLayer` opacity or the `/interface/hud` settings group, and player-renderer hiding by disabling the player puppet's mesh components. Use mesh-component hiding rather than gameplay `SetInvisible`, preserve every component's original enabled state, and re-scan for newly created equipment meshes. Ultra+ additionally demonstrates real-FPS measurement from CET update deltas, frame-generation setting lookup, and optional native presented-FPS measurement. Temporal settling will count at least eight real CET update frames after each final pose write; generated presents do not count. These controls still require a combined in-game visual/restoration test before production capture work. Implementation references and restoration requirements are recorded in `docs/cet-fpp-reference-implementations.md`.
+
+Packet 12 current status (2026-08-21): automatic bounded-memory exposure normalization is implemented for SDR and PQ/Rec.2020 HDR sources. It solves robust overlap-graph luminance gains in a linear-light prepass, applies gains during streaming composition, reports the anchor/edge/gain summary in CLI and GUI, and rejects disconnected or unsampled graphs. Synthetic SDR gain recovery, HDR round-trip, memory, and cancellation tests pass. Native Settings is intentionally limited to the verified settling-delay and ReShade-toast-cooldown controls; capture FoV override and live planned-count controls were removed because the game camera did not reliably accept the override and Native Settings could not update the summary. The active in-game FPP FoV remains authoritative and already drives pose planning correctly across tested aspect ratios.
+
+Packet 12 logging cleanup (2026-08-21): CET per-pose movement, metadata, readiness, acknowledgement, and settling diagnostics are now disabled behind `DEVELOPMENT_MODE`; lifecycle, cancellation, and error messages remain. The ReShade add-on no longer logs routine screenshot request/save messages, retaining startup and timeout/error reporting. The capture-relative CET basis fix is verified in a real render: yaw-zero screen centre now maps to panorama centre rather than a 90-degree world-axis offset. Full review and clean-machine packaged-artifact testing remain release gates.
+
+Packet 12 aspect regression coverage (2026-08-21): projection tests now exercise
+4:3, 16:9, 16:10, 21:9, and 32:9 source geometry, checking finite maps and
+complete full-sphere coverage. The stitcher suite now passes 26 tests. Native
+Windows compilation and in-game verification are intentionally delegated to
+Jenkins after local Windows build directories were removed.
+
+Packet 12 console cleanup v0.1.32 (2026-08-21): routine CET probe transitions,
+pose queueing, readiness, screenshot acknowledgements, and inactive-binding
+messages are disabled unless `DEVELOPMENT_MODE` is enabled. Version/startup,
+session lifecycle, status, and actionable error messages remain visible. This
+keeps normal capture output concise without removing diagnostic data from the
+session JSON or the explicit status binding.
+
+Packet 12 binding cleanup v0.1.33 (2026-08-21): production CET registration
+now exposes only Start and Abort. The environment probe, status, and manual
+advance handlers remain in source but are hidden behind the disabled
+`DEVELOPMENT_MODE` flag for future manual-mode work.
+
+Packet 12 review corrections v0.1.34 (2026-08-21): release captures now reject
+`automatedScreenshots = false` with an explicit development-only diagnostic;
+manual Advance remains unregistered. Terminal pitch-correction exhaustion is
+kept as a normal cancellation error. Completion state is captured before Lua
+session state is cleared, so successful production runs report completion.
+
+Packet 12 completion-state correction v0.1.35 (2026-08-21): restoration now
+distinguishes completed production sessions from incomplete/failed production
+sessions before clearing state; only the former emits the completion message,
+while the latter emits an aborted message.
+
+ReShade add-on reliability review (2026-08-21): in-flight bridge requests now
+receive an error acknowledgement when an effect runtime is destroyed. Worker
+filesystem polling uses non-throwing error-code APIs with rate-limited error
+reporting, acknowledgement files are checked after flush/close before atomic
+publication, and CMake rejects non-64-bit Windows configurations. Native MSVC
+compilation remains a Jenkins verification step.
+
+ReShade contract tests (2026-08-21): added CI/release checks for the 64-bit
+CMake requirement and the add-on bridge failure-handling safeguards. The
+combined Python test suite now passes 28 tests; native compilation and runtime
+behavior remain Jenkins/game acceptance checks.
+
+Capture recovery hardening v0.1.36 (2026-08-21): CET now aborts after a
+bounded ReShade acknowledgement wait, refuses to settle/capture when HUD or
+equipment re-hide fails, and treats any metadata publication failure as
+terminal. Active Native Settings values are copied into the production-session
+snapshot at start. Aborted metadata remains removed in normal builds; setting
+`DEVELOPMENT_MODE` enables incomplete-session metadata, diagnostic logging, and
+development-only bindings together.
+
+Development-mode flag consolidation v0.1.37 (2026-08-21): all CET developer
+facilities now share the single `DEVELOPMENT_MODE` switch.
+
+Packet 12 final review hardening v0.1.38 (2026-08-21): the capture bridge and
+stitcher now have bounded acknowledgement recovery, safe metadata publication,
+and safe add-on worker failure handling. CET treats write or close failures when
+publishing metadata as terminal and preserves manual advance only when the
+single `DEVELOPMENT_MODE` flag is enabled. Release mode still requires automated
+screenshots. The stitcher accepts JPEG inputs as SDR, filters unavailable frames
+before CLI/GUI resource estimates and rendering when incomplete sessions are
+explicitly allowed, and prompts before replacing either the panorama or its
+coverage diagnostic. Version-1 timing/FPS fields remain schema-compatible but
+are deprecated and ignored; active capture timing is seconds-based only.
+
+Current acceptance state (2026-08-21): Ruff, mypy, and the combined stitcher
+and ReShade contract suite pass (31 tests). The latest reviewer pass found no
+remaining actionable correctness issues. Jenkins/native MSVC compilation and
+in-game testing remain the required acceptance gates for a tagged release.
+
+Manual release-build acceptance (2026-08-21): the GitHub Actions Windows
+workflow-dispatch dry run completed successfully. Native MSVC ReShade
+compilation, PyInstaller stitcher bundling, separate mod/stitcher archives,
+archive validation, checksums, and build provenance were verified. No public
+version tag has been created; code review remains the release gate.

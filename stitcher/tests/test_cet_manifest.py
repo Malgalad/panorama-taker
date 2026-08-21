@@ -21,8 +21,8 @@ def _pose_line(index: int = 1, count: int = 1) -> str:
         f"[PanoramaCaptureProbe] POSE_METADATA index={index}/{count} row=0 column=0 "
         "commanded_yaw=0.000000 commanded_pitch=0.000000 "
         "observed_forward=(0.0,1.0,0.0) observed_right=(1.0,0.0,0.0) "
-        "observed_up=(0.0,0.0,1.0) hfov=90.0 vfov=60.0 real_frames=8 "
-        "settle_seconds=1.5 real_fps=60.0 basis_valid=true"
+        "observed_up=(0.0,0.0,1.0) hfov=90.0 vfov=60.0 "
+        "settle_seconds=1.5 basis_valid=true"
     )
 
 

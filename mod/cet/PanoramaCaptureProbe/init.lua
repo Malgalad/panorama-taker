@@ -1,7 +1,20 @@
-local MOD_VERSION = "0.1.31"
+local MOD_VERSION = "0.1.38"
+local DEVELOPMENT_MODE = false
 
 local function log(message)
     print("[PanoramaCaptureProbe] " .. message)
+end
+
+local function devLog(message)
+    if DEVELOPMENT_MODE then
+        log(message)
+    end
+end
+
+local function registerDevelopmentInput(name, description, callback)
+    if DEVELOPMENT_MODE then
+        registerInput(name, description, callback)
+    end
 end
 
 log("reload verification marker v" .. MOD_VERSION)
@@ -21,10 +34,11 @@ local captureConfig = {
     adaptiveYawGuard = 0.05,
     settleSeconds = 1.0,
     screenshotCooldownSeconds = 3.1,
+    screenshotAckTimeoutSeconds = 15.0,
     calibrationFrames = 2,
     pitchToleranceDegrees = 0.25,
     maxPitchCorrections = 3,
-    -- Set true after installing PanoramaCaptureReShade.addon64.
+    -- Release captures require true after installing PanoramaCaptureReShade.addon64.
     automatedScreenshots = true,
     bridgeDirectory = ".",
 }
@@ -68,7 +82,7 @@ local function registerNativeSettings()
     end
 end
 
-log("bridge directory: " .. captureConfig.bridgeDirectory)
+devLog("bridge directory: " .. captureConfig.bridgeDirectory)
 
 local function syncNativeSettings()
     if settingsDraftSettle ~= nil then
@@ -99,6 +113,10 @@ local function configurationError()
         captureConfig.screenshotCooldownSeconds < 0 or captureConfig.screenshotCooldownSeconds > 60 then
         return "screenshotCooldownSeconds must be a finite number in [0, 60]"
     end
+    if not isFiniteNumber(captureConfig.screenshotAckTimeoutSeconds) or
+        captureConfig.screenshotAckTimeoutSeconds < 1 or captureConfig.screenshotAckTimeoutSeconds > 60 then
+        return "screenshotAckTimeoutSeconds must be a finite number in [1, 60]"
+    end
     if not isFiniteNumber(captureConfig.calibrationFrames) or captureConfig.calibrationFrames < 1 or
         captureConfig.calibrationFrames % 1 ~= 0 then
         return "calibrationFrames must be a positive integer"
@@ -111,8 +129,8 @@ local function configurationError()
         captureConfig.maxPitchCorrections % 1 ~= 0 then
         return "maxPitchCorrections must be a non-negative integer"
     end
-    if type(captureConfig.automatedScreenshots) ~= "boolean" then
-        return "automatedScreenshots must be true or false"
+    if not DEVELOPMENT_MODE and captureConfig.automatedScreenshots ~= true then
+        return "automatedScreenshots must remain true; manual mode is development-only"
     end
     if type(captureConfig.bridgeDirectory) ~= "string" or captureConfig.bridgeDirectory == "" then
         return "bridgeDirectory must be a non-empty path"
@@ -175,28 +193,55 @@ end
 
 local function writeSessionMetadata(session, state)
     local temporary = session.metadataPath .. ".tmp"
-    local output = io.open(temporary, "wb")
+    local output, openError = io.open(temporary, "wb")
     if output == nil then
-        log("Metadata warning: cannot open " .. session.metadataPath)
+        log("Metadata warning: cannot open " .. session.metadataPath .. ": " .. tostring(openError))
         return false
     end
-    output:write("{\n", string.format("  \"schema_version\":1,\n  \"session_id\":\"%s\",\n",
-        jsonEscape(session.sessionId)))
-    output:write(string.format("  \"horizontal_fov_deg\":%.9f,\n  \"vertical_fov_deg\":%.9f,\n",
-        session.horizontalFov, session.verticalFov))
-    output:write(string.format("  \"state\":\"%s\",\n  \"poses\":[\n", jsonEscape(state)))
+
+    local function writeChunk(...)
+        local result, writeError = output:write(...)
+        if result == nil then
+            log("Metadata warning: cannot write " .. session.metadataPath .. ": " .. tostring(writeError))
+            return false
+        end
+        return true
+    end
+
+    if not writeChunk("{\n", string.format("  \"schema_version\":1,\n  \"session_id\":\"%s\",\n",
+        jsonEscape(session.sessionId))) or
+        not writeChunk(string.format("  \"horizontal_fov_deg\":%.9f,\n  \"vertical_fov_deg\":%.9f,\n",
+            session.horizontalFov, session.verticalFov)) or
+        not writeChunk(string.format("  \"state\":\"%s\",\n  \"poses\":[\n", jsonEscape(state))) then
+        output:close()
+        os.remove(temporary)
+        return false
+    end
     for index, record in ipairs(session.metadataRecords) do
-        output:write(string.format(
+        if not writeChunk(string.format(
             "    {\"index\":%d,\"row\":%d,\"column\":%d,\"commanded_yaw_deg\":%.9f," ..
             "\"commanded_pitch_deg\":%.9f,\"observed_pitch_deg\":%.9f,\"forward\":%s," ..
             "\"right\":%s,\"up\":%s,\"settle_seconds\":%.6f,\"screenshot_path\":\"%s\"}%s\n",
             record.index, record.row, record.column, record.commandedYaw, record.commandedPitch,
             record.observedPitch, vectorJson(record.forward), vectorJson(record.right),
             vectorJson(record.up), record.settleSeconds, jsonEscape(record.screenshotPath),
-            index < #session.metadataRecords and "," or ""))
+            index < #session.metadataRecords and "," or "")) then
+            output:close()
+            os.remove(temporary)
+            return false
+        end
     end
-    output:write("  ]\n}\n")
-    output:close()
+    if not writeChunk("  ]\n}\n") then
+        output:close()
+        os.remove(temporary)
+        return false
+    end
+    local closed, closeError = output:close()
+    if not closed then
+        os.remove(temporary)
+        log("Metadata warning: cannot close " .. session.metadataPath .. ": " .. tostring(closeError))
+        return false
+    end
     os.remove(session.metadataPath)
     local renamed = os.rename(temporary, session.metadataPath)
     if not renamed then
@@ -210,6 +255,16 @@ end
 local function discardSessionMetadata(session)
     os.remove(session.metadataPath)
     os.remove(session.metadataPath .. ".tmp")
+end
+
+local function finalizeAbortedSessionMetadata(session)
+    if DEVELOPMENT_MODE then
+        if not writeSessionMetadata(session, "aborted") then
+            discardSessionMetadata(session)
+        end
+    else
+        discardSessionMetadata(session)
+    end
 end
 
 local function discardBridgeFiles()
@@ -679,7 +734,7 @@ local function logPoseMetadata(session, pose, observed)
     local f = observed.forward
     local r = observed.right
     local u = observed.up
-    log(string.format(
+    devLog(string.format(
         "POSE_METADATA index=%d/%d row=%d column=%d commanded_yaw=%.6f commanded_pitch=%.6f " ..
         "observed_forward=(%.9f,%.9f,%.9f) observed_right=(%.9f,%.9f,%.9f) " ..
         "observed_up=(%.9f,%.9f,%.9f) hfov=%.9f vfov=%.9f settle_seconds=%.6f " ..
@@ -707,14 +762,14 @@ local function applyPose(snapshot, yawDegrees)
     snapshot.waitFrames = 2
 end
 
-registerInput("panorama_capture_probe_environment", "Panorama: probe FPP capture environment", function(down)
+registerDevelopmentInput("panorama_capture_probe_environment", "Panorama: probe FPP capture environment", function(down)
     if not down then
         return
     end
 
     if environmentSequence ~= nil then
         environmentSequence.restoreRequested = true
-        log("Environment probe: restore queued; release the camera after the next update.")
+        devLog("Environment probe: restore queued; release the camera after the next update.")
         return
     end
     local configError = configurationError()
@@ -784,12 +839,12 @@ registerInput("panorama_capture_probe_environment", "Panorama: probe FPP capture
     end
     applyPose(environmentSequence, environmentSequence.originalYaw + environmentSequence.targetYaw)
     environmentSequence.state = "rotated_pending"
-    log("Environment probe active; press the same hotkey to restore.")
+    devLog("Environment probe active; press the same hotkey to restore.")
 end)
 
 local function startProductionSession()
     if productionSession ~= nil or environmentSequence ~= nil then
-        log("Production session already active.")
+        devLog("Production session already active.")
         return
     end
     syncNativeSettings()
@@ -880,15 +935,27 @@ local function startProductionSession()
         sessionId = sessionId,
         horizontalFov = horizontal,
         verticalFov = vertical,
+        settleSeconds = captureConfig.settleSeconds,
+        screenshotCooldownSeconds = captureConfig.screenshotCooldownSeconds,
+        screenshotAckTimeoutSeconds = captureConfig.screenshotAckTimeoutSeconds,
         lastSettleSeconds = 0.0,
         pitchCorrection = 0.0,
         awaitingScreenshot = false,
+        screenshotWaitElapsed = 0.0,
         screenshotCooldownRemaining = 0.0,
         metadataPath = bridgeFile("pano-" .. sessionId .. ".json"),
         metadataRecords = {},
         pendingMetadata = nil,
+        metadataFailed = false,
     }
-    writeSessionMetadata(productionSession, "active")
+    if not writeSessionMetadata(productionSession, "active") then
+        discardSessionMetadata(productionSession)
+        restoreEnvironmentControls(environmentSequence)
+        environmentSequence = nil
+        productionSession = nil
+        log("Production session cancelled: initial metadata publication failed.")
+        return
+    end
     applyPose(environmentSequence, environmentSequence.originalYaw + firstPose.yaw)
     environmentSequence.state = "pitch_calibration_pending"
     log(string.format("Production session started: %d poses, %dx%d, HFoV=%.3f VFoV=%.3f, adaptive yaw guard=%.1f%%.",
@@ -901,7 +968,7 @@ local function queueNextProductionPose()
     end
     if productionSession.index >= #productionSession.plan.poses then
         environmentSequence.restoreRequested = true
-        log("Production session: final screenshot acknowledged; restoration queued.")
+        devLog("Production session: final screenshot acknowledged; restoration queued.")
         return
     end
     productionSession.index = productionSession.index + 1
@@ -914,7 +981,7 @@ local function queueNextProductionPose()
     environmentSequence.settleElapsed = 0.0
     environmentSequence.state = "rotated_pending"
     applyPose(environmentSequence, environmentSequence.originalYaw + pose.yaw)
-    log(string.format("Production pose %d/%d queued: row=%d column=%d yaw=%.3f pitch=%.3f.",
+    devLog(string.format("Production pose %d/%d queued: row=%d column=%d yaw=%.3f pitch=%.3f.",
         productionSession.index, #productionSession.plan.poses,
         pose.row, pose.column, pose.yaw, pose.pitch))
 end
@@ -925,20 +992,20 @@ registerInput("panorama_capture_start", "Panorama: start full-sphere pose sessio
     end
 end)
 
-registerInput("panorama_capture_advance", "Panorama: advance full-sphere pose", function(down)
+registerDevelopmentInput("panorama_capture_advance", "Panorama: advance full-sphere pose", function(down)
     if not down then
         return
     end
     if productionSession == nil or environmentSequence == nil then
-        log("No production session is active.")
+        devLog("No production session is active.")
         return
     end
     if captureConfig.automatedScreenshots then
-        log("Automated screenshot mode is active; ReShade acknowledgement advances the pose.")
+        devLog("Automated screenshot mode is active; ReShade acknowledgement advances the pose.")
         return
     end
     if environmentSequence.state ~= "active" then
-        log("Production pose is not settled; wait for the ready log.")
+        devLog("Production pose is not settled; wait for the ready log.")
         return
     end
     queueNextProductionPose()
@@ -966,7 +1033,8 @@ local function reportStatus()
     if environmentSequence == nil then
         log(string.format(
             "Status: idle; %s; overlap=%.1f%% settle=%.2fs.",
-            fovStatus, captureConfig.overlap * 100.0, captureConfig.settleSeconds))
+        fovStatus, captureConfig.overlap * 100.0,
+        productionSession and productionSession.settleSeconds or captureConfig.settleSeconds))
         return
     end
 
@@ -981,7 +1049,7 @@ local function reportStatus()
         sequence.state, poseStatus, fovStatus, remainingSeconds))
 end
 
-registerInput("panorama_capture_status", "Panorama: report capture status", function(down)
+registerDevelopmentInput("panorama_capture_status", "Panorama: report capture status", function(down)
     if down then
         reportStatus()
     end
@@ -993,7 +1061,7 @@ local function abortEnvironment(reason)
     end
     discardBridgeFiles()
     if productionSession ~= nil then
-        discardSessionMetadata(productionSession)
+        finalizeAbortedSessionMetadata(productionSession)
     end
     restoreEnvironmentControls(environmentSequence)
     environmentSequence = nil
@@ -1024,8 +1092,9 @@ local function requestProductionScreenshot()
         return
     end
     productionSession.awaitingScreenshot = true
+    productionSession.screenshotWaitElapsed = 0.0
     environmentSequence.state = "awaiting_screenshot"
-    log(string.format("Production pose ready: %d/%d; ReShade screenshot requested.",
+    devLog(string.format("Production pose ready: %d/%d; ReShade screenshot requested.",
         productionSession.index, #productionSession.plan.poses))
 end
 
@@ -1049,8 +1118,18 @@ registerForEvent("onUpdate", function(deltaTime)
                 productionSession.screenshotCooldownRemaining - deltaTime)
         end
         if productionSession ~= nil and productionSession.awaitingScreenshot then
-            local acknowledgement = readBridgeAck()
-            if acknowledgement ~= nil then
+            if type(deltaTime) == "number" and deltaTime > 0 then
+                productionSession.screenshotWaitElapsed =
+                    productionSession.screenshotWaitElapsed + deltaTime
+            end
+            if productionSession.screenshotWaitElapsed >= productionSession.screenshotAckTimeoutSeconds then
+                productionSession.awaitingScreenshot = false
+                discardBridgeFiles()
+                log("Production session cancelled: ReShade screenshot acknowledgement timed out.")
+                environmentSequence.restoreRequested = true
+            else
+                local acknowledgement = readBridgeAck()
+                if acknowledgement ~= nil then
                 local poseMatches = acknowledgement.poseIndex == productionSession.index
                 local sessionMatches = acknowledgement.sessionId == productionSession.sessionId
                 local tokenMatches = acknowledgement.token == string.format("pano-%s-%03d",
@@ -1059,7 +1138,6 @@ registerForEvent("onUpdate", function(deltaTime)
                     productionSession.awaitingScreenshot = false
                     if acknowledgement.path:sub(1, 6) == "ERROR:" then
                         log("Production session cancelled: ReShade bridge error " .. acknowledgement.path)
-                        discardSessionMetadata(productionSession)
                         discardBridgeFiles()
                         environmentSequence.restoreRequested = true
                     else
@@ -1070,19 +1148,26 @@ registerForEvent("onUpdate", function(deltaTime)
                             productionSession.pendingMetadata = nil
                         end
                         local completed = productionSession.index >= #productionSession.plan.poses
-                        writeSessionMetadata(productionSession, completed and "completed" or "active")
-                        log(string.format("Production screenshot acknowledged: pose %d/%d path=%s",
-                            productionSession.index, #productionSession.plan.poses, acknowledgement.path))
-                        if completed then
-                            queueNextProductionPose()
+                        local metadataState = completed and "completed" or "active"
+                        if not writeSessionMetadata(productionSession, metadataState) then
+                            productionSession.metadataFailed = true
+                            log("Production session cancelled: metadata publication failed.")
+                            environmentSequence.restoreRequested = true
                         else
-                            productionSession.screenshotCooldownRemaining =
-                                captureConfig.screenshotCooldownSeconds
-                            queueNextProductionPose()
+                            devLog(string.format("Production screenshot acknowledged: pose %d/%d path=%s",
+                                productionSession.index, #productionSession.plan.poses, acknowledgement.path))
+                            if completed then
+                                queueNextProductionPose()
+                            else
+                                productionSession.screenshotCooldownRemaining =
+                                    productionSession.screenshotCooldownSeconds
+                                queueNextProductionPose()
+                            end
                         end
                     end
                 else
-                    log("Production screenshot acknowledgement ignored: request identity mismatch.")
+                    devLog("Production screenshot acknowledgement ignored: request identity mismatch.")
+                end
                 end
             end
         end
@@ -1126,10 +1211,14 @@ registerForEvent("onUpdate", function(deltaTime)
             local meshesHidden, meshError = hideCaptureMeshes(environmentSequence)
             if not hidden or not meshesHidden then
                 log("Environment probe: transition re-hide failed: " .. tostring(hideError or meshError))
+                environmentSequence.restoreRequested = true
+                environmentSequence.state = "active"
+            else
+                environmentSequence.state = "settling"
+                environmentSequence.settleElapsed = 0.0
+                environmentSequence.settleSecondsRequired = productionSession and
+                    productionSession.settleSeconds or captureConfig.settleSeconds
             end
-            environmentSequence.state = "settling"
-            environmentSequence.settleElapsed = 0.0
-            environmentSequence.settleSecondsRequired = captureConfig.settleSeconds
         elseif environmentSequence.state == "settling" then
             if type(deltaTime) == "number" and deltaTime > 0 then
                 environmentSequence.settleElapsed = environmentSequence.settleElapsed + deltaTime
@@ -1165,7 +1254,7 @@ registerForEvent("onUpdate", function(deltaTime)
                                     productionSession.pitchCorrection
                                 environmentSequence.pitchCorrectionPending = true
                                 environmentSequence.state = "rotated_pending"
-                                log(string.format(
+                                devLog(string.format(
                                     "Production pose %d pitch correction %d/%d: observed=%.3f target=%.3f command=%.3f.",
                                     productionSession.index, environmentSequence.pitchCorrections,
                                     captureConfig.maxPitchCorrections, observed.pitch,
@@ -1173,7 +1262,7 @@ registerForEvent("onUpdate", function(deltaTime)
                             end
                         elseif environmentSequence.pitchCorrectionPending then
                             environmentSequence.pitchCorrectionPending = false
-                            environmentSequence.settleSecondsRequired = captureConfig.settleSeconds
+                            environmentSequence.settleSecondsRequired = productionSession.settleSeconds
                             environmentSequence.settleElapsed = 0.0
                             environmentSequence.state = "settling"
                         else
@@ -1185,7 +1274,7 @@ registerForEvent("onUpdate", function(deltaTime)
                                     requestProductionScreenshot()
                                 end
                             else
-                                log(string.format(
+                                devLog(string.format(
                                     "Production pose ready: %d/%d; capture screenshot, then advance.",
                                     productionSession.index, #productionSession.plan.poses))
                                 environmentSequence.state = "active"
@@ -1193,7 +1282,7 @@ registerForEvent("onUpdate", function(deltaTime)
                         end
                     end
                 else
-                    log(string.format("Environment probe settled: settle_seconds=%.3f",
+                    devLog(string.format("Environment probe settled: settle_seconds=%.3f",
                         environmentSequence.settleElapsed))
                     environmentSequence.state = "active"
                 end
@@ -1207,20 +1296,35 @@ registerForEvent("onUpdate", function(deltaTime)
             environmentSequence.waitFrames = 2
             environmentSequence.state = "restore_correcting"
         elseif environmentSequence.state == "restore_correcting" then
+            local wasProductionSession = productionSession ~= nil
+            local completedProductionSession = false
             if productionSession ~= nil then
-                local completed = productionSession.index >= #productionSession.plan.poses and
+                local completed = not productionSession.metadataFailed and
+                    productionSession.index >= #productionSession.plan.poses and
                     productionSession.pendingMetadata == nil
+                completedProductionSession = completed
                 if completed then
-                    writeSessionMetadata(productionSession, "completed")
+                    if not writeSessionMetadata(productionSession, "completed") then
+                        productionSession.metadataFailed = true
+                        completedProductionSession = false
+                        log("Production session aborted: final metadata publication failed.")
+                        discardSessionMetadata(productionSession)
+                    end
                 else
-                    discardSessionMetadata(productionSession)
+                    finalizeAbortedSessionMetadata(productionSession)
                     discardBridgeFiles()
                 end
             end
             restoreEnvironmentControls(environmentSequence)
             environmentSequence = nil
             productionSession = nil
-            log("Environment probe: complete.")
+            if completedProductionSession then
+                log("Production session completed.")
+            elseif wasProductionSession then
+                log("Production session aborted.")
+            else
+                devLog("Environment probe: complete.")
+            end
         end
     end
 

@@ -7,7 +7,12 @@ import sys
 from fractions import Fraction
 from pathlib import Path
 
-from pano_stitch.compositor import estimate_render_resources, render_session, validate_images
+from pano_stitch.compositor import (
+    estimate_render_resources,
+    render_session,
+    renderable_session,
+    validate_images,
+)
 from pano_stitch.metadata import load_session
 
 
@@ -95,6 +100,7 @@ def main() -> None:
         session = load_session(session_path, image_directory=image_root)
         validate_images(session, image_root, arguments.allow_incomplete)
         if arguments.command == "render":
+            session = renderable_session(session, image_root, arguments.allow_incomplete)
             memory_budget_bytes = arguments.memory_budget_mib * 1024 * 1024
             render_width = arguments.width
             if arguments.resolution != 1:

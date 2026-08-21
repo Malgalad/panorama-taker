@@ -43,9 +43,9 @@ jobs:
       - name: Run stitcher checks
         shell: pwsh
         run: |
-          ruff check stitcher/src stitcher/scripts stitcher/tests
+          ruff check stitcher/src stitcher/scripts stitcher/tests reshade-addon/tests
           mypy stitcher/src
-          pytest -q stitcher/tests
+          pytest -q stitcher/tests reshade-addon/tests
       - name: Build ReShade add-on
         shell: pwsh
         run: |

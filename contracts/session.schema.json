@@ -67,6 +67,7 @@
       }
     },
     "render_timing": {
+      "description": "Deprecated v1 timing metadata retained for compatibility.",
       "type": "object",
       "additionalProperties": false,
       "properties": {
@@ -172,8 +173,15 @@
         "observed_up": { "$ref": "#/$defs/vector3" },
         "view_matrix_row_major": { "$ref": "#/$defs/matrix16" },
         "projection_matrix_row_major": { "$ref": "#/$defs/matrix16" },
-        "settled_real_frames": { "type": "integer", "minimum": 0 },
-        "real_fps_before_capture": { "$ref": "#/$defs/finiteNumber" },
+        "settled_real_frames": {
+          "description": "Deprecated v1 timing metadata retained for compatibility.",
+          "type": "integer",
+          "minimum": 0
+        },
+        "real_fps_before_capture": {
+          "description": "Deprecated v1 timing metadata retained for compatibility.",
+          "$ref": "#/$defs/finiteNumber"
+        },
         "status": { "enum": ["planned", "captured", "failed"] }
       }
     }

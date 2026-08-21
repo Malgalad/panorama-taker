@@ -30,6 +30,34 @@ def test_invalid_session_reports_schema_location(tmp_path: Path) -> None:
         load_session(invalid, SCHEMA)
 
 
+def test_version_one_timing_metadata_remains_accepted(tmp_path: Path) -> None:
+    document = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    document["render_timing"] = {
+        "required_real_settle_frames": 8,
+        "real_fps_at_start": 60.0,
+        "presented_fps_at_start": 120.0,
+        "frame_generation": {"enabled": True, "active_backend": "DLSS"},
+    }
+    document["frames"] = [
+        {
+            "index": 0,
+            "filename": "legacy.png",
+            "yaw_deg": 0.0,
+            "pitch_deg": 0.0,
+            "roll_deg": 0.0,
+            "settled_real_frames": 8,
+            "real_fps_before_capture": 60.0,
+            "status": "captured",
+        }
+    ]
+    legacy = tmp_path / "legacy-v1.json"
+    legacy.write_text(json.dumps(document), encoding="utf-8")
+
+    session = load_session(legacy, SCHEMA)
+
+    assert session.frames[0].filename == "legacy.png"
+
+
 def test_frozen_schema_path_uses_pyinstaller_bundle(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

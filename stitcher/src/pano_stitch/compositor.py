@@ -10,7 +10,7 @@ import tempfile
 import zlib
 from collections.abc import Callable
 from contextlib import nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib import import_module
 from pathlib import Path
 from threading import Event
@@ -266,6 +266,10 @@ def _probe_source(path: Path) -> SourceInfo:
         finally:
             image.close()
         return SourceInfo(width, height, ImageEncoding("float32", "rec2020", "linear", 203.0))
+    if suffix in {".jpg", ".jpeg"}:
+        with Image.open(path) as image:
+            width, height = image.size
+        return SourceInfo(width, height, ImageEncoding("uint8", "srgb", "srgb"))
     raise ValueError(f"unsupported source image format: {path.suffix}")
 
 
@@ -302,11 +306,19 @@ def _read_exr(path: Path) -> FloatImage:
     return values
 
 
+def _read_jpeg(path: Path) -> FloatImage:
+    with Image.open(path) as image:
+        rgb = np.asarray(image.convert("RGB"), dtype=np.float32) / np.float32(255.0)
+    return _srgb_to_linear(rgb)
+
+
 def _read_source(path: Path, encoding: ImageEncoding) -> FloatImage:
     if path.suffix.lower() == ".png":
         return _read_png(path, encoding)
     if path.suffix.lower() == ".exr":
         return _read_exr(path)
+    if path.suffix.lower() in {".jpg", ".jpeg"}:
+        return _read_jpeg(path)
     raise ValueError(f"unsupported source image format: {path.suffix}")
 
 
@@ -548,6 +560,23 @@ def _source_info_for_session(session: SessionMetadata, image_root: Path) -> Sour
     return first_source
 
 
+def renderable_session(
+    session: SessionMetadata, image_root: Path, allow_incomplete: bool = False
+) -> SessionMetadata:
+    """Return only captured, available frames when rendering an incomplete session."""
+
+    if not allow_incomplete:
+        return session
+    frames = tuple(
+        frame
+        for frame in session.frames
+        if frame.status == "captured" and _image_path(image_root, frame.filename).is_file()
+    )
+    if not frames:
+        raise ValueError("incomplete session contains no captured source images")
+    return replace(session, frames=frames)
+
+
 def estimate_render_resources(
     session: SessionMetadata,
     image_root: Path,
@@ -590,6 +619,8 @@ def render_session(
         not session.completed or any(frame.status != "captured" for frame in session.frames)
     ):
         raise ValueError("session contains frames that are not captured")
+
+    session = renderable_session(session, image_root, allow_incomplete)
 
     first_source = _source_info_for_session(session, image_root)
     output_suffix = output_path.suffix.lower()
@@ -783,6 +814,8 @@ def validate_images(
     for filename in filenames:
         path = filename if filename.is_absolute() else image_root / filename
         if not path.is_file():
+            if allow_incomplete:
+                continue
             raise ValueError(f"missing source image: {filename}")
         try:
             _probe_source(path)

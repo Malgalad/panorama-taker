@@ -81,7 +81,23 @@ void write_ack(const BridgeCompletion &completion)
     }
     output << "1\t" << completion.request.session << '\t' << completion.request.pose << '\t'
            << completion.request.token << '\t' << completion.path << '\n';
+    output.flush();
+    if (!output)
+    {
+        log_error("PanoramaCaptureReShade: failed writing bridge acknowledgement file");
+        output.close();
+        std::error_code cleanup_error;
+        std::filesystem::remove(temporary, cleanup_error);
+        return;
+    }
     output.close();
+    if (!output)
+    {
+        log_error("PanoramaCaptureReShade: failed closing bridge acknowledgement file");
+        std::error_code cleanup_error;
+        std::filesystem::remove(temporary, cleanup_error);
+        return;
+    }
     std::error_code error;
     std::filesystem::remove(g_bridge_ack_path, error);
     std::filesystem::rename(temporary, g_bridge_ack_path, error);
@@ -91,6 +107,7 @@ void write_ack(const BridgeCompletion &completion)
 
 void bridge_worker_loop()
 {
+    bool poll_error_reported = false;
     while (true)
     {
         std::optional<BridgeCompletion> completion;
@@ -107,7 +124,21 @@ void bridge_worker_loop()
         if (completion.has_value())
             write_ack(*completion);
 
-        if (std::filesystem::exists(g_bridge_request_path))
+        std::error_code poll_error;
+        const bool request_exists = std::filesystem::exists(g_bridge_request_path, poll_error);
+        if (poll_error)
+        {
+            if (!poll_error_reported)
+            {
+                const std::string message =
+                    "PanoramaCaptureReShade: bridge request polling failed: " + poll_error.message();
+                log_error(message.c_str());
+                poll_error_reported = true;
+            }
+            continue;
+        }
+        poll_error_reported = false;
+        if (request_exists)
         {
             std::ifstream input(g_bridge_request_path, std::ios::binary);
             std::string line;
@@ -151,6 +182,11 @@ void on_destroy_runtime(reshade::api::effect_runtime *runtime)
     auto *expected = runtime;
     g_runtime.compare_exchange_strong(expected, nullptr, std::memory_order_acq_rel);
     std::lock_guard lock(g_mutex);
+    if (g_bridge_request.has_value())
+    {
+        g_completion = BridgeCompletion {*g_bridge_request, "ERROR:runtime_destroyed"};
+        g_worker_wakeup.notify_one();
+    }
     g_bridge_request.reset();
     g_pending = false;
     g_token.clear();
@@ -199,10 +235,6 @@ void on_present(reshade::api::effect_runtime *runtime)
     if (bridge)
     {
         runtime->save_screenshot(request_token.c_str());
-        char message[256] = {};
-        std::snprintf(message, sizeof(message),
-            "PanoramaCaptureReShade: bridge screenshot requested token=%s", request_token.c_str());
-        log_info(message);
         return;
     }
 
@@ -224,10 +256,6 @@ void on_present(reshade::api::effect_runtime *runtime)
         g_pending = true;
     }
     runtime->save_screenshot(request_token.c_str());
-    char message[128] = {};
-    std::snprintf(message, sizeof(message),
-        "PanoramaCaptureReShade: screenshot requested token=%s", request_token.c_str());
-    log_info(message);
 }
 
 void on_screenshot(reshade::api::effect_runtime *runtime, const char *path)
@@ -247,10 +275,6 @@ void on_screenshot(reshade::api::effect_runtime *runtime, const char *path)
         g_worker_wakeup.notify_one();
         return;
     }
-    char message[1024] = {};
-    std::snprintf(message, sizeof(message),
-        "PanoramaCaptureReShade: screenshot saved token=%s path=%s", g_token.c_str(), saved_path.c_str());
-    log_info(message);
     g_pending = false;
     g_token.clear();
 }

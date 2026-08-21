@@ -755,7 +755,10 @@ Acceptance:
 - Repeated commands cannot corrupt state.
 - Changing the frame-generation multiplier cannot shorten the required real-frame settling interval.
 
-Current result (2026-08-21): Packet 6 is accepted. Start, Advance, Abort, FoV-derived adaptive planning, 1.5-second/eight-real-frame settling, observed pose/FoV metadata, readiness gating, validated user-editable capture settings, configurable CET bindings, and an explicit Status binding are operational. Status was tested idle, during settling, and after abort; zero-pitch calibration eliminated the prior routine first-pose correction. Further frontend presentation is release polish, not a packet gate.
+Current result (2026-08-21): Packet 6 development controls were verified. Release
+registration retains only Start and Abort; manual Advance and Status remain
+source-only development handlers. FoV-derived planning, settling, observed
+pose/FoV metadata, readiness gating, and zero-pitch calibration are operational.
 
 ### Packet 7: manual capture sessions
 
@@ -790,8 +793,9 @@ file fallback. CET writes `PanoramaCaptureBridge.request` as
 consumes that record on a worker thread, invokes `save_screenshot(token)` from
 `reshade_present`, and publishes `PanoramaCaptureBridge.ack` as
 `1<TAB>session<TAB>pose<TAB>token<TAB>exact-path` after the screenshot event.
-The CET option is opt-in (`automatedScreenshots = false` by default), so the
-manual path remains the safe fallback while the in-game bridge is validated.
+Release captures require `automatedScreenshots = true`; the manual advance
+handler remains source-only development scaffolding and is not registered in
+the shipped CET surface.
 
 Deliverables:
 
@@ -993,24 +997,18 @@ mod retains its built-in defaults and capture remains usable.
 
 When present, register a `Panorama Capture` tab and `Capture` subcategory with:
 
-- `Capture horizontal FoV`: 70–100 degrees, step 5, default 90. It temporarily
-  changes only the capture camera and restores the exact previous FoV at session
-  end or abort. The labels use the game-slider horizontal FoV convention; the
-  implementation converts it to the active camera's vertical FoV using the
-  current aspect ratio. Never assume 16:9.
-- `Estimated capture plan`: a dynamically rebuilt Native Settings summary
- control showing the plan calculated from the selected FoV and current aspect
-  ratio, for example `16 screenshots (5 × 4)`. Recalculate it after each FoV
-  change; display an explicit unavailable state if the active camera aspect
-  ratio cannot be read.
+- The active in-game FPP FoV remains authoritative. A capture-only FoV override
+  and live planned-count control were prototyped but removed because the game
+  camera did not reliably accept the override and Native Settings could not
+  update the summary safely.
 - `Settling delay`: 0.1–3.0 seconds, step 0.1, default 1.0. It is the time
   after a verified camera move and before a screenshot request, for temporal
   accumulation; it does not delay pitch-correction attempts.
-- `Apply capture settings` button: validates and saves the draft settings only
-  while idle. Active sessions retain their immutable start-of-session snapshot.
-- `Restore capture defaults` button and Native Settings restore-defaults hook:
-  reset both controls to the values above, update the UI, and save only while
-  idle.
+- `ReShade toast cooldown`: 3.1 seconds by default, ensuring the screenshot
+  notification has expired before the next request. Camera rotation and
+  temporal settling overlap this cooldown.
+- Native Settings restore-defaults resets these controls while idle. Active
+  sessions retain their immutable start-of-session snapshot.
 
 Persist settings atomically in the existing relative bridge/runtime directory;
 never hard-code a game installation path. First prove `gameFPPCameraComponent`
@@ -1030,8 +1028,8 @@ different recomputed screenshot count where geometry requires one.
 #### 12C. User-facing logs and three-part review
 
 - CET console: production capture emits only session started, completed,
-  aborted, or errored messages. The explicit status hotkey retains its requested
-  one-line report. Per-pose motion, metadata, bridge acknowledgements, and HUD
+  aborted, or errored messages. Per-pose motion, metadata, bridge
+  acknowledgements, and HUD
   internals move behind a disabled development-only logger; metadata JSON is the
   authoritative per-pose record.
 - ReShade add-on: retain startup and error/timeout logging; remove routine
@@ -1050,9 +1048,9 @@ Acceptance:
   deterministic SDR conversions.
 - The exposure prepass stays within the established memory ceiling and refuses
   insufficient coverage with a clear diagnostic.
-- With Native Settings installed, both controls and the recomputed plan summary
-  apply only to the next capture, restore correctly after complete/abort/reload,
-  and reset to defaults. Without it, capture works unchanged.
+- With Native Settings installed, settling and toast-cooldown controls apply to
+  the next capture, restore correctly after complete/abort/reload, and reset to
+  defaults. Without it, capture works unchanged.
 - 4:3, 16:9, 16:10, 21:9, and 32:9 captures use their recorded camera aspect
   without cropping or 16:9-specific plan assumptions.
 - The normal CET console contains no per-pose spam, while development logs and

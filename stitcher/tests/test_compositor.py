@@ -124,12 +124,7 @@ def test_full_sphere_render_has_coverage_and_expected_directions(tmp_path: Path)
         assert np.all(np.asarray(coverage) == 255)
 
     directions = np.array(
-        [
-            [0.0, 0.0, 1.0],
-            [1.0, 0.0, 0.0],
-            [0.0, 1.0, 0.0],
-            [0.0, -1.0, 0.0],
-        ],
+        [[0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, -1.0, 0.0]],
         dtype=np.float32,
     )
     expected = np.clip((directions + 1.0) * 110.0 + 20.0, 0, 255)
@@ -144,6 +139,27 @@ def test_full_sphere_render_has_coverage_and_expected_directions(tmp_path: Path)
     assert exr_result.shape == (32, 64, 3)
     assert np.all(exr_result > 0.0)
 
+
+def test_jpeg_sources_are_supported(tmp_path: Path) -> None:
+    frame = FrameMetadata(0, "frame.jpg", 0.0, 0.0, 0.0, "captured")
+    session = SessionMetadata(
+        1, "jpeg", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (frame,), True
+    )
+    Image.new("RGB", (32, 16), (128, 64, 32)).save(tmp_path / frame.filename, quality=95)
+    validate_images(session, tmp_path)
+    assert _probe_source(tmp_path / frame.filename).encoding.transfer_function == "srgb"
+
+
+def test_allow_incomplete_skips_missing_sources(tmp_path: Path) -> None:
+    frames = (
+        FrameMetadata(0, "present.png", 0.0, 0.0, 0.0, "captured"),
+        FrameMetadata(1, "missing.png", 90.0, 0.0, 0.0, "planned"),
+    )
+    session = SessionMetadata(1, "partial", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, frames, False)
+    Image.new("RGB", (32, 16), (128, 64, 32)).save(tmp_path / "present.png")
+    validate_images(session, tmp_path, allow_incomplete=True)
+    render_session(session, tmp_path, tmp_path / "partial.png", width=32, allow_incomplete=True)
+    assert (tmp_path / "partial.png").is_file()
 
 def test_pq_decoder_preserves_hdr_domain() -> None:
     encoded = np.array([0.0, 0.5, 1.0], dtype=np.float32)
@@ -213,6 +229,39 @@ def test_uniform_yaw_rows_avoid_low_fov_polar_coverage_gaps() -> None:
         for column in range(uniform_columns):
             frame = FrameMetadata(row, "", 360.0 * column / uniform_columns, pitch, 0.0, "captured")
             covered |= camera_maps(directions, frame, 3840, 2160, horizontal, vertical)[2]
+    assert np.all(covered)
+
+
+@pytest.mark.parametrize("aspect", (4 / 3, 16 / 9, 16 / 10, 21 / 9, 32 / 9))
+def test_full_sphere_projection_supports_common_display_aspects(aspect: float) -> None:
+    vertical = 59.229667664
+    horizontal = math.degrees(2.0 * math.atan(math.tan(math.radians(vertical) / 2.0) * aspect))
+    base = _synthetic_session()
+    session = SessionMetadata(
+        schema_version=base.schema_version,
+        session_id=f"aspect-{aspect}",
+        capture_mode=base.capture_mode,
+        horizontal_fov_deg=horizontal,
+        vertical_fov_deg=vertical,
+        overlap_fraction=base.overlap_fraction,
+        frames=(),
+        completed=True,
+    )
+    planned = plan_shots(session)
+    directions = equirectangular_directions(256, 128)
+    covered = np.zeros((128, 256), dtype=bool)
+    source_height = 2160
+    source_width = round(source_height * aspect)
+    for shot in planned.shots:
+        frame = FrameMetadata(
+            shot.index, "", shot.yaw_deg, shot.pitch_deg, shot.roll_deg, "captured"
+        )
+        map_x, map_y, valid, _ = camera_maps(
+            directions, frame, source_width, source_height, horizontal, vertical
+        )
+        assert np.all(np.isfinite(map_x))
+        assert np.all(np.isfinite(map_y))
+        covered |= valid
     assert np.all(covered)
 
 

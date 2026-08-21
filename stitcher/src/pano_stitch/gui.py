@@ -17,6 +17,7 @@ from pano_stitch.compositor import (
     RenderCancelledError,
     estimate_render_resources,
     render_session,
+    renderable_session,
     validate_images,
 )
 from pano_stitch.metadata import load_session
@@ -419,10 +420,22 @@ class StitcherApp:
         if not self._validated:
             return
         output_path = self._output_path_preview()
-        if output_path is not None and output_path.exists():
+        coverage_path = (
+            output_path.with_name(f"{output_path.stem}-coverage.png")
+            if output_path is not None and self.coverage_var.get()
+            else None
+        )
+        existing = [
+            path
+            for path in (output_path, coverage_path)
+            if path is not None and path.exists()
+        ]
+        if existing:
             if not messagebox.askyesno(
                 "Overwrite existing file?",
-                f"{output_path.name} already exists. Replace it?",
+                "The following output files already exist:\n"
+                + "\n".join(path.name for path in existing)
+                + "\nReplace them?",
             ):
                 return
         self._start_worker("render")
@@ -442,6 +455,7 @@ class StitcherApp:
             if operation == "validate":
                 self._events.put(("validated", f"Valid session: {session.session_id}"))
                 return
+            session = renderable_session(session, image_dir, allow_incomplete)
             scale = Fraction(self.resolution_percent_var.get(), 100)
             if scale <= 0 or scale > 1:
                 raise ValueError("resolution must be between 1/1 and a positive fraction")
