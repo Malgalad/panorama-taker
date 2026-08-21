@@ -46,12 +46,13 @@ if (-not (Test-Path $python)) {
 
 $pyInstallerWork = Join-Path $buildRoot "pyinstaller-work"
 $pyInstallerDist = Join-Path $buildRoot "pyinstaller-dist"
-# OpenEXR is loaded dynamically; the remaining runtime libraries are direct imports.
+# OpenEXR and Imath are loaded dynamically; the remaining runtime libraries are direct imports.
 & $python -m PyInstaller --noconfirm --clean --windowed `
     --name PanoramaCaptureStitcher `
     --workpath $pyInstallerWork `
     --distpath $pyInstallerDist `
     --collect-all OpenEXR `
+    --collect-all Imath `
     --add-data "$projectRoot\contracts\session.schema.json;contracts" `
     "$projectRoot\stitcher\scripts\pano_stitch_gui.py"
 
