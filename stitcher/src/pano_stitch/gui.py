@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import queue
 import threading
@@ -19,6 +20,8 @@ from pano_stitch.compositor import (
     validate_images,
 )
 from pano_stitch.metadata import load_session
+
+LOGGER = logging.getLogger(__name__)
 
 
 class StitcherApp:
@@ -52,6 +55,10 @@ class StitcherApp:
         app_data = os.environ.get("APPDATA")
         base = Path(app_data) if app_data else Path.home() / ".config"
         return base / "PanoramaCapture" / "gui-settings.json"
+
+    @classmethod
+    def _log_path(cls) -> Path:
+        return cls._settings_path().with_name("stitcher.log")
 
     def _load_settings(self) -> None:
         try:
@@ -427,6 +434,7 @@ class StitcherApp:
 
     def _worker_main(self, operation: str) -> None:
         try:
+            LOGGER.info("%s started", operation)
             session_path, image_dir, output_dir = self._paths()
             session = load_session(session_path, image_directory=image_dir)
             allow_incomplete = self.allow_incomplete_var.get()
@@ -476,11 +484,16 @@ class StitcherApp:
                 self._cancel_event,
                 self.jpeg_quality_var.get(),
             )
+            LOGGER.info("render completed: %s", output_path)
             self._events.put(("success", f"Wrote {output_path}"))
         except RenderCancelledError:
+            LOGGER.info("%s cancelled", operation)
             self._events.put(("cancelled", "Render cancelled; partial files were removed."))
-        except (OSError, ValueError) as error:
-            self._events.put(("error", str(error)))
+        except Exception as error:
+            LOGGER.exception("%s failed", operation)
+            self._events.put(
+                ("error", f"{error}\n\nDetails were written to {self._log_path()}")
+            )
         finally:
             self._events.put(("idle", ""))
 
@@ -573,9 +586,25 @@ def _configure_scaling(root: tk.Tk) -> None:
         named.configure(size=max(11, round(size * scale)))
 
 
+def _configure_logging() -> None:
+    log_path = StitcherApp._log_path()
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        logging.basicConfig(
+            filename=log_path,
+            encoding="utf-8",
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
+    except OSError:
+        logging.basicConfig(level=logging.INFO)
+    LOGGER.info("Panorama Stitcher started")
+
+
 def main() -> None:
     """Launch the desktop stitcher frontend."""
 
+    _configure_logging()
     root = tk.Tk()
     _configure_scaling(root)
     StitcherApp(root)
