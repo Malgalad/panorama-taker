@@ -50,8 +50,140 @@ class RenderResources:
     scratch_bytes: int
 
 
+@dataclass(frozen=True)
+class ExposureReport:
+    """Summary of the automatic linear-light exposure solve."""
+
+    anchor_frame: int
+    edge_count: int
+    gains: tuple[float, ...]
+
+
 class RenderCancelledError(RuntimeError):
     """Raised when a cooperative render cancellation is requested."""
+
+
+def _exposure_luminance(image: FloatImage) -> FloatImage:
+    return np.asarray(
+        image[..., 0] * np.float32(0.2126)
+        + image[..., 1] * np.float32(0.7152)
+        + image[..., 2] * np.float32(0.0722),
+        dtype=np.float32,
+    )
+
+
+def _exposure_proxy(source: FloatImage, maximum_width: int = 256) -> FloatImage:
+    """Downsample one decoded source for the exposure-only geometry pass."""
+
+    height, width = source.shape[:2]
+    proxy_width = min(maximum_width, width)
+    proxy_height = max(1, int(round(height * proxy_width / width)))
+    if (proxy_width, proxy_height) == (width, height):
+        return source
+    return np.asarray(
+        cv2.resize(source, (proxy_width, proxy_height), interpolation=cv2.INTER_AREA),
+        dtype=np.float32,
+    )
+
+
+def _estimate_exposure_gains(
+    session: SessionMetadata,
+    image_root: Path,
+    source_info: SourceInfo,
+    cancel_event: Event | None = None,
+    progress_callback: Callable[[int], None] | None = None,
+) -> ExposureReport:
+    """Solve robust per-frame gains from low-resolution geometric overlaps."""
+
+    frame_count = len(session.frames)
+    if frame_count <= 1:
+        return ExposureReport(0, 0, (1.0,) * frame_count)
+
+    sample_width = 256
+    sample_height = 128
+    latitude_span = (
+        180.0 if session.capture_mode.value == "full_sphere" else session.vertical_fov_deg
+    )
+    directions = equirectangular_directions(sample_width, sample_height, latitude_span)
+    valid_masks: list[NDArray[np.bool_]] = []
+    luminances: list[FloatImage] = []
+    for position, frame in enumerate(session.frames):
+        if cancel_event is not None and cancel_event.is_set():
+            raise RenderCancelledError("render cancelled")
+        source = _read_source(_image_path(image_root, frame.filename), source_info.encoding)
+        try:
+            proxy = _exposure_proxy(source)
+            map_x, map_y, valid, _ = camera_maps(
+                directions,
+                frame,
+                proxy.shape[1],
+                proxy.shape[0],
+                session.horizontal_fov_deg,
+                session.vertical_fov_deg,
+            )
+            sampled = remap_source(proxy, map_x, map_y)
+        finally:
+            del source
+        luminance = _exposure_luminance(sampled)
+        finite = np.isfinite(luminance) & (luminance > np.float32(1e-5))
+        luminances.append(luminance)
+        valid_masks.append(valid & finite)
+        if progress_callback is not None:
+            progress_callback(position + 1)
+
+    equations: list[tuple[int, int, float, float]] = []
+    adjacency: list[set[int]] = [set() for _ in session.frames]
+    for left in range(frame_count):
+        for right in range(left + 1, frame_count):
+            mask = valid_masks[left] & valid_masks[right]
+            if int(np.count_nonzero(mask)) < 24:
+                continue
+            left_values = luminances[left][mask]
+            right_values = luminances[right][mask]
+            log_ratios = np.log(left_values) - np.log(right_values)
+            finite_ratios = log_ratios[np.isfinite(log_ratios)]
+            if finite_ratios.size < 24:
+                continue
+            low, high = np.quantile(finite_ratios, (0.1, 0.9))
+            inliers = finite_ratios[(finite_ratios >= low) & (finite_ratios <= high)]
+            if inliers.size < 12:
+                continue
+            equations.append((left, right, float(np.median(inliers)), float(np.sqrt(inliers.size))))
+            adjacency[left].add(right)
+            adjacency[right].add(left)
+
+    if not equations:
+        raise ValueError("exposure normalization found no reliable overlapping frame pairs")
+    seen = {0}
+    pending = [0]
+    while pending:
+        current = pending.pop()
+        for neighbor in adjacency[current]:
+            if neighbor not in seen:
+                seen.add(neighbor)
+                pending.append(neighbor)
+    if len(seen) != frame_count:
+        missing = ", ".join(str(index + 1) for index in range(frame_count) if index not in seen)
+        raise ValueError(
+            f"exposure normalization graph is disconnected; frames not linked: {missing}"
+        )
+
+    matrix = np.zeros((len(equations) + 1, frame_count), dtype=np.float64)
+    values = np.zeros(len(equations) + 1, dtype=np.float64)
+    for row, (left, right, ratio, weight) in enumerate(equations):
+        matrix[row, left] = -weight
+        matrix[row, right] = weight
+        values[row] = ratio * weight
+    matrix[-1, 0] = 1.0
+    solution, *_ = np.linalg.lstsq(matrix, values, rcond=None)
+    solution -= np.median(solution)
+    limit = np.log(2.0)
+    gains = np.exp(np.clip(solution, -limit, limit)).astype(np.float32)
+    return ExposureReport(
+        anchor_frame=int(np.argmin(np.abs(solution - np.median(solution)))),
+        edge_count=len(equations),
+        gains=tuple(float(gain) for gain in gains),
+    )
 
 
 def _png_chunks(path: Path) -> dict[bytes, bytes]:
@@ -445,7 +577,7 @@ def render_session(
     debug_coverage_path: Path | None = None,
     cancel_event: Event | None = None,
     jpeg_quality: int = 95,
-) -> None:
+) -> ExposureReport:
     """Render one session with bounded RAM and disk-backed strip accumulators."""
 
     if not session.frames:
@@ -468,8 +600,9 @@ def render_session(
     output_height = resources.output_height
     strip_height = resources.strip_height
     composite_strips = (output_height + strip_height - 1) // strip_height
-    total_work = len(session.frames) * composite_strips + composite_strips
-    completed_work = 0
+    exposure_work = len(session.frames)
+    total_work = exposure_work + len(session.frames) * composite_strips + composite_strips
+    completed_work = exposure_work
     latitude_span = (
         180.0 if session.capture_mode.value == "full_sphere" else session.vertical_fov_deg
     )
@@ -482,6 +615,17 @@ def render_session(
     with tempfile.TemporaryDirectory(
         prefix="pano-stitch-", dir=output_path.parent
     ) as scratch_directory:
+        exposure_report = _estimate_exposure_gains(
+            session,
+            image_root,
+            first_source,
+            cancel_event,
+            (
+                (lambda completed: progress_callback(completed, total_work, "exposure"))
+                if progress_callback is not None
+                else None
+            ),
+        )
         scratch_root = Path(scratch_directory)
         color_path = scratch_root / "color.f32"
         weight_path = scratch_root / "weight.f32"
@@ -497,13 +641,14 @@ def render_session(
             )
 
         with color_path.open("r+b") as color_scratch, weight_path.open("r+b") as weight_scratch:
-            for frame in session.frames:
+            for frame_position, frame in enumerate(session.frames):
                 if cancel_event is not None and cancel_event.is_set():
                     raise RenderCancelledError("render cancelled")
                 source = _read_source(
                     _image_path(image_root, frame.filename), first_source.encoding
                 )
                 try:
+                    source *= np.float32(exposure_report.gains[frame_position])
                     for row_start in range(0, output_height, strip_height):
                         if cancel_event is not None and cancel_event.is_set():
                             raise RenderCancelledError("render cancelled")
@@ -614,6 +759,7 @@ def render_session(
                 if temporary_coverage_path is not None:
                     temporary_coverage_path.unlink(missing_ok=True)
                 raise
+            return exposure_report
 
 
 def validate_images(

@@ -104,3 +104,32 @@ def test_cet_metadata_loads_and_resolves_moved_windows_screenshot(tmp_path: Path
         -0.89,
         0.45,
     )
+
+
+def test_cet_metadata_centers_the_yaw_zero_camera_direction(tmp_path: Path) -> None:
+    document = {
+        "schema_version": 1,
+        "session_id": "cet-rotated",
+        "horizontal_fov_deg": 90.6,
+        "vertical_fov_deg": 59.23,
+        "state": "completed",
+        "poses": [
+            {
+                "index": 1,
+                "screenshot_path": "pose-001.png",
+                "commanded_yaw_deg": 0.0,
+                "commanded_pitch_deg": 0.0,
+                "forward": [-1.0, 0.0, 0.0],
+                "right": [0.0, 1.0, 0.0],
+                "up": [0.0, 0.0, 1.0],
+            }
+        ],
+    }
+    metadata = tmp_path / "PanoramaCaptureBridge.pano-rotated.json"
+    metadata.write_text(json.dumps(document), encoding="utf-8")
+
+    session = load_session(metadata)
+
+    assert session.frames[0].camera_basis_row_major == pytest.approx(
+        (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+    )

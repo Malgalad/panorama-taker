@@ -28,11 +28,10 @@ compensators. The first PanoramaCapture version should use only global
 luminance gain: per-channel white balance and spatial/block gain can create
 color shifts or gradients when a game's temporal exposure changes locally.
 
-GUI proposal: `Exposure normalization` is off by default, with an `Auto
-(global)` choice, a maximum-EV control, and a preview of the resulting gains.
-The render report should state the anchor image, overlap graph connectivity,
-and each applied gain. A disconnected graph is an error, not an invitation to
-guess.
+Packet 12 decision: exposure normalization is mandatory and automatic for
+production renders, rather than an opt-in GUI setting. The render report must
+state the anchor image, overlap graph connectivity, and each applied gain. A
+disconnected graph is an error, not an invitation to guess.
 
 ## Optional upright / horizon correction
 

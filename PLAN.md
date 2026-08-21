@@ -945,34 +945,127 @@ assets plus a build-provenance manifest to the matching GitHub Release. CI runs 
 on pull requests and `master`. The root guide now covers installation,
 automated capture, stitching, recovery, compatibility limits, release
 verification, tag-driven publication, and the separate local development loop.
-The remaining Packet 11 gate is a manual release dry run and clean-machine
-installation from its downloaded artifacts; only then should the first tag be
-pushed.
+A manual, non-publishing dry run has built both ZIPs successfully; the packaged
+GUI has launched and rendered JPEG and EXR outputs. The distribution now keeps
+the schema inside the PyInstaller bundle, logs GUI worker failures to the user
+configuration directory, and avoids broad collection of direct imports, saving
+about 8 MiB while retaining the dynamically loaded OpenEXR and Imath modules.
+The remaining Packet 11 gate is an independent clean-machine installation from
+the downloaded artifact; only then should the first tag be pushed.
 
-### Post-MVP polish: photometric and upright correction
+### Packet 12: exposure normalization, capture settings, and release review
 
-Defer this work until the core capture, direct JSON stitching, GUI, and release
-paths are stable. Research and design notes are in
-`docs/polish-research.md`.
+Purpose: make exposure normalization part of every production stitch, provide
+capture-only settings through Native Settings when available, and remove
+development noise before the first public release. This packet covers all three
+runtime parts: stitcher, CET mod, and ReShade add-on.
 
-Deliverables:
+#### 12A. Automatic exposure normalization
 
-- Optional overlap-graph exposure normalization in linear HDR space, using one
-  conservative global luminance gain per source frame.
-- Diagnostics for overlap connectivity, selected exposure anchor, and applied
-  gains; refuse to normalize disconnected capture graphs.
-- A low-resolution GUI preview that can propose an upright/horizon correction
-  from rectilinear line detection.
-- Optional correction-strength and manual pitch/roll controls. Apply the final
-  choice as a global output-space rotation, without mutating source metadata.
+Implement a linear-HDR prepass before compositing. For every capture session:
+
+1. Decode each source one at a time, make a small linear-light proxy, and keep
+   the prepass under the existing 1 GiB process-RSS budget. Preserve both
+   supported inputs: SDR sRGB images convert to linear light before estimation;
+   HDR PQ/Rec.2020 images retain the existing linear-HDR conversion path.
+2. Use metadata camera bases and FoV to sample only geometric overlaps. Reject
+   near-black, clipped, high-gradient, and otherwise unreliable luminance
+   samples.
+3. Estimate robust log-luminance differences for overlap edges; solve a
+   weighted least-squares graph for one global RGB-preserving gain per source.
+   Anchor the solution to the representative median-exposure frame and clamp
+   gains to plus or minus one EV.
+4. Require a connected, sufficiently sampled graph. Refuse rendering with a
+   precise diagnostic rather than silently outputting unnormalized seams.
+5. Apply each gain to linear RGB immediately after decoding and before feather
+   blending, SDR tone mapping, JPEG/PNG output, or EXR output.
+
+The GUI and CLI report the anchor, sample/edge count, and final gains. This is
+automatic for production renders; no user-facing enable toggle is added in this
+packet. Add synthetic SDR and HDR tests with known per-frame exposure offsets,
+an unreliable-overlap rejection case, and a disconnected-graph failure case.
+
+#### 12B. Optional Native Settings UI integration
+
+Native Settings is an optional enhancement, not a packaging dependency. During
+`onInit`, call `GetMod("nativeSettings")`; if it is absent or incompatible, the
+mod retains its built-in defaults and capture remains usable.
+
+When present, register a `Panorama Capture` tab and `Capture` subcategory with:
+
+- `Capture horizontal FoV`: 70–100 degrees, step 5, default 90. It temporarily
+  changes only the capture camera and restores the exact previous FoV at session
+  end or abort. The labels use the game-slider horizontal FoV convention; the
+  implementation converts it to the active camera's vertical FoV using the
+  current aspect ratio. Never assume 16:9.
+- `Estimated capture plan`: a dynamically rebuilt Native Settings summary
+ control showing the plan calculated from the selected FoV and current aspect
+  ratio, for example `16 screenshots (5 × 4)`. Recalculate it after each FoV
+  change; display an explicit unavailable state if the active camera aspect
+  ratio cannot be read.
+- `Settling delay`: 0.1–3.0 seconds, step 0.1, default 1.0. It is the time
+  after a verified camera move and before a screenshot request, for temporal
+  accumulation; it does not delay pitch-correction attempts.
+- `Apply capture settings` button: validates and saves the draft settings only
+  while idle. Active sessions retain their immutable start-of-session snapshot.
+- `Restore capture defaults` button and Native Settings restore-defaults hook:
+  reset both controls to the values above, update the UI, and save only while
+  idle.
+
+Persist settings atomically in the existing relative bridge/runtime directory;
+never hard-code a game installation path. First prove `gameFPPCameraComponent`
+FoV override/readback and restoration in-game before making it the production
+path. If verification fails, abort before hiding the HUD or moving the camera.
+Do not alter existing CET bindings.
+
+The capture and stitcher path must support arbitrary display and screenshot
+aspects, including 4:3, 16:9, 16:10, 21:9, and 32:9. Use the active camera
+aspect ratio for horizontal-to-vertical FoV conversion and plan construction;
+write the observed horizontal and vertical FoV into metadata as today. Do not
+letterbox, crop, or normalize source images merely to fit a preferred aspect.
+Add planner and projection tests for the listed ratios, verifying complete
+sphere coverage, finite map coordinates, correct output dimensions, and a
+different recomputed screenshot count where geometry requires one.
+
+#### 12C. User-facing logs and three-part review
+
+- CET console: production capture emits only session started, completed,
+  aborted, or errored messages. The explicit status hotkey retains its requested
+  one-line report. Per-pose motion, metadata, bridge acknowledgements, and HUD
+  internals move behind a disabled development-only logger; metadata JSON is the
+  authoritative per-pose record.
+- ReShade add-on: retain startup and error/timeout logging; remove routine
+  per-screenshot request/acknowledgement noise from normal logs.
+- Stitcher: retain its GUI log file and user-visible errors; include exposure
+  normalization diagnostics in the render report without per-pixel logging.
+- Review the CET state machine and restoration paths, bridge token/file cleanup
+  and add-on shutdown, renderer memory/resource ownership, error propagation,
+  packaged-file layout, and tests. Fix release-blocking findings within this
+  packet and record non-blocking limitations in `docs/progress.md`.
 
 Acceptance:
 
-- Auto exposure normalization visibly reduces overlap brightness steps without
-  clipping HDR inputs or changing output geometry.
-- The user can disable both polish features and reproduce the baseline stitch.
-- Weak, contradictory, or intentionally non-level scene lines do not cause an
-  unrequested orientation change.
+- Deliberately exposure-shifted SDR and HDR captures stitch without visible
+  overlap brightness steps, while EXR remains linear HDR and JPEG/PNG remain
+  deterministic SDR conversions.
+- The exposure prepass stays within the established memory ceiling and refuses
+  insufficient coverage with a clear diagnostic.
+- With Native Settings installed, both controls and the recomputed plan summary
+  apply only to the next capture, restore correctly after complete/abort/reload,
+  and reset to defaults. Without it, capture works unchanged.
+- 4:3, 16:9, 16:10, 21:9, and 32:9 captures use their recorded camera aspect
+  without cropping or 16:9-specific plan assumptions.
+- The normal CET console contains no per-pose spam, while development logs and
+  metadata still support diagnosis.
+- Stitcher, add-on, and CET review findings are either fixed or documented.
+
+#### Deferred Packet 13: optional upright / horizon correction
+
+After exposure normalization is proven, add a low-resolution equirectangular
+preview that proposes (but never silently applies) a global upright correction
+from rectilinear line evidence. Preserve manual pitch/roll controls and default
+to zero correction for weak or contradictory scenes. Research remains in
+`docs/polish-research.md`.
 
 ## MVP completion definition
 

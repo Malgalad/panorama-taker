@@ -10,6 +10,7 @@ from pano_stitch.compositor import (
     MAX_MEMORY_BUDGET_BYTES,
     SourceInfo,
     _choose_strip_height,
+    _estimate_exposure_gains,
     _pq_to_linear,
     _probe_source,
     _write_exr,
@@ -152,6 +153,30 @@ def test_pq_decoder_preserves_hdr_domain() -> None:
     assert decoded[2] == pytest.approx(1.0, abs=1e-6)
 
 
+def test_exposure_solver_recovers_relative_sdr_gain(tmp_path: Path) -> None:
+    frames = (
+        FrameMetadata(0, "bright.png", 0.0, 0.0, 0.0, "captured"),
+        FrameMetadata(1, "dim.png", 30.0, 0.0, 0.0, "captured"),
+    )
+    session = SessionMetadata(
+        schema_version=1,
+        session_id="exposure",
+        capture_mode=CaptureMode.FULL_SPHERE,
+        horizontal_fov_deg=120.0,
+        vertical_fov_deg=90.0,
+        overlap_fraction=0.08,
+        frames=frames,
+        completed=True,
+    )
+    Image.new("RGB", (64, 64), (160, 160, 160)).save(tmp_path / "bright.png")
+    Image.new("RGB", (64, 64), (80, 80, 80)).save(tmp_path / "dim.png")
+
+    report = _estimate_exposure_gains(session, tmp_path, SourceInfo(64, 64, ImageEncoding()))
+
+    assert report.edge_count == 1
+    assert report.gains[1] / report.gains[0] == pytest.approx(4.0, rel=0.03)
+
+
 def test_4k_source_uses_bounded_output_strips() -> None:
     source = SourceInfo(3840, 2160, ImageEncoding("uint16", "rec2020", "pq", 203.0))
     strip_height = _choose_strip_height(source, 21274, DEFAULT_MEMORY_BUDGET_BYTES)
@@ -161,23 +186,32 @@ def test_4k_source_uses_bounded_output_strips() -> None:
         _choose_strip_height(source, 21274, MAX_MEMORY_BUDGET_BYTES + 1)
 
 
-def test_guarded_adaptive_rows_cover_full_sphere() -> None:
-    horizontal = 59.229668
-    vertical = 35.462
+def test_uniform_yaw_rows_avoid_low_fov_polar_coverage_gaps() -> None:
+    horizontal = 70.599993
+    vertical = 43.43203
     overlap = 0.08
     guard = 0.05
     yaw_step = horizontal * (1.0 - overlap) * (1.0 - guard)
-    pitches = (-72.269, -43.361, -14.454, 14.454, 43.361, 72.269)
-    columns = tuple(
+    pitches = (-70.021266, -35.010633, 0.0, 35.010633, 70.021266)
+    adaptive_columns = tuple(
         math.ceil(360.0 * math.cos(math.radians(abs(pitch))) / yaw_step) for pitch in pitches
     )
+    assert adaptive_columns == (2, 5, 6, 5, 2)
 
-    assert columns == (3, 6, 7, 7, 6, 3)
     directions = equirectangular_directions(512, 256)
-    covered = np.zeros((256, 512), dtype=bool)
-    for row, (pitch, count) in enumerate(zip(pitches, columns, strict=True)):
+    adaptive_coverage = np.zeros((256, 512), dtype=bool)
+    for row, (pitch, count) in enumerate(zip(pitches, adaptive_columns, strict=True)):
         for column in range(count):
             frame = FrameMetadata(row, "", 360.0 * column / count, pitch, 0.0, "captured")
+            adaptive_coverage |= camera_maps(directions, frame, 3840, 2160, horizontal, vertical)[2]
+    assert np.any(~adaptive_coverage)
+
+    uniform_columns = math.ceil(360.0 / yaw_step)
+    assert uniform_columns == 6
+    covered = np.zeros((256, 512), dtype=bool)
+    for row, pitch in enumerate(pitches):
+        for column in range(uniform_columns):
+            frame = FrameMetadata(row, "", 360.0 * column / uniform_columns, pitch, 0.0, "captured")
             covered |= camera_maps(directions, frame, 3840, 2160, horizontal, vertical)[2]
     assert np.all(covered)
 

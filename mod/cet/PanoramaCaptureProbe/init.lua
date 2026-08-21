@@ -1,4 +1,4 @@
-local MOD_VERSION = "0.1.19"
+local MOD_VERSION = "0.1.31"
 
 local function log(message)
     print("[PanoramaCaptureProbe] " .. message)
@@ -11,12 +11,16 @@ local productionSession = nil
 local pauseEventState = nil
 local hudRehideFrames = 0
 local bridgeSessionCounter = 0
+local nativeSettings = nil
+local settingsDraftSettle = nil
+local settingsDraftScreenshotCooldown = nil
 
 -- User-editable capture settings. Reload CET after changing them.
 local captureConfig = {
     overlap = 0.08,
     adaptiveYawGuard = 0.05,
-    settleSeconds = 1.5,
+    settleSeconds = 1.0,
+    screenshotCooldownSeconds = 3.1,
     calibrationFrames = 2,
     pitchToleranceDegrees = 0.25,
     maxPitchCorrections = 3,
@@ -25,7 +29,55 @@ local captureConfig = {
     bridgeDirectory = ".",
 }
 
+local function registerNativeSettings()
+    local ok, settings = pcall(function() return GetMod("nativeSettings") end)
+    if not ok or settings == nil then
+        return
+    end
+    nativeSettings = settings
+    settingsDraftSettle = captureConfig.settleSeconds
+    settingsDraftScreenshotCooldown = captureConfig.screenshotCooldownSeconds
+    local okApi = pcall(function()
+        nativeSettings.addTab("/PanoramaCapture", "Panorama Capture", nil)
+        nativeSettings.addSubcategory("/PanoramaCapture/Capture", "Capture", 1)
+        nativeSettings.addRangeFloat(
+            "/PanoramaCapture/Capture", "Settling delay", "Seconds to wait after the verified pose before requesting a screenshot.",
+            0.1, 3.0, 0.1, "%.1fs", settingsDraftSettle, captureConfig.settleSeconds,
+            function(value)
+                settingsDraftSettle = value
+                captureConfig.settleSeconds = value
+            end, 1)
+        nativeSettings.addRangeFloat(
+            "/PanoramaCapture/Capture", "ReShade toast cooldown",
+            "Wait after each ReShade screenshot so its three-second toast cannot enter the next capture.",
+            0.0, 5.0, 0.1, "%.1fs", settingsDraftScreenshotCooldown,
+            captureConfig.screenshotCooldownSeconds,
+            function(value)
+                settingsDraftScreenshotCooldown = value
+                captureConfig.screenshotCooldownSeconds = value
+            end, 2)
+        nativeSettings.registerRestoreDefaultsCallback("/PanoramaCapture/Capture", false, function()
+            settingsDraftSettle = 1.0
+            settingsDraftScreenshotCooldown = 3.1
+            captureConfig.settleSeconds = 1.0
+            captureConfig.screenshotCooldownSeconds = 3.1
+        end)
+    end)
+    if not okApi then
+        nativeSettings = nil
+    end
+end
+
 log("bridge directory: " .. captureConfig.bridgeDirectory)
+
+local function syncNativeSettings()
+    if settingsDraftSettle ~= nil then
+        captureConfig.settleSeconds = settingsDraftSettle
+    end
+    if settingsDraftScreenshotCooldown ~= nil then
+        captureConfig.screenshotCooldownSeconds = settingsDraftScreenshotCooldown
+    end
+end
 
 local function isFiniteNumber(value)
     return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
@@ -42,6 +94,10 @@ local function configurationError()
     if not isFiniteNumber(captureConfig.settleSeconds) or captureConfig.settleSeconds < 0 or
         captureConfig.settleSeconds > 60 then
         return "settleSeconds must be a finite number in [0, 60]"
+    end
+    if not isFiniteNumber(captureConfig.screenshotCooldownSeconds) or
+        captureConfig.screenshotCooldownSeconds < 0 or captureConfig.screenshotCooldownSeconds > 60 then
+        return "screenshotCooldownSeconds must be a finite number in [0, 60]"
     end
     if not isFiniteNumber(captureConfig.calibrationFrames) or captureConfig.calibrationFrames < 1 or
         captureConfig.calibrationFrames % 1 ~= 0 then
@@ -151,6 +207,16 @@ local function writeSessionMetadata(session, state)
     return true
 end
 
+local function discardSessionMetadata(session)
+    os.remove(session.metadataPath)
+    os.remove(session.metadataPath .. ".tmp")
+end
+
+local function discardBridgeFiles()
+    os.remove(bridgeFile("request"))
+    os.remove(bridgeFile("ack"))
+end
+
 local function effectiveFov()
     local cameraSystem = Game.GetCameraSystem()
     if cameraSystem == nil then
@@ -182,12 +248,11 @@ local function buildFullSpherePlan(horizontal, vertical, overlap, adaptiveYawGua
     local polarGuard = vertical * overlap / 2.0
     local maxPitch = math.min(89.0, math.max(0.0, 90.0 - vertical / 2.0 + polarGuard))
     local plan = {}
-    local maximumColumns = 0
+    -- A rectilinear frame's longitude coverage changes across its vertical extent.
+    -- Keeping the yaw count uniform avoids gaps between latitude rows near the poles.
+    local columns = math.max(1, math.ceil(360.0 / guardedYawStep))
     for row = 0, rows - 1 do
         local pitch = rows == 1 and 0.0 or -maxPitch + (2.0 * maxPitch * row / (rows - 1))
-        local columns = math.max(1,
-            math.ceil(360.0 * math.cos(math.rad(math.abs(pitch))) / guardedYawStep))
-        maximumColumns = math.max(maximumColumns, columns)
         for column = 0, columns - 1 do
             plan[#plan + 1] = { row = row, column = column, columns = columns,
                 yaw = column * 360.0 / columns, pitch = pitch }
@@ -200,7 +265,7 @@ local function buildFullSpherePlan(horizontal, vertical, overlap, adaptiveYawGua
         guardedYawStep = guardedYawStep,
         adaptiveYawGuard = adaptiveYawGuard,
         pitchStep = pitchStep,
-        columns = maximumColumns,
+        columns = columns,
         rows = rows,
         poses = plan,
     }, nil
@@ -727,6 +792,7 @@ local function startProductionSession()
         log("Production session already active.")
         return
     end
+    syncNativeSettings()
     local configError = configurationError()
     if configError ~= nil then
         log("Production session cancelled: invalid configuration: " .. configError .. ".")
@@ -741,23 +807,23 @@ local function startProductionSession()
         log("Production session requires normal FPP view; exit Photo Mode first.")
         return
     end
-    local horizontal, vertical, fovError = effectiveFov()
-    if horizontal == nil then
-        log("Production session cancelled: " .. tostring(fovError))
-        return
-    end
-    local plan, planError = buildFullSpherePlan(
-        horizontal, vertical, captureConfig.overlap, captureConfig.adaptiveYawGuard)
-    if plan == nil then
-        log("Production session cancelled: " .. tostring(planError))
-        return
-    end
     local player = Game.GetPlayer()
     local cameraSystem = Game.GetCameraSystem()
     local camera = player and player:GetFPPCameraComponent()
     local playerHash = player and entityHash(player)
     if player == nil or playerHash == nil or cameraSystem == nil or camera == nil then
         log("Production session requires an active player, camera system, and FPP camera.")
+        return
+    end
+    local horizontal, vertical, fovError = effectiveFov()
+    if horizontal == nil then
+        log("Production session cancelled: " .. tostring(fovError) .. ".")
+        return
+    end
+    local plan, planError = buildFullSpherePlan(
+        horizontal, vertical, captureConfig.overlap, captureConfig.adaptiveYawGuard)
+    if plan == nil then
+        log("Production session cancelled: " .. tostring(planError))
         return
     end
     local hud, hudError = snapshotHud()
@@ -817,6 +883,7 @@ local function startProductionSession()
         lastSettleSeconds = 0.0,
         pitchCorrection = 0.0,
         awaitingScreenshot = false,
+        screenshotCooldownRemaining = 0.0,
         metadataPath = bridgeFile("pano-" .. sessionId .. ".json"),
         metadataRecords = {},
         pendingMetadata = nil,
@@ -887,6 +954,7 @@ registerInput("panorama_capture_abort", "Panorama: abort full-sphere pose sessio
 end)
 
 local function reportStatus()
+    syncNativeSettings()
     local configError = configurationError()
     if configError ~= nil then
         log("Status: invalid configuration: " .. configError .. ".")
@@ -923,10 +991,9 @@ local function abortEnvironment(reason)
     if environmentSequence == nil then
         return
     end
-    os.remove(bridgeFile("request"))
-    os.remove(bridgeFile("ack"))
+    discardBridgeFiles()
     if productionSession ~= nil then
-        writeSessionMetadata(productionSession, "aborted")
+        discardSessionMetadata(productionSession)
     end
     restoreEnvironmentControls(environmentSequence)
     environmentSequence = nil
@@ -944,6 +1011,24 @@ local function restorePoseImmediately(environment)
     end)
 end
 
+local function requestProductionScreenshot()
+    if productionSession == nil or environmentSequence == nil then
+        return
+    end
+    local token = string.format("pano-%s-%03d", productionSession.sessionId, productionSession.index)
+    local requestOk, requestError = writeBridgeRequest(
+        productionSession.sessionId, productionSession.index, token)
+    if not requestOk then
+        log("Production session cancelled: " .. tostring(requestError))
+        environmentSequence.restoreRequested = true
+        return
+    end
+    productionSession.awaitingScreenshot = true
+    environmentSequence.state = "awaiting_screenshot"
+    log(string.format("Production pose ready: %d/%d; ReShade screenshot requested.",
+        productionSession.index, #productionSession.plan.poses))
+end
+
 registerForEvent("onUpdate", function(deltaTime)
     if environmentSequence ~= nil then
         if hudRehideFrames > 0 then
@@ -957,6 +1042,12 @@ registerForEvent("onUpdate", function(deltaTime)
             abortEnvironment("player changed or became unavailable during session transition")
             return
         end
+        if productionSession ~= nil and not productionSession.awaitingScreenshot and
+            productionSession.screenshotCooldownRemaining > 0 and type(deltaTime) == "number" and
+            deltaTime > 0 then
+            productionSession.screenshotCooldownRemaining = math.max(0.0,
+                productionSession.screenshotCooldownRemaining - deltaTime)
+        end
         if productionSession ~= nil and productionSession.awaitingScreenshot then
             local acknowledgement = readBridgeAck()
             if acknowledgement ~= nil then
@@ -968,7 +1059,8 @@ registerForEvent("onUpdate", function(deltaTime)
                     productionSession.awaitingScreenshot = false
                     if acknowledgement.path:sub(1, 6) == "ERROR:" then
                         log("Production session cancelled: ReShade bridge error " .. acknowledgement.path)
-                        writeSessionMetadata(productionSession, "failed")
+                        discardSessionMetadata(productionSession)
+                        discardBridgeFiles()
                         environmentSequence.restoreRequested = true
                     else
                         local metadata = productionSession.pendingMetadata
@@ -981,7 +1073,13 @@ registerForEvent("onUpdate", function(deltaTime)
                         writeSessionMetadata(productionSession, completed and "completed" or "active")
                         log(string.format("Production screenshot acknowledged: pose %d/%d path=%s",
                             productionSession.index, #productionSession.plan.poses, acknowledgement.path))
-                        queueNextProductionPose()
+                        if completed then
+                            queueNextProductionPose()
+                        else
+                            productionSession.screenshotCooldownRemaining =
+                                captureConfig.screenshotCooldownSeconds
+                            queueNextProductionPose()
+                        end
                     end
                 else
                     log("Production screenshot acknowledgement ignored: request identity mismatch.")
@@ -1004,6 +1102,11 @@ registerForEvent("onUpdate", function(deltaTime)
             if observed == nil or not observed.basisValid then
                 log("Production session cancelled: initial pitch calibration failed: " ..
                     tostring(observedError or "active camera basis is not orthonormal"))
+                environmentSequence.restoreRequested = true
+            elseif math.abs(observed.horizontalFov - productionSession.horizontalFov) > 0.5 then
+                log(string.format(
+                    "Production session cancelled: capture FoV did not apply (requested %.3f, observed %.3f).",
+                    productionSession.horizontalFov, observed.horizontalFov))
                 environmentSequence.restoreRequested = true
             else
                 productionSession.pitchCorrection = -observed.pitch
@@ -1076,19 +1179,10 @@ registerForEvent("onUpdate", function(deltaTime)
                         else
                             productionSession.pendingMetadata = logPoseMetadata(productionSession, pose, observed)
                             if captureConfig.automatedScreenshots then
-                                local token = string.format("pano-%s-%03d", productionSession.sessionId,
-                                    productionSession.index)
-                                local requestOk, requestError = writeBridgeRequest(
-                                    productionSession.sessionId, productionSession.index, token)
-                                if not requestOk then
-                                    log("Production session cancelled: " .. tostring(requestError))
-                                    environmentSequence.restoreRequested = true
+                                if productionSession.screenshotCooldownRemaining > 0 then
+                                    environmentSequence.state = "awaiting_screenshot_cooldown"
                                 else
-                                    productionSession.awaitingScreenshot = true
-                                    environmentSequence.state = "awaiting_screenshot"
-                                    log(string.format(
-                                        "Production pose ready: %d/%d; ReShade screenshot requested.",
-                                        productionSession.index, #productionSession.plan.poses))
+                                    requestProductionScreenshot()
                                 end
                             else
                                 log(string.format(
@@ -1104,6 +1198,10 @@ registerForEvent("onUpdate", function(deltaTime)
                     environmentSequence.state = "active"
                 end
             end
+        elseif environmentSequence.state == "awaiting_screenshot_cooldown" then
+            if productionSession.screenshotCooldownRemaining <= 0 then
+                requestProductionScreenshot()
+            end
         elseif environmentSequence.state == "restore_pending" then
             environmentSequence.camera:SetLocalOrientation(environmentSequence.originalOrientation)
             environmentSequence.waitFrames = 2
@@ -1112,7 +1210,12 @@ registerForEvent("onUpdate", function(deltaTime)
             if productionSession ~= nil then
                 local completed = productionSession.index >= #productionSession.plan.poses and
                     productionSession.pendingMetadata == nil
-                writeSessionMetadata(productionSession, completed and "completed" or "aborted")
+                if completed then
+                    writeSessionMetadata(productionSession, "completed")
+                else
+                    discardSessionMetadata(productionSession)
+                    discardBridgeFiles()
+                end
             end
             restoreEnvironmentControls(environmentSequence)
             environmentSequence = nil
@@ -1124,6 +1227,7 @@ registerForEvent("onUpdate", function(deltaTime)
 end)
 
 registerForEvent("onInit", function()
+    registerNativeSettings()
     Observe("gameuiPopupsManager", "OnMenuUpdate", function(_, isInMenu)
         pauseEventState = isInMenu == true
         if environmentSequence ~= nil then

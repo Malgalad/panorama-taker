@@ -278,16 +278,41 @@ Final Packet 10 GUI verification (2026-08-21): native Windows testing confirmed
 the JPEG-default export, quality 95, render-time form lock, and replacement
 confirmation for an existing output file.
 
+Packet 12 plan (2026-08-21): automatic linear-HDR overlap-graph exposure
+normalization is the next stitcher requirement and must support both SDR and
+HDR inputs. Native Settings integration is optional at runtime and will provide
+capture-only horizontal FoV, an estimated screenshot-count summary, and a
+0.1–3.0 second settling-delay control (default 1.0); settings must be applied
+only while idle and restored after a capture. The packet also reduces normal
+CET and ReShade logging to user-facing session events and includes a
+release-oriented review of the stitcher, add-on, and CET state machine. FoV
+conversion, plan estimation, capture metadata, and stitching tests must support
+4:3, 16:9, 16:10, 21:9, and 32:9 without cropping or a hidden 16:9 assumption.
+
+Packet 12 implementation started (2026-08-21): the stitcher now performs a
+bounded-memory linear-light exposure prepass, reports the overlap graph and
+gains in CLI/GUI, and applies those gains during streaming compositing. The
+CET development build also has optional Native Settings controls for temporary
+capture FoV and settling delay (default 1.0 second), with capture-only FoV
+restoration. In-game Native Settings verification and the remaining logging
+cleanup are still pending.
+
 Packet 11 release tooling (2026-08-21): shareable artifacts are now built only
 from version tags by GitHub Actions. A manual, non-publishing dispatch executes
 the same Windows build and retains its ZIPs, checksums, and provenance for seven
 days for a clean-machine smoke test. The pinned-action release workflow builds
 the ReShade add-on with MSVC x64, bundles the GUI with PyInstaller, stages CET
-and schema files, validates ZIP contents, produces `SHA256SUMS.txt`, and
-publishes the assets plus `BUILD-INFO.txt` provenance through the GitHub CLI. A separate CI workflow runs the
-stitcher checks for pull requests and `master`. `README.md` documents the
-tag-driven release process; the package must still complete its first hosted
-build and clean-machine installation test.
+files, validates ZIP contents, produces `SHA256SUMS.txt`, and publishes the
+assets plus `BUILD-INFO.txt` provenance through the GitHub CLI. The schema is
+now internal to the PyInstaller bundle rather than a visible extra directory.
+The packaged GUI records unexpected worker failures in the user configuration
+directory, so windowed EXR failures retain their tracebacks. The successful
+hosted dry run verified the packaged GUI's JPEG and EXR output; trimming broad
+PyInstaller collection of direct imports reduced its package by about 8 MiB
+while keeping the dynamically loaded OpenEXR and Imath modules. A separate CI
+workflow runs stitcher checks for pull requests and `master`. `README.md`
+documents the tag-driven release process; an independent clean-machine
+installation test remains before the first public tag.
 
 An in-game stock IGCS Connector panorama test completed camera movement and restoration, producing nine 3840×2160 baseline 8-bit JPEGs. Their HDR colors were incorrect, confirming that the connector's `uint8_t` capture path cannot replace normal ReShade HDR screenshots.
 

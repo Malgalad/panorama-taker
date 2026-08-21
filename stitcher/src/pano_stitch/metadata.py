@@ -114,12 +114,48 @@ def _cet_vector_to_canonical(vector: list[float]) -> tuple[float, float, float]:
     return vector[0], vector[2], vector[1]
 
 
+def _dot(left: tuple[float, float, float], right: tuple[float, float, float]) -> float:
+    return sum(left_value * right_value for left_value, right_value in zip(left, right))
+
+
+def _capture_reference_axes(
+    poses: list[dict[str, Any]],
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """Return yaw-zero right and forward axes in the converted engine world."""
+
+    reference = min(
+        poses,
+        key=lambda pose: abs((float(pose["commanded_yaw_deg"]) + 180.0) % 360.0 - 180.0),
+    )
+    right = _cet_vector_to_canonical(reference["right"])
+    horizontal_length = (right[0] * right[0] + right[2] * right[2]) ** 0.5
+    if horizontal_length < 1e-6:
+        raise ValueError("CET yaw-zero camera right vector is not horizontal")
+    capture_right = (right[0] / horizontal_length, 0.0, right[2] / horizontal_length)
+    return capture_right, (-capture_right[2], 0.0, capture_right[0])
+
+
+def _capture_relative_vector(
+    vector: list[float],
+    capture_right: tuple[float, float, float],
+    capture_forward: tuple[float, float, float],
+) -> tuple[float, float, float]:
+    """Express a converted CET vector in the capture's yaw-zero coordinate system."""
+
+    world = _cet_vector_to_canonical(vector)
+    return _dot(world, capture_right), world[1], _dot(world, capture_forward)
+
+
 def _load_cet_session(
     document: dict[str, Any], path: Path, image_directory: Path | None
 ) -> SessionMetadata:
     state = document.get("state")
     if state not in {"active", "completed", "aborted", "failed"}:
         raise ValueError("CET metadata state must be active, completed, aborted, or failed")
+    poses = document.get("poses", [])
+    if not poses:
+        raise ValueError("CET metadata must contain at least one pose")
+    capture_right, capture_forward = _capture_reference_axes(poses)
     frames = tuple(
         FrameMetadata(
             index=pose["index"],
@@ -130,13 +166,13 @@ def _load_cet_session(
             status="captured",
             camera_basis_row_major=tuple(
                 (
-                    *_cet_vector_to_canonical(pose["right"]),
-                    *_cet_vector_to_canonical(pose["up"]),
-                    *_cet_vector_to_canonical(pose["forward"]),
+                    *_capture_relative_vector(pose["right"], capture_right, capture_forward),
+                    *_capture_relative_vector(pose["up"], capture_right, capture_forward),
+                    *_capture_relative_vector(pose["forward"], capture_right, capture_forward),
                 )
             ),
         )
-        for pose in document.get("poses", [])
+        for pose in poses
     )
     return SessionMetadata(
         schema_version=document["schema_version"],

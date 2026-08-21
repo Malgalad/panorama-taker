@@ -471,7 +471,7 @@ class StitcherApp:
             self._events.put(
                 ("status", f"Rendering {resources.output_width}×{resources.output_height}…")
             )
-            render_session(
+            exposure_report = render_session(
                 session,
                 image_dir,
                 output_path,
@@ -485,7 +485,12 @@ class StitcherApp:
                 self.jpeg_quality_var.get(),
             )
             LOGGER.info("render completed: %s", output_path)
-            self._events.put(("success", f"Wrote {output_path}"))
+            self._events.put(
+                (
+                    "success",
+                    f"Wrote {output_path} (exposure edges: {exposure_report.edge_count})",
+                )
+            )
         except RenderCancelledError:
             LOGGER.info("%s cancelled", operation)
             self._events.put(("cancelled", "Render cancelled; partial files were removed."))

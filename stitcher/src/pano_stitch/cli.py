@@ -115,7 +115,7 @@ def main() -> None:
                 f"render plan: {resources.output_width}x{resources.output_height}, "
                 f"{resources.strip_height}-row strips, {scratch_gib:.2f} GiB scratch"
             )
-            render_session(
+            exposure_report = render_session(
                 session,
                 image_root,
                 arguments.output,
@@ -128,6 +128,11 @@ def main() -> None:
                 jpeg_quality=arguments.jpeg_quality,
             )
             print(file=sys.stderr)
+            gains = ", ".join(f"{gain:.3f}" for gain in exposure_report.gains)
+            print(
+                f"exposure normalization: anchor={exposure_report.anchor_frame + 1}, "
+                f"overlap edges={exposure_report.edge_count}, gains=[{gains}]"
+            )
             print(f"wrote {arguments.output}")
         else:
             print(f"valid session: {session.session_id}")
