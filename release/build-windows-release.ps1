@@ -21,12 +21,14 @@ $venvRoot = Join-Path $projectRoot ".venv-release"
 $python = Join-Path $venvRoot "Scripts\python.exe"
 $addon = (Resolve-Path $AddonPath).Path
 $pyproject = Get-Content -LiteralPath (Join-Path $projectRoot "stitcher\pyproject.toml") -Raw
+$versionMatch = [regex]::Match($pyproject, '(?m)^version\s*=\s*"(?<version>[^"]+)"\s*\r?$')
 
-if ($pyproject -notmatch '(?m)^version = "([^"]+)"$') {
+if (-not $versionMatch.Success) {
     throw "Cannot determine stitcher version from stitcher\pyproject.toml"
 }
-if ($Matches[1] -ne $Version) {
-    throw "Release version $Version does not match stitcher package version $($Matches[1])"
+$packageVersion = $versionMatch.Groups["version"].Value
+if ($packageVersion -ne $Version) {
+    throw "Release version $Version does not match stitcher package version $packageVersion"
 }
 
 if ([IO.Path]::GetExtension($addon).ToLowerInvariant() -ne ".addon64") {
