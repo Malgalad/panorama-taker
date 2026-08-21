@@ -7,3 +7,10 @@ __pycache__/
 build/
 dist/
 .venv/
+.venv-win/
+.venv-release/
+
+# Local game-development inputs and third-party checkout; release builds fetch/package
+# only the source-controlled payload.
+/captures/
+/mod/deps/

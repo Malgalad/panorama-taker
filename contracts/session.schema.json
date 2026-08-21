@@ -34,6 +34,17 @@
         "height": { "type": "integer", "minimum": 1 }
       }
     },
+    "image_encoding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sample_type", "color_primaries", "transfer_function", "reference_white_nits"],
+      "properties": {
+        "sample_type": { "enum": ["uint8", "uint16", "float16", "float32"] },
+        "color_primaries": { "enum": ["srgb", "rec2020"] },
+        "transfer_function": { "enum": ["srgb", "pq", "linear"] },
+        "reference_white_nits": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    },
     "fov": {
       "type": "object",
       "additionalProperties": false,
@@ -53,6 +64,24 @@
         "overlap_fraction": { "type": "number", "minimum": 0, "exclusiveMaximum": 1 },
         "yaw_step_deg": { "type": "number", "exclusiveMinimum": 0, "maximum": 360 },
         "pitch_step_deg": { "type": "number", "exclusiveMinimum": 0, "maximum": 180 }
+      }
+    },
+    "render_timing": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "required_real_settle_frames": { "type": "integer", "minimum": 0 },
+        "real_fps_at_start": { "$ref": "#/$defs/finiteNumber" },
+        "presented_fps_at_start": { "$ref": "#/$defs/finiteNumber" },
+        "frame_generation": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "active_backend": { "type": "string" },
+            "raw_settings": { "type": "object" }
+          }
+        }
       }
     },
     "frames": {
@@ -116,10 +145,6 @@
         "yaw_deg",
         "pitch_deg",
         "roll_deg",
-        "position",
-        "orientation_xyzw",
-        "view_matrix_row_major",
-        "projection_matrix_row_major",
         "status"
       ],
       "properties": {
@@ -130,8 +155,25 @@
         "roll_deg": { "$ref": "#/$defs/finiteNumber" },
         "position": { "$ref": "#/$defs/vector3" },
         "orientation_xyzw": { "$ref": "#/$defs/quaternionXYZW" },
+        "camera_basis_row_major": {
+          "type": "array",
+          "description": "Rows are camera right, up, and forward in canonical world coordinates.",
+          "prefixItems": [
+            { "$ref": "#/$defs/finiteNumber" }, { "$ref": "#/$defs/finiteNumber" },
+            { "$ref": "#/$defs/finiteNumber" }, { "$ref": "#/$defs/finiteNumber" },
+            { "$ref": "#/$defs/finiteNumber" }, { "$ref": "#/$defs/finiteNumber" },
+            { "$ref": "#/$defs/finiteNumber" }, { "$ref": "#/$defs/finiteNumber" },
+            { "$ref": "#/$defs/finiteNumber" }
+          ],
+          "items": false
+        },
+        "observed_forward": { "$ref": "#/$defs/vector3" },
+        "observed_right": { "$ref": "#/$defs/vector3" },
+        "observed_up": { "$ref": "#/$defs/vector3" },
         "view_matrix_row_major": { "$ref": "#/$defs/matrix16" },
         "projection_matrix_row_major": { "$ref": "#/$defs/matrix16" },
+        "settled_real_frames": { "type": "integer", "minimum": 0 },
+        "real_fps_before_capture": { "$ref": "#/$defs/finiteNumber" },
         "status": { "enum": ["planned", "captured", "failed"] }
       }
     }

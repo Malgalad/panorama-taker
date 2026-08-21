@@ -53,3 +53,45 @@ def test_full_sphere_plan_reaches_both_poles_within_vertical_fov(tmp_path: Path)
     assert max(pitches) == pytest.approx(90.0 - plan.pitch_step_deg / 2.0)
     assert min(pitches) - plan.pitch_step_deg / 2.0 <= -90.0
     assert max(pitches) + plan.pitch_step_deg / 2.0 >= 90.0
+
+
+def test_cet_metadata_loads_and_resolves_moved_windows_screenshot(tmp_path: Path) -> None:
+    screenshot = tmp_path / "pose-001.png"
+    screenshot.write_bytes(b"not a real png")
+    document = {
+        "schema_version": 1,
+        "session_id": "cet-test",
+        "horizontal_fov_deg": 90.6,
+        "vertical_fov_deg": 59.23,
+        "state": "completed",
+        "poses": [
+            {
+                "index": 1,
+                "screenshot_path": r"E:\Pictures\Cyberpunk 2077\pose-001.png",
+                "commanded_yaw_deg": 0.0,
+                "commanded_pitch_deg": -62.7,
+                "forward": [0.0, 0.45, -0.89],
+                "right": [1.0, 0.0, 0.0],
+                "up": [0.0, 0.89, 0.45],
+            }
+        ],
+    }
+    metadata = tmp_path / "PanoramaCaptureBridge.pano-test.json"
+    metadata.write_text(json.dumps(document), encoding="utf-8")
+
+    session = load_session(metadata, image_directory=tmp_path)
+
+    assert session.capture_mode is CaptureMode.FULL_SPHERE
+    assert session.completed
+    assert session.frames[0].filename == str(screenshot)
+    assert session.frames[0].camera_basis_row_major == (
+        1.0,
+        0.0,
+        0.0,
+        0.0,
+        0.45,
+        0.89,
+        0.0,
+        -0.89,
+        0.45,
+    )

@@ -11,7 +11,8 @@ dependencies = [
   "jsonschema>=4.20",
   "numpy>=2.0",
   "opencv-python>=4.10",
-  "pillow>=10.0"
+  "pillow>=10.0",
+  "OpenEXR>=3.4"
 ]
 
 [project.optional-dependencies]
@@ -21,9 +22,13 @@ dev = [
   "ruff>=0.6",
   "types-jsonschema>=4.24"
 ]
+bundle = [
+  "pyinstaller>=6.10"
+]
 
 [project.scripts]
 pano-stitch = "pano_stitch.cli:main"
+pano-stitch-gui = "pano_stitch.gui:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

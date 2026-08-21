@@ -2,12 +2,13 @@
 
 ## Objective
 
-Build two pieces of software:
+Build three cooperating pieces of software:
 
 1. `PanoramaCapture`: a Cyberpunk 2077 mod that positions the camera at precise, repeatable angles and coordinates screenshot capture.
-2. `pano-stitch`: a command-line script that uses the captured images and their metadata to produce a lossless equirectangular PNG.
+2. `PanoramaCapture.ReShade`: a small ReShade add-on that requests screenshots through ReShade and reports completed screenshot paths.
+3. `pano-stitch`: a command-line script that uses the captured images and their metadata to produce an equirectangular panorama without discarding source dynamic range. Use OpenEXR for the HDR proof of concept and provide PNG output in the final release.
 
-The repository is initially empty, so this plan assumes a new project with no existing compatibility constraints.
+The repository began as a new project; the packet status sections below identify the accepted implementation slices.
 
 ## Scope clarification
 
@@ -18,35 +19,50 @@ Support two modes:
 - `horizontal`: yaw-only, producing a cropped 360-degree equirectangular band.
 - `full_sphere`: yaw and pitch coverage from -90 to +90 degrees, producing a standard 2:1 equirectangular image.
 
-Implement `horizontal` first, but design the metadata and camera controller for `full_sphere` from the beginning.
+Use `horizontal` only as a camera-control and stitching diagnostic. The project MVP is `full_sphere`; a yaw-only band does not satisfy the objective.
 
 ## Recommended architecture
 
 ### PanoramaCapture mod
 
-Treat the mod as one product containing:
+Implement the production controller in CET Lua using the verified first-person player/FPP camera path outside Photo Mode. This path already changes yaw and pitch with exact two-click restoration. Full-sphere execution uses player world orientation for yaw and the FPP camera's local orientation for pitch, always deriving each pose from the saved origin rather than accumulating Euler changes.
 
-- A RED4ext C++ plugin for exact final-camera transform and FoV control.
-- A small Cyber Engine Tweaks Lua front end for configurable bindings and user-facing status.
+Required runtime components are CET, its required RED4ext runtime, and ReShade for 16-bit HDR screenshots. The project does not require the paid IGCS tools or IGCS Connector. Keep the custom RED4ext plugin as a fallback only if one measured CET requirement fails.
 
-RED4ext is the appropriate camera layer because its SDK exposes game structures and native scripting integration. It also supports runtime compatibility declarations so an unsupported game update can be rejected instead of risking a crash.
+The CET capture environment must:
 
-References:
+- apply a uniquely named time dilation near zero and remove only that dilation on restore;
+- keep CET/camera updates responsive while the world is frozen;
+- apply reversible `NoMovement` and `NoCameraControl` restrictions while capture is active so manual screenshots cannot be invalidated by accidental input; document their non-ownership-aware interaction with FreeFly and similar mods;
+- snapshot the `inkHUDLayer` widget opacities, hide the layer's children during capture, and restore the exact saved values;
+- reapply HUD hiding at capture transitions so newly created HUD children cannot appear in later frames;
+- snapshot every player and active-weapon mesh component's enabled state, disable both renderers during capture, and restore the exact saved states;
+- re-scan and track newly created player or active-weapon mesh components before each capture pose;
+- restore camera, player meshes, HUD, and time state on completion, abort, Photo Mode/menu transitions, player detach, CET shutdown, and recoverable errors.
 
-- [Creating a RED4ext plugin](https://docs.red4ext.com/mod-developers/creating-a-plugin)
-- [RED4ext SDK capabilities](https://docs.red4ext.com/mod-developers/red4ext-and-red4ext.sdk)
-- [RED4ext custom native classes](https://docs.red4ext.com/mod-developers/creating-a-custom-native-class)
-- [CP2077 FOV Control reference implementation](https://github.com/koryboc/CP2077-FovControl)
+Use CET `registerInput` for Start/Advance/Abort bindings. Read back the active camera transform, basis, FoV, and aspect ratio after every pose change. Never infer metadata only from requested angles.
 
-Use CET `registerInput` for configurable bindings:
+Measure real game FPS from CET `onUpdate(deltaTime)` and detect frame-generation settings through `Game.GetSettingsSystem()`. Keep real game frames distinct from generated presentation frames. After every final pose write, count at least the configured number of real `onUpdate` frames before capture; default to 8. A native swap-chain present counter may provide optional presented-FPS diagnostics, but must not become a dependency or advance the temporal-settling counter.
 
-- Start capture session
-- Capture/advance in manual mode
-- Abort and restore camera
+Do not use the FPP setters while Photo Mode is active and do not execute the native REDengine `GetCameraSystem` RTTI query during startup.
 
-CET hotkeys fire on release and can fail while another game binding is held, so `registerInput` is preferable even though the user-facing concept is still a hotkey.
+See `docs/igcs-evaluation.md` for why IGCS Connector is not the selected full-sphere backend.
+See `docs/cet-fpp-reference-implementations.md` for the installed CET-mod implementations used as the basis for time freeze, HUD suppression, and player-renderer hiding.
 
-Reference: [CET hotkey documentation](https://wiki.redmodding.org/cyber-engine-tweaks/cet-functions/hotkeys/registerhotkey)
+### ReShade screenshot add-on
+
+Implement screenshot capture and completion reporting as a small native ReShade add-on. Vendor the official headers from the ReShade `v6.7.3` tag (API 18), matching the installed ReShade 6.7.3 runtime; do not build against the moving `main` headers, which currently advertise a newer API. Register `init_effect_runtime`, `destroy_effect_runtime`, `reshade_present`, and `reshade_screenshot` callbacks through the official add-on API.
+
+- Accept at most one pending capture request carrying a session ID, pose index, and short filesystem-safe correlation token.
+- Consume the request from `reshade_present`, then call `effect_runtime::save_screenshot(token)` on the active runtime. Do not call runtime methods from an IPC worker thread; the public API does not document that as thread-safe.
+- Treat `addon_event::reshade_screenshot(runtime, path)` as the authoritative successful-save signal. It is documented as running after the screenshot has been saved and supplies the exact path.
+- Match completion by both runtime and correlation token. Ignore unrelated screenshots instead of binding them to the current pose.
+- Reject concurrent requests and emit a timeout/error without advancing the camera if no matching event arrives.
+- Use ReShade's configured screenshot path, naming, format, effects, and HDR pipeline. Do not parse the on-screen notification and do not discover successful captures by directory polling in the primary path.
+- Use the callback path as authoritative; reading `[SCREENSHOT] SavePath` is unnecessary for association. If preflight/status needs the configured directory, query it through ReShade's `get_config_value` API instead of parsing `ReShade.ini` independently.
+- Keep the existing stable-file watcher and Print Screen simulation only as compatibility fallbacks.
+
+Before integration, prove in game that `save_screenshot()` produces the same kind of 3840×2160 16-bit Rec.2020/PQ PNG as the verified ReShade hotkey. The API uses ReShade's disk-save path, but identical Cyberpunk HDR behavior is an empirical compatibility gate. If this gate fails, retain the event callback for exact completion/path reporting and trigger ReShade's normal screenshot binding as the fallback.
 
 ### pano-stitch command-line tool
 
@@ -54,12 +70,15 @@ Use Python 3.12 with:
 
 - NumPy for projection calculations
 - OpenCV for image remapping
-- Pillow for PNG input/output
+- an HDR-capable image layer for 16-bit PNG and floating-point OpenEXR
+- Pillow only for ordinary 8-bit PNG compatibility where appropriate
 - pytest for tests
 - Ruff for linting and formatting
 - mypy for type checking
 
 The stitcher must use recorded camera geometry. Do not use image feature matching in the MVP.
+
+The stitcher must remain below 1,000,000,000 bytes of peak resident memory while rendering a complete session of 30 3840×2160 HDR screenshots. Treat this as a hard MVP acceptance requirement, not an optional optimization. Use a conservative internal working-memory target of at most 768 MiB so decoder, Python runtime, and output-writer overhead cannot push the process over the limit.
 
 ## Suggested repository layout
 
@@ -82,6 +101,11 @@ cp2077-panorama-taker/
 │   │   └── plugin.cpp
 │   ├── scripts/PanoramaCapture.reds
 │   └── cet/init.lua
+├── reshade-addon/
+│   ├── CMakeLists.txt
+│   ├── include/
+│   ├── src/addon.cpp
+│   └── tests/
 ├── stitcher/
 │   ├── pyproject.toml
 │   ├── src/pano_stitch/
@@ -113,6 +137,12 @@ Example:
     "width": 3840,
     "height": 2160
   },
+  "image_encoding": {
+    "sample_type": "float16",
+    "color_primaries": "rec2020",
+    "transfer_function": "linear",
+    "reference_white_nits": 203.0
+  },
   "fov": {
     "horizontal_deg": 100.0,
     "vertical_deg": 67.67,
@@ -127,6 +157,19 @@ Example:
     "yaw_step_deg": 90.0,
     "pitch_step_deg": 60.0
   },
+  "render_timing": {
+    "required_real_settle_frames": 8,
+    "real_fps_at_start": 47.8,
+    "presented_fps_at_start": 95.4,
+    "frame_generation": {
+      "enabled": true,
+      "active_backend": "dlss",
+      "raw_settings": {
+        "DLSSFrameGen": true,
+        "DLSS_MultiFrameGeneration": 1
+      }
+    }
+  },
   "frames": [
     {
       "index": 0,
@@ -138,6 +181,8 @@ Example:
       "orientation_xyzw": [0.0, 0.0, 0.0, 1.0],
       "view_matrix_row_major": [],
       "projection_matrix_row_major": [],
+      "settled_real_frames": 8,
+      "real_fps_before_capture": 46.9,
       "status": "captured"
     }
   ],
@@ -148,9 +193,13 @@ Example:
 Contract requirements:
 
 - Store both horizontal and vertical FoV to eliminate convention ambiguity.
-- Record the final observed projection and view matrices.
+- Record source sample type, color primaries, transfer function, and reference-white/max-luminance metadata needed to decode HDR values consistently.
+- Require one compatible encoding for all frames in a session. Reject mixed SDR/HDR or mixed transfer functions until explicit conversion is implemented.
+- Record final observed projection and view matrices when the active CET camera exposes them. In the next schema revision, make matrices optional and require verified horizontal/vertical FoV plus viewport dimensions as the projection fallback.
 - State matrix layout, handedness, axis directions, quaternion order, and angle signs in the schema descriptions.
 - Record commanded yaw, pitch, and roll as canonical angles relative to the panorama origin.
+- Record smoothed real FPS, required/observed real settle-frame counts, normalized frame-generation state, and every available raw frame-generation setting. Record presented FPS only when a native present counter is available.
+- Reject a frame-generation setting change during an active session; a new configuration requires a new session.
 - Keep screenshot filenames relative to the manifest.
 - Include the game version, RED4ext version, mod version, and UTC timestamps.
 - Rewrite the manifest atomically after each successful frame: write a temporary file, flush it, and replace the old manifest.
@@ -163,26 +212,30 @@ Contract requirements:
 
 This is a mandatory gate before implementing the complete mod.
 
-1. Pin the exact Cyberpunk 2077, RED4ext, and RED4ext.SDK versions.
-2. Locate the current active render camera using current SDK types and NativeDB.
-3. Log its position, orientation, FoV, viewport, and projection matrix.
-4. Override its final position and orientation after the ordinary game camera update.
-5. Verify that the game does not overwrite that transform before rendering.
-6. Change FoV and verify the effective value in the final projection matrix.
-7. Confirm that the camera can be restored safely.
-8. Reject unsupported game versions clearly.
+1. Pin the exact Cyberpunk 2077, ReShade, CET, and required RED4ext runtime versions.
+2. Detect and reject Photo Mode and other unsupported camera/player states before using the normal FPP camera.
+3. Log the active camera position, orientation/basis, FoV, and viewport. Log projection data if CET exposes it; do not require unavailable matrices.
+4. Snapshot, apply, verify, and restore an absolute FPP player/camera pose.
+5. Verify that yaw and pitch rotate around one unchanged optical center and introduce no roll.
+6. Change FoV and read the effective value back from the active FPP camera.
+7. Repeat the absolute-pose test across a complete yaw circle and near both pitch poles.
+8. Confirm safe restoration on the normal restore command, abort, CET reload, save transition, and script error where recoverable.
+9. Verify the capture environment restores time dilation, exact HUD state, and exact player mesh states alongside the camera pose.
+10. Verify body, arms, equipment, shadows, and reflections are absent throughout equatorial and polar views.
+11. Reject unsupported or unverified runtime behavior clearly.
 
 Existing camera and FoV projects may be used as references, but do not copy version-specific offsets or signatures without validating them against the pinned runtime.
 
 Spike acceptance criteria:
 
-- Optical-center movement below 1 mm between rotations.
-- Commanded versus observed orientation error below 0.01 degrees.
+- Optical-center movement below 1 mm between rotations, or the smallest reliably measurable CET tolerance if camera-world position is not exposed directly.
+- Commanded versus observed orientation error below 0.01 degrees, or a documented tighter-than-one-output-pixel angular tolerance derived from the target resolution.
 - FoV remains fixed across at least 300 rendered frames.
 - Restoration returns the camera to its original pose and FoV.
-- Unsupported game versions fail with a useful log message rather than crashing.
+- Reloading CET or changing saves while idle is safe; interrupting an active probe restores immediately when CET provides an applicable shutdown/exit callback.
+- Unsupported game versions or camera modes fail with a useful log message rather than crashing.
 
-Do not begin the production camera controller until this spike passes inside the actual game.
+The CET Photo Mode control gate failed, but this does not apply to the normal first-person path: FPP yaw/pitch changes and exact restoration are already verified. CET-accessible time dilation, HUD-layer controls, and player mesh-component hiding have also been found in working installed mods. The remaining gate is an in-game FPP capture-environment test covering frozen-world behavior, complete HUD and player-renderer suppression, polar coverage, stable optical center/FoV, and restoration.
 
 ### Capture planning
 
@@ -219,7 +272,7 @@ pitch[row] = -90 + pitchStep / 2 + row * pitchStep
 yaw[col]   = col * yawStep
 ```
 
-Use every yaw position in every pitch row initially. This is redundant near the poles but simple and conservative. Optimizing the number of polar frames is a later enhancement.
+Use row-adaptive yaw counts after geometric coverage validation. Start from the latitude-scaled azimuth count, then apply a small configurable guard band before rounding so different adjacent rows cannot leave diagonal gaps. For the verified 59.230° × 35.462° capture geometry with 8% overlap and a 5% adaptive-yaw guard, use 3/6/7/7/6/3 frames from nadir to zenith (32 total). Re-run the metadata-only coverage diagnostic whenever FoV, overlap, guard, or projection conventions change.
 
 Generate and validate the complete shot list when the session starts. Store it in the manifest before taking the first screenshot.
 
@@ -232,7 +285,7 @@ When starting a session:
 3. Apply the configured FoV.
 4. Wait until the final projection reports the expected FoV.
 5. Build every shot orientation relative to the origin.
-6. Reapply the current absolute shot pose on every rendered frame.
+6. Apply the current absolute shot pose once, wait for settling, then verify it from the active camera.
 
 Never rotate incrementally. Calculate every pose from the original snapshot:
 
@@ -241,7 +294,7 @@ shotOrientation = baseOrientation * relativeYawPitchOrientation
 shotPosition = basePosition
 ```
 
-This prevents cumulative floating-point drift and ensures rotation occurs around the optical center.
+This prevents cumulative floating-point drift and ensures rotation occurs around the optical center. Do not write or teleport continuously in `onUpdate`; retry a pose only a small, bounded number of times when verification shows that the first write was ignored.
 
 Define a canonical panorama coordinate system shared with the stitcher. A reasonable choice is:
 
@@ -267,7 +320,7 @@ Idle
   -> Settling
   -> Ready
   -> TriggeringScreenshot
-  -> AwaitingScreenshotFile
+  -> AwaitingScreenshotEvent
   -> CommittingFrame
   -> ApplyingNextPose
   -> Settling
@@ -280,7 +333,7 @@ Any active state may transition to `Aborted` or `Error`.
 Rules:
 
 - Ignore repeated or re-entrant commands while an operation is pending.
-- Use both `settle_frames` and `settle_ms` before declaring a pose ready.
+- Use both configured `settle_frames` and `settle_ms` minima before declaring a pose ready. The default `settle_ms` is zero so the eight-real-frame requirement is authoritative; use the screenshot timeout as a stall watchdog.
 - Keep enforcing the absolute camera pose while settling and capturing.
 - Do not rotate until screenshot completion has been confirmed.
 - Restore the original transform and FoV after completion or abort by default.
@@ -292,31 +345,31 @@ Rules:
 #### MVP: manual mode
 
 1. The mod moves and locks the camera.
-2. The user invokes the ReShade screenshot binding.
-3. The user presses Capture/Advance.
-4. The mod locates the new screenshot, commits its metadata, and advances.
+2. The user invokes either the add-on capture binding or ReShade's screenshot binding.
+3. The add-on receives `reshade_screenshot` with the exact completed path.
+4. The user presses Capture/Advance.
+5. The coordinator commits the matching path and pose metadata, then advances.
 
 Only one screenshot may be awaiting association with a frame.
 
 #### Automated mode
 
-1. Snapshot the configured screenshot directory contents.
-2. Simulate the configured screenshot key with Win32 `SendInput`.
-3. Poll the directory for a new supported image.
-4. If multiple new candidates appear, stop with an association error.
-5. Wait until the new file's size is stable over at least two polls.
-6. Verify that it can be decoded and has the expected dimensions.
-7. Commit its filename and camera metadata.
-8. Advance to the next pose.
+1. After the CET pose is ready, send one correlated capture request to the add-on.
+2. On the next suitable `reshade_present`, call `effect_runtime::save_screenshot(correlation_token)`.
+3. Wait for a matching `reshade_screenshot` event; its path is authoritative.
+4. Verify that the completed file can be decoded and has the expected dimensions and HDR encoding.
+5. Atomically commit its relative filename and camera metadata.
+6. Acknowledge completion to CET and only then advance to the next pose.
 
-ReShade's default screenshot key is Print Screen. Its normal input path queues the screenshot for a following frame, so a fixed sleep alone is not sufficient.
+The communication transport is a small local command/event bridge. Keep transport I/O off the render callback: an IPC worker may enqueue/dequeue bounded plain-data messages, while `reshade_present` alone touches the runtime. The first implementation uses an add-on-owned capture hotkey plus an append-only event record to prove capture and event correlation. Before unattended capture, spike whether CET can access a named pipe without blocking its update callback. If not, use atomically replaced request/acknowledgement files in a dedicated bridge directory; this polls tiny control records, never the screenshot directory. Do not revive the RED4ext plugin solely for transport unless both approaches fail.
 
 References:
 
 - [ReShade screenshot implementation](https://github.com/crosire/reshade/blob/main/source/runtime.cpp)
 - [ReShade API, including direct screenshot capture](https://github.com/crosire/reshade/blob/main/include/reshade_api.hpp)
+- [ReShade add-on events](https://github.com/crosire/reshade/blob/main/include/reshade_events.hpp)
 
-ReShade exposes a direct `save_screenshot` API, but using it requires a ReShade add-on. Treat that as an optional later integration because it adds another native component and communication boundary.
+ReShade's `capture_screenshot(void *)` is not the selected path: it returns raw back-buffer bytes to the caller and would make this project responsible for HDR encoding, file naming, and save-path handling. Use `save_screenshot()` so ReShade retains ownership of those details.
 
 ### Configuration
 
@@ -325,17 +378,18 @@ Start with a JSON configuration similar to:
 ```json
 {
   "capture_mode": "full_sphere",
-  "screenshot_mode": "manual",
+  "screenshot_mode": "reshade_addon",
   "target_fov_deg": 100.0,
   "fov_axis": "horizontal",
   "overlap_fraction": 0.08,
-  "settle_frames": 10,
-  "settle_ms": 500,
+  "settle_frames": 8,
+  "settle_ms": 1500,
   "screenshot_timeout_ms": 10000,
-  "screenshot_directory": "D:/Screenshots/Cyberpunk",
-  "screenshot_key_vk": 44,
+  "screenshot_bridge_mode": "control_files",
+  "screenshot_bridge_path": "PanoramaCaptureProbe/bridge",
   "restore_camera": true,
-  "hide_ui": false
+  "hide_ui": true,
+  "hide_player": true
 }
 ```
 
@@ -343,13 +397,15 @@ Validate at minimum:
 
 - FoV is greater than zero and safely below 180 degrees.
 - Overlap is non-negative and below a documented upper limit.
-- Screenshot directory exists and is writable by ReShade.
+- The ReShade add-on and a compatible add-on API are loaded.
+- The add-on reports an active effect runtime before capture starts.
 - Timeouts and settling values are non-negative.
+- `settle_frames` counts real CET game-update frames after the final pose write, never frame-generated swap-chain presents; `settle_ms` is an independent lower bound for GI/temporal stabilization.
 - Capture mode and screenshot mode use known values.
 
-### UI hiding and stable-scene guidance
+### Capture-environment guidance
 
-UI hiding is low priority. Initially recommend Photo Mode or an existing HUD-hiding mod rather than expanding the camera controller.
+UI and player-renderer hiding are required for unattended FPP capture. Snapshot and restore exact state rather than relying on another mod's toggle state. Reject capture if complete HUD suppression or player-mesh restoration cannot be guaranteed.
 
 Document that users should disable or lock effects that violate the rectilinear-camera assumption or change between frames:
 
@@ -443,7 +499,7 @@ Implement two modes:
 - `hard`: choose the valid frame where the projected point is furthest from a screenshot edge.
 - `feather`: blend only inside overlaps, using distance from invalid screenshot edges as weights.
 
-Convert sRGB values to linear RGB before feathering and convert back to sRGB before saving. Blending gamma-encoded values produces incorrect brightness.
+Decode the recorded transfer function into a `float32` linear-light working buffer before interpolation or feathering. Support ordinary sRGB plus the HDR transfer function produced by the verified ReShade workflow. Convert to the selected output encoding only after compositing. Blending gamma-, PQ-, or HLG-encoded values produces incorrect brightness.
 
 Do not implement these in MVP:
 
@@ -474,9 +530,30 @@ Round the result to an even number. Permit explicit `--width` override.
 
 For horizontal-only mode, emit a cropped equirectangular band. Do not silently generate a 2:1 image with invented or black poles.
 
-Save an 8-bit RGB PNG initially. PNG compression is lossless; compression level affects file size and encoding time, not image fidelity. Preserve ICC metadata only if all source images use the same profile.
+For the HDR proof of concept, read a real ReShade HDR capture without reducing it to 8-bit, process it in `float32` linear light, and save a half-float or float OpenEXR panorama. OpenEXR is the reference output used to prove that highlights and values above SDR white survive the complete pipeline.
 
-For the MVP, a full NumPy output buffer is acceptable with a documented output-size limit. If memory becomes a practical problem, add tiled rendering and streamed PNG writing as a separate optimization.
+The release must also expose PNG output:
+
+- SDR sources may produce ordinary lossless 8-bit or 16-bit PNG.
+- HDR sources currently produce an explicitly tone-mapped lossless 8-bit SDR PNG preview. Stream this output directly; do not create an EXR intermediate.
+- Retain EXR as the archival HDR output. A future HDR-capable PNG mode requires verified transfer-function, primaries, bit-depth, and signaling support in the chosen viewers.
+- Exact Rec.2020-to-display-primary conversion and tone-map tuning remain release work; do not describe the SDR PNG preview as preserving source dynamic range.
+
+Pillow cannot be the sole HDR image backend because its multichannel RGB path is limited to 8 bits per channel. Select and test the HDR backend against actual ReShade files before freezing dependencies.
+
+Rendering must be out of core:
+
+- Never retain all decoded source images or a complete floating-point panorama in resident memory.
+- Probe source headers and encoding sequentially during validation, then decode at most one source image at a time.
+- Convert transfer functions to linear `float32` in bounded row chunks so PQ decoding does not create several full-image temporaries.
+- Composite bounded output strips or tiles. Store the panorama and hard/feather weight accumulators in disk-backed scratch files, reading and writing only the active tile rather than relying on the operating system to evict a whole-file memory map.
+- Derive tile dimensions from a conservative worst-case allocation estimate that includes directions, projection maps, masks, sampled RGB, blend weights, the decoded source, decoder buffers, and writer buffers.
+- Stream completed output rows or tiles into an EXR/PNG backend proven not to stage the complete output image. If a selected encoder cannot do that, reject it rather than silently exceeding the memory limit.
+- Create output and scratch files atomically where practical, and remove incomplete scratch data after success or a handled failure.
+- Treat successful requested outputs as user-owned artifacts and never delete them automatically. Scratch directories and `.partial` outputs are implementation details and must be removed; manually requested benchmark/debug outputs require an explicit cleanup command or user action.
+- Ensure `Ctrl+C`/`KeyboardInterrupt` removes the atomic `.partial` output. A hard process kill or power loss cannot run in-process cleanup, so document or implement a narrowly scoped stale-artifact cleanup command that only targets the compositor's recognizable scratch/partial names.
+
+The CLI may expose the calculated tile size and estimated working set for diagnostics, but production defaults must remain under the hard memory ceiling without requiring user tuning.
 
 ## Verification plan
 
@@ -500,6 +577,10 @@ For the MVP, a full NumPy output buffer is acceptable with a documented output-s
 - Verify hard and feather modes do not produce uncovered pixels.
 - Verify rendering identical input twice produces identical output.
 - Verify the result is a valid PNG and exactly 2:1 in full-sphere mode.
+- Verify an HDR synthetic source containing values above 1.0 survives projection and EXR output within floating-point tolerance.
+- Verify hard and feather compositing operate in linear light for HDR inputs.
+- Run the renderer in a subprocess against 30 3840×2160 HDR fixtures or equivalent deterministic generated inputs, sample its resident set throughout the render, and assert that peak RSS remains below 1,000,000,000 bytes for both hard and feather modes.
+- Verify that increasing output width increases scratch-file size and processing time without causing panorama-sized resident allocations.
 
 ### In-game acceptance test
 
@@ -567,52 +648,114 @@ Acceptance:
 - Longitude seam and pole tests pass.
 - Output is deterministic and lossless PNG.
 
-### Packet 4: RED4ext camera feasibility spike
+### Packet 3H: HDR stitcher proof of concept
 
 Deliverables:
 
-- Pin supported game and SDK versions.
-- Build a minimal plugin that logs final camera parameters.
-- Demonstrate absolute camera transform and FoV override.
-- Demonstrate restoration.
-- Document all verified APIs, hooks, and runtime assumptions.
+- Replace the unconditional Pillow `RGB`/`uint8` decode path with an image backend that preserves a verified ReShade HDR input.
+- Add source-encoding metadata and validation.
+- Process projection, interpolation, and blending in `float32` linear light.
+- Write a half-float or float OpenEXR panorama.
+- Add synthetic HDR tests containing values below black-reference, at reference white, and above 1.0.
 
 Acceptance:
 
-- Pass all feasibility criteria defined above in the actual game.
+- A real ReShade HDR screenshot can be decoded without reducing it to 8-bit.
+- Values above 1.0 survive a render/read-back round trip within documented tolerance.
+- Hard and feather modes do not clamp HDR values.
+- Ruff, mypy, and pytest pass.
+
+### Packet 3M: memory-bounded HDR compositor
+
+Deliverables:
+
+- Replace eager loading of every source image with sequential header validation and one-source-at-a-time decoding.
+- Replace the full panorama/direction/weight arrays with bounded tiles and disk-backed scratch accumulators.
+- Decode PQ and other transfer functions in bounded chunks without full-image intermediate arrays.
+- Add incremental EXR output; keep PNG output on the same bounded writer contract when it is enabled.
+- Add allocation estimates and peak-RSS integration measurement for hard and feather rendering.
+
+Acceptance:
+
+- Rendering 30 3840×2160 HDR inputs stays below 1,000,000,000 bytes peak RSS, including Python, decoder, compositor, and encoder memory.
+- HDR values and output pixels match the existing eager implementation within documented floating-point tolerance on synthetic fixtures.
+- No code path constructs a list of decoded session images or a complete in-memory panorama.
+- Interrupted and failed renders do not leave a valid-looking partial output and clean up their scratch files.
+- `Ctrl+C` cleanup is verified for both PNG and EXR; stale cleanup after an uncatchable hard kill never deletes a successful requested output.
+- Ruff, mypy, and pytest pass without warnings.
+
+Current result (2026-08-20): the 16-image v0.1.5 quarter-dimension PNG render (2984×1492, feather blend) peaked at 432,068 KiB RSS (421.9 MiB), used no swap, and required 71,234,048 bytes (67.9 MiB) of disk scratch. The direct PNG is 7,108,960 bytes (6.78 MiB). No `pano-stitch-*` scratch directory, `.partial` output, or EXR conversion intermediate remained after completion. The same manifest estimates 1,140,126,752 bytes (1.06 GiB) of scratch at its native 11,938×5,969 output size.
+
+### Packet 4: CET FPP capture-environment feasibility
+
+Deliverables:
+
+- Pin supported game, CET, and required RED4ext runtime versions.
+- Reject capture while Photo Mode, menus, vehicles, ladders, scripted scenes, or other unsupported camera states are active.
+- Require other time-control features to be inactive because CET does not expose the prior value of the global local-player dilation-ignore flag used by the initial probe.
+- Add a two-click environment probe: first click snapshots state, applies near-zero time dilation, hides `inkHUDLayer` and player mesh components, and applies a representative FPP yaw/pitch; second click restores everything.
+- Verify moving NPCs, vehicles, particles, weather, animation, and player sway remain visually stationary over the maximum expected capture duration.
+- Verify the player/FPP camera remains controllable while dilation is active.
+- Log smoothed real FPS from CET update deltas and the raw/normalized state of every available DLSS, FSR3, XeSS, and generic frame-generation setting.
+- Verify exactly eight or the configured greater number of real CET update frames elapse after the final pose write before the probe reports capture-ready, regardless of frame-generation multiplier.
+- If a native present counter is available, log presented FPS and its ratio to real FPS as diagnostics without using it for settling.
+- With frame generation off and on, compare CET update count against UltraTool's present count and visually verify that eight CET updates advance temporal accumulation as expected. Document the observed multiplier and reject this counter source if it tracks generated presents.
+- Verify all HUD, markers, interaction prompts, quest widgets, crosshair, damage overlays, notifications, and newly spawned HUD children remain absent.
+- Verify the player body, head, arms, held weapon, clothing, cyberware, shadows, and reflections remain absent at representative equatorial and polar poses.
+- Verify originally disabled mesh components remain disabled after restoration and newly created components are tracked safely.
+- Test all planned pitch-row centers, including rows whose FoV covers both poles, without optical-center movement or unexpected roll.
+- Test normal completion, abort, CET reload, save reload, and recoverable error restoration.
+
+Acceptance:
+
+- Time freeze, HUD suppression, player-renderer suppression, real-frame temporal settling, full-sphere orientation coverage, FoV stability, and restoration pass in the actual game.
 - No production state machine or screenshot automation yet.
 
-Stop the project here if the spike cannot control the final render camera precisely. Investigate a different hook point or an established free-camera integration before continuing.
+If CET cannot meet one specific criterion, investigate a documented game API, established free-camera integration, or narrowly scoped native fallback for that criterion. Do not restore the custom RED4ext plugin to the whole architecture by default.
 
-### Packet 5: production camera controller
+Current result (2026-08-20): the live CET environment probe passes FPP yaw/pitch movement and exact two-click restoration, near-zero time dilation, HUD suppression/restoration, player mesh suppression/restoration, frame-generation setting detection, and eight-real-update-frame settling. Quick-load while frozen is a known limitation: F9/session teardown does not execute until time is unfrozen, so automatic cleanup cannot run during that interval. Defer deeper input/native-hook work unless unattended abort during a frozen session becomes a release requirement. Packet 4 still needs the planned adversarial checks: polar rows, complete UI/transient coverage, and frame-generation on/off counter validation.
 
-Deliverables:
-
-- Implement absolute pose locking from a base transform.
-- Implement effective FoV application and readback.
-- Convert engine coordinates into canonical metadata coordinates.
-- Implement safe restoration and runtime guards.
-
-Acceptance:
-
-- No cumulative rotation drift.
-- Position and orientation tolerances pass in game.
-- Unsupported runtime behavior is safe and logged.
-
-### Packet 6: CET frontend
+### Packet 5: production CET FPP camera controller
 
 Deliverables:
 
-- Expose minimal native Start, Advance, Abort, and Status functions.
-- Add configurable CET input bindings.
-- Load and validate configuration.
-- Show concise state/error notifications.
+- Implement absolute FPP poses derived from one saved player/camera origin.
+- Implement full-sphere yaw/pitch planning and effective FoV readback.
+- Use row-adaptive yaw counts: reduce azimuth samples toward the poles according to the row latitude while preserving the configured overlap margin.
+- Integrate capture-environment snapshot, near-zero time dilation, HUD hiding, player mesh hiding, and exact restoration.
+- Extend the session schema with render-timing and frame-generation metadata before the capture mod emits production manifests.
+- Convert observed engine transforms into canonical metadata coordinates.
+- Add runtime guards for unsupported camera/player states.
 
 Acceptance:
 
-- Bindings work while normal movement inputs are held.
+- Commanded and observed yaw/pitch agree within tolerance for every full-sphere pose.
+- Optical center and FoV remain fixed and roll stays at the commanded value.
+- Completion and abort restore camera, player orientation, every recorded player mesh state, HUD state, and time dilation.
+- Unsupported states fail safely and clearly.
+
+Current result (2026-08-21): v0.1.12 completed the full Packet 5 acceptance set. In-game checks cover full-sphere capture, guarded 3/5/5/3 planning at 90.60°×59.23° FoV, calibrated pitch, time/HUD/player/weapon/input restoration, menus/vendor UI, vehicles, scripted scenes, CET overlay close, and CET reload. Documented limitations are frozen-time F9, FreeFly conflict, non-ownership-aware input restrictions, unsupported vehicle cameras, and unverified exotic hand props.
+
+### Packet 6: CET frontend and full-sphere session controller
+
+Deliverables:
+
+- Implement deterministic yaw and pitch-row execution from the observed effective horizontal/vertical FoV and configured overlap.
+- Implement Start, Advance, Abort, and Status operations in the CET mod.
+- Add configurable CET input bindings and validated configuration.
+- Report smoothed real FPS, frame-generation configuration, elapsed real settle frames, and estimated readiness time in Status.
+- Read back the actual pose/FoV after every FPP pose change and convert it to canonical metadata.
+- Prevent Photo Mode or incompatible camera controllers from starting during a session.
+
+Acceptance:
+
+- Exactly one capture pose is produced for every planned yaw/pitch pair without a duplicate 360-degree endpoint.
+- Measured optical-center, pitch, yaw, and roll tolerances pass for the complete sphere.
 - Invalid configuration prevents session start and explains why.
 - Repeated commands cannot corrupt state.
+- Changing the frame-generation multiplier cannot shorten the required real-frame settling interval.
+
+Current result (2026-08-21): Packet 6 is accepted. Start, Advance, Abort, FoV-derived adaptive planning, 1.5-second/eight-real-frame settling, observed pose/FoV metadata, readiness gating, validated user-editable capture settings, configurable CET bindings, and an explicit Status binding are operational. Status was tested idle, during settling, and after abort; zero-pitch calibration eliminated the prior routine first-pose correction. Further frontend presentation is release polish, not a packet gate.
 
 ### Packet 7: manual capture sessions
 
@@ -620,32 +763,60 @@ Deliverables:
 
 - Implement the capture state machine.
 - Create per-session output directories and manifests.
-- Detect user-created screenshots in manual mode.
+- Scaffold a 64-bit ReShade add-on with the official ReShade `v6.7.3` API 18 headers.
+- Register runtime lifecycle, present, and screenshot callbacks.
+- Add an add-on-owned test capture binding that calls `save_screenshot()` with a pose correlation token.
+- Record the exact completed path from `reshade_screenshot`; ignore unrelated captures.
+- Verify add-on-triggered output remains 3840×2160 16-bit Rec.2020/PQ PNG with ReShade effects applied.
 - Associate one image with one pose.
 - Atomically update metadata and advance.
 
+Packet 7 implementation began with `stitcher/scripts/extract_cet_pose_manifest.py`: it binds the latest complete indexed CET metadata session to a caller-selected filename interval, rejects unsupported/empty files and count mismatches, and atomically writes the resulting manifest. The stable-file watcher remains a tested fallback. The ReShade add-on proof and exact event/path correlation are complete; per-pose advancement integration is deferred to Packet 8's CET bridge.
+
 Acceptance:
 
-- Horizontal panorama capture completes end to end.
-- Timeout and ambiguous-file cases do not rotate the camera.
+- Full-sphere capture completes end to end.
+- A test request causes exactly one normal ReShade HDR screenshot and exactly one matching completion event.
+- The verified add-on request produced a 3840×2160, 16-bit RGB PNG decodable as `uint16`, with HDR-range sample values matching the normal ReShade workflow.
+- Manual or third-party screenshots cannot be associated with the pending panorama pose.
+- Timeout and correlation failures do not rotate the camera.
 - Abort and completion restore the original camera.
 
 ### Packet 8: automated ReShade screenshots
 
+Implementation note (2026-08-21): the first transport is the atomic control
+file fallback. CET writes `PanoramaCaptureBridge.request` as
+`1<TAB>session<TAB>pose<TAB>token`, replacing it only after close. The add-on
+consumes that record on a worker thread, invokes `save_screenshot(token)` from
+`reshade_present`, and publishes `PanoramaCaptureBridge.ack` as
+`1<TAB>session<TAB>pose<TAB>token<TAB>exact-path` after the screenshot event.
+The CET option is opt-in (`automatedScreenshots = false` by default), so the
+manual path remains the safe fallback while the in-game bridge is validated.
+
 Deliverables:
 
-- Add configurable Win32 key simulation.
-- Add screenshot directory snapshots and file-stability checks.
+- Add a bounded local command/event bridge between CET and the ReShade add-on: prefer a non-blocking named pipe if the CET transport spike passes, otherwise use atomic request/acknowledgement control files.
+- Queue correlated requests outside render callbacks and execute `save_screenshot()` from `reshade_present`.
+- Return exact completion paths and errors through the bridge.
 - Add decode and dimension validation.
 - Add retry and timeout handling.
+- Retain Win32 key simulation plus stable-directory polling only as an explicitly selected compatibility fallback.
 
 Acceptance:
 
 - One automated run produces exactly one image per pose.
 - Slow screenshot writes cannot cause premature rotation.
-- Multiple new files produce a safe, recoverable error.
+- Duplicate, stale, unrelated, or missing completion events produce a safe, recoverable error.
+- The add-on unloads/reloads without retaining a runtime pointer or pending request.
+
+Status (2026-08-21): accepted in-game with a complete 16-pose run. CET v0.1.16
+and the rebuilt add-on correlated every pose to exactly one ReShade screenshot,
+then restored the environment. The mailbox lives in the CET mod folder and is
+resolved portably by the add-on relative to ReShade's base directory.
 
 ### Packet 9: full-sphere integration
+
+Gate: do not implement this integration packet until Packet 4 proves time freeze, HUD hiding, player-renderer hiding, polar coverage, and restoration in the real FPP camera.
 
 Deliverables:
 
@@ -660,7 +831,95 @@ Acceptance:
 - Pole orientation has no unexpected roll.
 - No frame requires manual metadata or filename correction.
 
-### Packet 10: packaging and documentation
+Status (2026-08-21): the in-game full-sphere capture path and ReShade bridge
+are accepted. The stitcher now consumes CET's per-session JSON directly,
+including observed camera bases and exact screenshot paths, with portable
+basename/`--image-dir` fallback when a Windows capture is moved to another
+machine. Completed-state validation is strict; partial sessions are an
+explicit `--allow-incomplete` workflow. A direct render of completed session
+`1787269393-1` exposed a 90° rotation: CET emits Z-up bases, whereas the
+stitcher uses Y-up. The CET adapter now converts its right/up/forward vectors
+into the canonical convention; rerendering that session is required before
+Packet 9 can be accepted. Orientation is now visually verified in
+`/tmp/cp2077-pano-packet9-yup.png`. The optional streaming
+`--debug-coverage` PNG output is implemented and tested; one real-session
+coverage-image run remains for final acceptance. Packet 9 is now accepted:
+the corrected real-session render has the verified way-up, and its coverage
+diagnostic is pure white, confirming complete output-pixel coverage.
+
+### Packet 10: stitcher desktop GUI
+
+Scope: provide a pleasant local frontend over the existing metadata validator
+and bounded compositor. The GUI must not duplicate projection, validation, or
+rendering logic; it invokes the same Python APIs as `pano-stitch`.
+
+Deliverables:
+
+- Provide a Windows-friendly desktop GUI for the stitcher.
+- Let the user choose a CET `capture.json`, a screenshots directory, and an
+  output directory.
+- Validate automatically in the background whenever the JSON or screenshots
+  directory changes, and enable Render only after validation succeeds.
+- Expose output format, resolution fraction, explicit output width, blend
+  mode, memory budget, and incomplete-session handling.
+- Show validation errors and renderer progress without making the application
+  appear frozen; disable conflicting controls while rendering and provide a
+  safe cancel path.
+- Remember the most recently selected directories for the current user,
+  without embedding machine-specific paths in capture metadata.
+
+Acceptance:
+
+- A completed CET session can be selected, validated, and rendered without
+  invoking a terminal.
+- Rendering presents responsive determinate progress and a clear terminal
+  success/failure state.
+- GUI output is byte-for-byte or pixel-equivalent to a CLI render using the
+  same options.
+- Invalid paths, incomplete sessions, and renderer failures are shown as
+  actionable messages, without a traceback-only failure.
+
+Status (2026-08-21): initial Tkinter frontend implemented as
+`pano-stitch-gui`, including file/directory pickers, all current render
+options, automatic background validation, Render gating, a 1–100% resolution
+slider, determinate progress, coverage output, and cooperative cancellation.
+Automated tests and static checks pass; Windows GUI
+smoke testing remains.
+WSLg uses a 1.5 default Tk scale, with `PANO_STITCH_GUI_SCALE` available as an
+override for other display configurations.
+WSLg font rendering remains a known development-host limitation; defer further
+WSL-specific typography work and validate DPI behavior in the native Windows
+release executable.
+The GUI also persists the last Capture JSON directory, screenshots directory,
+and output directory in a per-user settings file using atomic replacement; this
+behavior is verified across restarts. Selecting a new JSON refreshes the
+screenshots directory from its recorded absolute paths, even when an older
+directory was persisted. On native Windows, a blank screenshots field may be
+inferred from the CET JSON. Remaining work is native Windows smoke testing.
+The latest path-normalization fix was included in the final native Windows
+smoke test and verified.
+The GUI defaults output names to `panorama-<session-id>.<format>`, asks
+before replacing an existing output, and keeps advanced render controls behind
+an expandable section while leaving format and resolution visible.
+JPEG is available as an SDR export with a visible 1–100 quality slider (default
+95) and is the default export; it uses a temporary disk-spooled RGB raster during encoding so rendering
+does not require a second full panorama in RAM. PNG remains lossless SDR and
+EXR preserves HDR data.
+
+Packet 10 acceptance (2026-08-21): native Windows GUI verification is complete,
+including validation gating, rendering, persistence, path inference and
+normalization, overwrite confirmation, advanced-options collapse, and the
+100% default resolution. JPEG default export at quality 95 and the render-time
+form lock were also verified.
+
+### Packet 11: packaging and documentation
+
+Public-release note: defer native Windows packaging until the project is
+ready for public distribution. During development and private testing, the
+stitcher may continue to run from the documented Python virtual environment.
+When release work begins, produce a Windows x64 one-folder bundle (with an
+optional one-file convenience build), bundle OpenEXR/NumPy/OpenCV/Pillow and
+the schema, and validate it on a clean Windows system without Python or WSL.
 
 Deliverables:
 
@@ -668,6 +927,7 @@ Deliverables:
 - Build the Python package and document installation.
 - Document ReShade configuration and manual/automatic workflows.
 - Document supported versions, incompatibilities, and recovery steps.
+- Provide HDR EXR output and a PNG output option; document the verified color encoding and any explicitly selected conversion.
 - Add a release verification checklist.
 
 Acceptance:
@@ -676,17 +936,55 @@ Acceptance:
 - All native and Python checks pass without warnings.
 - Package contents contain no build artifacts or developer-specific paths.
 
+Status (2026-08-21): shareable artifacts are now release-tag-only GitHub
+Actions outputs. The release workflow runs the stitcher checks on a GitHub
+Windows runner, builds the ReShade add-on with MSVC x64, calls
+`release/build-windows-release.ps1` to produce the mod and one-folder stitcher
+archives, validates their contents, writes SHA-256 checksums, and publishes the
+assets plus a build-provenance manifest to the matching GitHub Release. CI runs the independent stitcher checks
+on pull requests and `master`. The root guide now covers installation,
+automated capture, stitching, recovery, compatibility limits, release
+verification, tag-driven publication, and the separate local development loop.
+The remaining Packet 11 gate is a
+first tag build and clean-machine installation from the downloaded assets.
+
+### Post-MVP polish: photometric and upright correction
+
+Defer this work until the core capture, direct JSON stitching, GUI, and release
+paths are stable. Research and design notes are in
+`docs/polish-research.md`.
+
+Deliverables:
+
+- Optional overlap-graph exposure normalization in linear HDR space, using one
+  conservative global luminance gain per source frame.
+- Diagnostics for overlap connectivity, selected exposure anchor, and applied
+  gains; refuse to normalize disconnected capture graphs.
+- A low-resolution GUI preview that can propose an upright/horizon correction
+  from rectilinear line detection.
+- Optional correction-strength and manual pitch/roll controls. Apply the final
+  choice as a global output-space rotation, without mutating source metadata.
+
+Acceptance:
+
+- Auto exposure normalization visibly reduces overlap brightness steps without
+  clipping HDR inputs or changing output geometry.
+- The user can disable both polish features and reproduce the baseline stitch.
+- Weak, contradictory, or intentionally non-level scene lines do not cause an
+  unrequested orientation change.
+
 ## MVP completion definition
 
 The MVP is complete only when:
 
-1. The mod captures a deterministic horizontal 360-degree sequence from one optical center.
+1. The mod captures deterministic yaw and pitch rows covering the full sphere from one optical center.
 2. It associates every screenshot with explicit FoV and pose metadata.
-3. The stitcher converts that session to a lossless cropped equirectangular PNG.
-4. Automated and in-game acceptance tests pass.
-5. Abort, retry, screenshot timeout, and camera restoration are safe.
+3. The stitcher converts that session to a covered 2:1 equirectangular output without unintended bit-depth or dynamic-range loss. The proof-of-concept HDR target is EXR; the final release also provides PNG output.
+4. A 30-frame 3840×2160 HDR render remains below 1,000,000,000 bytes peak process RSS.
+5. Automated and in-game acceptance tests pass.
+6. Abort, retry, screenshot timeout, and camera restoration are safe.
 
-Full-sphere capture is the next release milestone and must reuse the same manifest and projection pipeline rather than introducing a second format.
+Horizontal-only captures remain useful diagnostics, but they do not satisfy MVP completion.
 
 ## Explicit non-goals for the first implementation
 
@@ -696,8 +994,7 @@ Full-sphere capture is the next release milestone and must reuse the same manife
 - Dynamic-scene ghost removal
 - Exposure or color correction
 - Optimized polar frame placement
-- A graphical desktop application
 - Automatic UI hiding
-- HDR or 16-bit output
+- Final HDR-to-PNG appearance tuning beyond a documented, deterministic conversion
 
 Keeping these out of the MVP is necessary to make the work suitable for sequential implementation by a lower-cost model while preserving a testable path to the complete result.
