@@ -104,6 +104,12 @@ Existing output files require confirmation before replacement.
 Shareable artifacts are built only by the repository's GitHub Actions release
 workflow. Do not attach locally built EXEs or DLLs to a public release.
 
+Before publishing, use **Actions → Release → Run workflow**, enter the version
+from `stitcher/pyproject.toml` without its `v` prefix, then download the
+temporary artifact from the completed run. It contains the same two ZIPs,
+checksum manifest, and provenance that a tag release would create, but never
+creates a GitHub Release. The artifact is retained for seven days.
+
 Before tagging a release, a maintainer must run the checklist above against the
 candidate commit and update the stitcher version in `stitcher/pyproject.toml`.
 Then create and push a matching annotated tag:

@@ -279,7 +279,9 @@ the JPEG-default export, quality 95, render-time form lock, and replacement
 confirmation for an existing output file.
 
 Packet 11 release tooling (2026-08-21): shareable artifacts are now built only
-from version tags by GitHub Actions. The pinned-action release workflow builds
+from version tags by GitHub Actions. A manual, non-publishing dispatch executes
+the same Windows build and retains its ZIPs, checksums, and provenance for seven
+days for a clean-machine smoke test. The pinned-action release workflow builds
 the ReShade add-on with MSVC x64, bundles the GUI with PyInstaller, stages CET
 and schema files, validates ZIP contents, produces `SHA256SUMS.txt`, and
 publishes the assets plus `BUILD-INFO.txt` provenance through the GitHub CLI. A separate CI workflow runs the

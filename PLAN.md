@@ -945,8 +945,9 @@ assets plus a build-provenance manifest to the matching GitHub Release. CI runs 
 on pull requests and `master`. The root guide now covers installation,
 automated capture, stitching, recovery, compatibility limits, release
 verification, tag-driven publication, and the separate local development loop.
-The remaining Packet 11 gate is a
-first tag build and clean-machine installation from the downloaded assets.
+The remaining Packet 11 gate is a manual release dry run and clean-machine
+installation from its downloaded artifacts; only then should the first tag be
+pushed.
 
 ### Post-MVP polish: photometric and upright correction
 
