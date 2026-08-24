@@ -15,7 +15,7 @@ from dataclasses import dataclass, replace
 from importlib import import_module
 from pathlib import Path
 from threading import Event
-from typing import Any, BinaryIO
+from typing import Any
 
 import cv2
 import numpy as np
@@ -548,27 +548,9 @@ def _choose_strip_height(source: SourceInfo, output_width: int, memory_budget_by
     return strip_height
 
 
-def _read_tile(stream: BinaryIO, offset: int, shape: tuple[int, ...]) -> FloatImage:
-    count = int(np.prod(shape))
-    stream.seek(offset)
-    data = stream.read(count * np.dtype(np.float32).itemsize)
-    if len(data) != count * np.dtype(np.float32).itemsize:
-        raise OSError("truncated compositor scratch file")
-    return np.frombuffer(data, dtype=np.float32).copy().reshape(shape)
-
-
-def _write_tile(stream: BinaryIO, offset: int, tile: FloatImage) -> None:
-    stream.seek(offset)
-    stream.write(np.ascontiguousarray(tile, dtype=np.float32).tobytes())
-
-
-def _scratch_offset(row: int, width: int, channels: int) -> int:
-    return row * width * channels * np.dtype(np.float32).itemsize
-
-
 def _composite_strip(
-    color_path: Path,
-    weight_path: Path,
+    color_scratch: FloatImage,
+    weight_scratch: FloatImage,
     source: FloatImage,
     frame: FrameMetadata,
     source_info: SourceInfo,
@@ -582,7 +564,7 @@ def _composite_strip(
     blend: str,
     cancel_event: Event | None,
 ) -> None:
-    """Composite one row-disjoint strip using independent scratch-file handles."""
+    """Composite one row-disjoint strip in disk-backed shared array views."""
 
     if cancel_event is not None and cancel_event.is_set():
         raise RenderCancelledError("render cancelled")
@@ -599,27 +581,22 @@ def _composite_strip(
         vertical_fov_deg,
     )
     sampled = remap_source(source, map_x, map_y)
-    color_offset = _scratch_offset(row_start, output_width, 3)
-    weight_offset = _scratch_offset(row_start, output_width, 1)
-    with color_path.open("r+b") as color_scratch, weight_path.open("r+b") as weight_scratch:
-        color = _read_tile(color_scratch, color_offset, (rows, output_width, 3))
-        weight = _read_tile(weight_scratch, weight_offset, (rows, output_width))
-        if blend == "hard":
-            candidate = np.where(valid, np.maximum(edge_distance, 1e-6), 0.0)
-            selected = candidate > weight
-            color[selected] = sampled[selected]
-            weight[selected] = candidate[selected]
-        else:
-            feather_width = max(1.0, min(source_info.width, source_info.height) * 0.08)
-            candidate = np.where(
-                valid,
-                np.maximum(edge_distance / feather_width, 1e-6),
-                0.0,
-            )
-            color += sampled * candidate[..., np.newaxis]
-            weight += candidate
-        _write_tile(color_scratch, color_offset, color)
-        _write_tile(weight_scratch, weight_offset, weight)
+    color = color_scratch[row_start : row_start + rows]
+    weight = weight_scratch[row_start : row_start + rows]
+    if blend == "hard":
+        candidate = np.where(valid, np.maximum(edge_distance, 1e-6), 0.0)
+        selected = candidate > weight
+        color[selected] = sampled[selected]
+        weight[selected] = candidate[selected]
+    else:
+        feather_width = max(1.0, min(source_info.width, source_info.height) * 0.08)
+        candidate = np.where(
+            valid,
+            np.maximum(edge_distance / feather_width, 1e-6),
+            0.0,
+        )
+        color += sampled * candidate[..., np.newaxis]
+        weight += candidate
 
 
 def _image_path(image_root: Path, filename: str) -> Path:
@@ -769,56 +746,57 @@ def render_session(
         scratch_root = Path(scratch_directory)
         color_path = scratch_root / "color.f32"
         weight_path = scratch_root / "weight.f32"
-        with (
-            color_path.open("wb") as color_initializer,
-            weight_path.open("wb") as weight_initializer,
-        ):
-            color_initializer.truncate(
-                output_height * output_width * 3 * np.dtype(np.float32).itemsize
-            )
-            weight_initializer.truncate(
-                output_height * output_width * np.dtype(np.float32).itemsize
-            )
+        color_scratch = np.memmap(
+            color_path,
+            mode="w+",
+            dtype=np.float32,
+            shape=(output_height, output_width, 3),
+        )
+        weight_scratch = np.memmap(
+            weight_path,
+            mode="w+",
+            dtype=np.float32,
+            shape=(output_height, output_width),
+        )
+        try:
+            with _limit_opencv_threads(resources.worker_count):
+                for frame_position, frame in enumerate(session.frames):
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise RenderCancelledError("render cancelled")
+                    source = _read_source(
+                        _image_path(image_root, frame.filename), first_source.encoding
+                    )
+                    try:
+                        source *= np.float32(exposure_report.gains[frame_position])
+                        with ThreadPoolExecutor(max_workers=resources.worker_count) as executor:
+                            futures = [
+                                executor.submit(
+                                    _composite_strip,
+                                    color_scratch,
+                                    weight_scratch,
+                                    source,
+                                    frame,
+                                    first_source,
+                                    session.horizontal_fov_deg,
+                                    session.vertical_fov_deg,
+                                    latitude_span,
+                                    output_width,
+                                    output_height,
+                                    row_start,
+                                    strip_height,
+                                    blend,
+                                    cancel_event,
+                                )
+                                for row_start in range(0, output_height, strip_height)
+                            ]
+                            for future in as_completed(futures):
+                                future.result()
+                                completed_work += 1
+                                if progress_callback is not None:
+                                    progress_callback(completed_work, total_work, "compositing")
+                    finally:
+                        del source
 
-        with _limit_opencv_threads(resources.worker_count):
-            for frame_position, frame in enumerate(session.frames):
-                if cancel_event is not None and cancel_event.is_set():
-                    raise RenderCancelledError("render cancelled")
-                source = _read_source(
-                    _image_path(image_root, frame.filename), first_source.encoding
-                )
-                try:
-                    source *= np.float32(exposure_report.gains[frame_position])
-                    with ThreadPoolExecutor(max_workers=resources.worker_count) as executor:
-                        futures = [
-                            executor.submit(
-                                _composite_strip,
-                                color_path,
-                                weight_path,
-                                source,
-                                frame,
-                                first_source,
-                                session.horizontal_fov_deg,
-                                session.vertical_fov_deg,
-                                latitude_span,
-                                output_width,
-                                output_height,
-                                row_start,
-                                strip_height,
-                                blend,
-                                cancel_event,
-                            )
-                            for row_start in range(0, output_height, strip_height)
-                        ]
-                        for future in as_completed(futures):
-                            future.result()
-                            completed_work += 1
-                            if progress_callback is not None:
-                                progress_callback(completed_work, total_work, "compositing")
-                finally:
-                    del source
-
-        with color_path.open("r+b") as color_scratch, weight_path.open("r+b") as weight_scratch:
             temporary_path = _temporary_output_path(output_path)
             temporary_coverage_path = (
                 _temporary_output_path(debug_coverage_path)
@@ -853,16 +831,8 @@ def render_session(
                         if cancel_event is not None and cancel_event.is_set():
                             raise RenderCancelledError("render cancelled")
                         rows = min(strip_height, output_height - row_start)
-                        color = _read_tile(
-                            color_scratch,
-                            _scratch_offset(row_start, output_width, 3),
-                            (rows, output_width, 3),
-                        )
-                        weight = _read_tile(
-                            weight_scratch,
-                            _scratch_offset(row_start, output_width, 1),
-                            (rows, output_width),
-                        )
+                        color = color_scratch[row_start : row_start + rows]
+                        weight = weight_scratch[row_start : row_start + rows]
                         covered = weight > 0.0
                         if coverage_writer is not None:
                             coverage_writer.write(covered)
@@ -886,6 +856,11 @@ def render_session(
                     temporary_coverage_path.unlink(missing_ok=True)
                 raise
             return exposure_report
+        finally:
+            color_scratch.flush()
+            weight_scratch.flush()
+            del color_scratch
+            del weight_scratch
 
 
 def validate_images(
