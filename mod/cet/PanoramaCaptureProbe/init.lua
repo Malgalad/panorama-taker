@@ -1,4 +1,4 @@
-local MOD_VERSION = "0.1.53"
+local MOD_VERSION = "0.1.59"
 local DEVELOPMENT_MODE = false
 
 local function log(message)
@@ -192,12 +192,12 @@ local function registerNativeSettings()
                 text:SetName("panoramaCaptureSummary")
                 text:SetFontFamily("base\\gameplay\\gui\\fonts\\raj\\raj.inkfontfamily")
                 text:SetFontStyle("Medium")
-                text:SetFontSize(32)
+                text:SetFontSize(36)
                 text:SetLetterCase(textLetterCase.OriginalCase)
-                text:SetTintColor(HDRColor.new({ Red = 1.0, Green = 1.0, Blue = 1.0, Alpha = 1.0 }))
+                text:SetTintColor(HDRColor.new({ Red = 0.94088, Green = 0.30472, Blue = 0.27808, Alpha = 1.0 }))
                 text:SetHorizontalAlignment(textHorizontalAlignment.Left)
                 text:SetVerticalAlignment(textVerticalAlignment.Center)
-                text:SetMargin(inkMargin.new({ left = 64.0, top = 6.0, right = 0.0, bottom = 6.0 }))
+                text:SetMargin(inkMargin.new({ left = 40.0, top = 6.0, right = 0.0, bottom = 6.0 }))
                 text:SetText(option.text or "Capture estimate loading…")
                 text:SetInteractive(false)
                 text:Reparent(parent, -1)
@@ -295,7 +295,11 @@ local function refreshBridgeCaptureRange()
     end
     local line = input:read("*l")
     input:close()
-    local version, captureRange = line and line:match("^([^\t]+)\t([^\t]+)$")
+    if line == nil then
+        bridgeCaptureRange = "unknown"
+        return
+    end
+    local version, captureRange = line:match("^([^\t]+)\t([^\t]+)$")
     if version == "1" and (captureRange == "hdr" or captureRange == "sdr") then
         bridgeCaptureRange = captureRange
     else
@@ -574,7 +578,7 @@ local function estimateCaptureSeconds(shotCount)
     if bridgeCaptureRange == "unknown" then
         return nil
     end
-    local screenshotSeconds = bridgeCaptureRange == "hdr" and 0.5 or 0.1
+    local screenshotSeconds = bridgeCaptureRange == "hdr" and 1.0 or 0.1
     return captureConfig.settleSeconds + shotCount * screenshotSeconds +
         math.max(0, shotCount - 1) * math.max(captureConfig.settleSeconds,
             captureConfig.screenshotCooldownSeconds)
@@ -605,10 +609,9 @@ updateCaptureSummary = function()
         option.text = string.format("Capture estimate: %d shots", preview.shots)
     else
         local duration = estimateCaptureSeconds(preview.shots)
-        local timing = duration and (" · " .. formatDuration(duration) .. " " .. string.upper(bridgeCaptureRange)) or
-            " · timing unavailable"
-        option.text = string.format("Capture estimate: %d shots · ~%.1f MP%s",
-            preview.shots, preview.megapixels, timing)
+        local timing = duration and formatDuration(duration) or "timing unavailable"
+        option.text = string.format("Capture estimate: %d shots / %s · ~%.1f MP",
+            preview.shots, timing, preview.megapixels)
     end
     if option.textWidget ~= nil then
         pcall(function() option.textWidget:SetText(option.text) end)
@@ -983,6 +986,15 @@ local function captureBlockReason()
     end)
     if okMounted and mounted == true then
         return "player is mounted in a vehicle"
+    end
+
+    local freeflyActive = false
+    local okFreefly = pcall(function()
+        freeflyActive = type(freefly) == "table" and type(freefly.runtimeData) == "table" and
+            freefly.runtimeData.active == true
+    end)
+    if okFreefly and freeflyActive then
+        return "FreeFly is active; disable it before starting a panorama capture"
     end
     return nil
 end

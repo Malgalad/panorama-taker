@@ -423,3 +423,15 @@ temporarily limited to one thread, and stores its colour/weight accumulators in
 disk-backed memory maps. The resulting large render has verified improved CPU
 utilization, negligible disk reads, and modest resident RAM; Windows CI now
 explicitly closes mappings before temporary-file cleanup.
+
+Packet 12 live capture estimate v0.1.58 (2026-08-24): the ReShade add-on now
+publishes the active swapchain range (`hdr`, `sdr`, or `unknown`) atomically to
+the bridge directory as soon as the game swapchain initializes. CET polls that
+status once per second and presents a live Native Settings summary in the form
+`Capture estimate: N shots / ~time · ~MP`. HDR estimates conservatively allow
+one second per screenshot (SDR allows 0.1 seconds); unknown range intentionally
+shows `timing unavailable`. A Lua multi-return parsing bug that dropped the
+range field from the valid `1<TAB>hdr` bridge record was corrected. The custom
+summary widget was restyled to 36 px with the NSUI label hue at 80% brightness
+and a 40 px left indent. CET v0.1.58 is copied to the game directory; the
+updated live HDR timing display awaits in-game confirmation.
