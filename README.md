@@ -18,8 +18,9 @@ JSON and screenshots into JPEG, lossless PNG, or HDR EXR.
 - ReShade configured to save the desired screenshots. The verified HDR input
   is its 16-bit Rec.2020/PQ PNG mode.
 
-The release bundles the MIT-licensed FOV Control RED4ext plugin and redscript
-helper. No separate Unlock FOV or FOV Control installation is required.
+The release bundles a collision-safe, MIT-licensed PanoramaFovControl RED4ext
+plugin and redscript helper. No separate Unlock FOV or FOV Control installation
+is required.
 
 Do not run FreeFly during capture. Vehicles are intentionally rejected, and a
 near-zero time dilation session prevents F9 quick-load from being processed
@@ -34,8 +35,8 @@ until the capture is restored or aborted.
    ```text
    bin\x64\PanoramaCaptureReShade.addon64
    bin\x64\plugins\cyber_engine_tweaks\mods\PanoramaCaptureProbe\init.lua
-   red4ext\plugins\FovControl\FovControl.dll
-   r6\scripts\FovControl\FovControl.reds
+   red4ext\plugins\PanoramaFovControl\PanoramaFovControl.dll
+   r6\scripts\PanoramaFovControl\PanoramaFovControl.reds
    ```
 
 3. Start the game and load a save. Confirm CET loads Panorama Capture and

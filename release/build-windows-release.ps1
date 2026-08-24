@@ -68,18 +68,18 @@ New-Item -ItemType Directory -Force -Path $cetDestination, $reshadeDestination |
 Copy-Item "$projectRoot\mod\cet\PanoramaCaptureProbe\init.lua" $cetDestination
 Copy-Item $addon (Join-Path $reshadeDestination "PanoramaCaptureReShade.addon64")
 if ($fovControlRoot) {
-    $fovDll = Get-ChildItem -LiteralPath $fovControlRoot -Recurse -File -Filter "FovControl.dll" |
+    $fovDll = Get-ChildItem -LiteralPath $fovControlRoot -Recurse -File -Filter "PanoramaFovControl.dll" |
         Select-Object -First 1
-    $fovScript = Join-Path $fovControlRoot "bin\r6\scripts\FovControl\FovControl.reds"
+    $fovScript = Join-Path $fovControlRoot "bin\r6\scripts\PanoramaFovControl\PanoramaFovControl.reds"
     if ($null -eq $fovDll -or -not (Test-Path -LiteralPath $fovScript)) {
-        throw "FovControl build outputs were not found under $fovControlRoot"
+        throw "PanoramaFovControl build outputs were not found under $fovControlRoot"
     }
-    $fovDestination = Join-Path $modStage "red4ext\plugins\FovControl"
-    $fovScriptDestination = Join-Path $modStage "r6\scripts\FovControl"
+    $fovDestination = Join-Path $modStage "red4ext\plugins\PanoramaFovControl"
+    $fovScriptDestination = Join-Path $modStage "r6\scripts\PanoramaFovControl"
     New-Item -ItemType Directory -Force -Path $fovDestination, $fovScriptDestination | Out-Null
-    Copy-Item $fovDll.FullName (Join-Path $fovDestination "FovControl.dll")
-    Copy-Item $fovScript (Join-Path $fovScriptDestination "FovControl.reds")
-    Copy-Item (Join-Path $fovControlRoot "LICENSE.txt") (Join-Path $fovDestination "FovControl-LICENSE.txt")
+    Copy-Item $fovDll.FullName (Join-Path $fovDestination "PanoramaFovControl.dll")
+    Copy-Item $fovScript (Join-Path $fovScriptDestination "PanoramaFovControl.reds")
+    Copy-Item (Join-Path $fovControlRoot "LICENSE.txt") (Join-Path $fovDestination "PanoramaFovControl-LICENSE.txt")
 }
 Copy-Item "$projectRoot\README.md" (Join-Path $cetDestination "README.md")
 

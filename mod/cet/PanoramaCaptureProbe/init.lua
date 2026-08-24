@@ -316,9 +316,9 @@ end
 
 local function setDisplayFov(camera, displayFov)
     local okPending = pcall(function() camera:PendingSetFOV() end)
-    local okSet, setError = pcall(function() camera:SetDisplayFOV(displayFov) end)
+    local okSet, setError = pcall(function() camera:SetPanoramaDisplayFOV(displayFov) end)
     if not okSet then
-        return false, "FOV Control SetDisplayFOV unavailable: " .. tostring(setError)
+        return false, "Panorama FOV control unavailable: " .. tostring(setError)
     end
     return true, okPending and nil or "PendingSetFOV unavailable"
 end
