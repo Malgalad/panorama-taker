@@ -83,6 +83,12 @@ def _parser() -> argparse.ArgumentParser:
         default=768,
         help="maximum compositor working budget; production default is 768 MiB, cap is 8192 MiB",
     )
+    render.add_argument(
+        "--workers",
+        type=int,
+        default=0,
+        help="parallel strip workers; 0 selects Auto (default)",
+    )
     render.add_argument("--allow-incomplete", action="store_true")
     return parser
 
@@ -115,11 +121,13 @@ def main() -> None:
                 image_root,
                 render_width,
                 memory_budget_bytes,
+                arguments.workers or None,
             )
             scratch_gib = resources.scratch_bytes / (1024**3)
             print(
                 f"render plan: {resources.output_width}x{resources.output_height}, "
-                f"{resources.strip_height}-row strips, {scratch_gib:.2f} GiB scratch"
+                f"{resources.worker_count} workers, {resources.strip_height}-row strips, "
+                f"{scratch_gib:.2f} GiB scratch"
             )
             exposure_report = render_session(
                 session,
@@ -132,6 +140,7 @@ def main() -> None:
                 _progress,
                 arguments.debug_coverage,
                 jpeg_quality=arguments.jpeg_quality,
+                workers=arguments.workers or None,
             )
             print(file=sys.stderr)
             gains = ", ".join(f"{gain:.3f}" for gain in exposure_report.gains)

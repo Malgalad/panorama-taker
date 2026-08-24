@@ -11,6 +11,7 @@ from numpy.typing import NDArray
 from pano_stitch.metadata import FrameMetadata
 
 FloatArray = NDArray[np.float32]
+_MAX_REMAP_DIMENSION = np.iinfo(np.int16).max - 1
 
 
 def _rotation_matrix(yaw_deg: float, pitch_deg: float, roll_deg: float) -> FloatArray:
@@ -117,9 +118,29 @@ def remap_source(
     map_x: FloatArray,
     map_y: FloatArray,
 ) -> FloatArray:
-    """Sample a source image at floating-point coordinates."""
+    """Sample a source image at floating-point coordinates within OpenCV's size limit."""
 
-    return np.asarray(
-        cv2.remap(source, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT),
-        dtype=np.float32,
-    )
+    if source.shape[0] > _MAX_REMAP_DIMENSION or source.shape[1] > _MAX_REMAP_DIMENSION:
+        raise ValueError("source image exceeds OpenCV remap's 32,766-pixel dimension limit")
+    height, width = map_x.shape
+    if map_y.shape != (height, width):
+        raise ValueError("remap coordinate arrays must have matching dimensions")
+    if height <= _MAX_REMAP_DIMENSION and width <= _MAX_REMAP_DIMENSION:
+        return np.asarray(
+            cv2.remap(source, map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT),
+            dtype=np.float32,
+        )
+
+    sampled = np.empty((height, width, source.shape[2]), dtype=np.float32)
+    for row_start in range(0, height, _MAX_REMAP_DIMENSION):
+        row_end = min(row_start + _MAX_REMAP_DIMENSION, height)
+        for column_start in range(0, width, _MAX_REMAP_DIMENSION):
+            column_end = min(column_start + _MAX_REMAP_DIMENSION, width)
+            sampled[row_start:row_end, column_start:column_end] = cv2.remap(
+                source,
+                np.ascontiguousarray(map_x[row_start:row_end, column_start:column_end]),
+                np.ascontiguousarray(map_y[row_start:row_end, column_start:column_end]),
+                cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+            )
+    return sampled

@@ -25,6 +25,7 @@ from pano_stitch.projection import (
     _rotation_matrix,
     camera_maps,
     equirectangular_directions,
+    remap_source,
 )
 
 
@@ -55,6 +56,18 @@ def test_observed_basis_rows_are_transposed_for_world_to_camera_rotation() -> No
     local_forward = np.array((1.0, 0.0, 0.0), dtype=np.float32) @ _frame_rotation(frame)
 
     assert local_forward == pytest.approx((0.0, 0.0, 1.0))
+
+
+def test_remap_source_splits_output_wider_than_opencv_limit() -> None:
+    source = np.array([[[0.25, 0.5, 0.75]]], dtype=np.float32)
+    width = np.iinfo(np.int16).max
+    map_x = np.zeros((1, width), dtype=np.float32)
+    map_y = np.zeros((1, width), dtype=np.float32)
+
+    sampled = remap_source(source, map_x, map_y)
+
+    assert sampled.shape == (1, width, 3)
+    np.testing.assert_array_equal(sampled, np.broadcast_to(source, sampled.shape))
 
 
 def _source_image(frame: FrameMetadata, width: int, height: int, fov_deg: float) -> np.ndarray:
@@ -284,6 +297,57 @@ def test_render_resource_estimate_uses_color_and_weight_scratch(tmp_path: Path) 
 
     assert resources.output_height == 32
     assert resources.scratch_bytes == 64 * 32 * 4 * np.dtype(np.float32).itemsize
+
+
+def test_parallel_strips_match_single_worker_output(tmp_path: Path) -> None:
+    base = _synthetic_session()
+    frames = tuple(
+        FrameMetadata(
+            index=shot.index,
+            filename=f"frame-{shot.index}.png",
+            yaw_deg=shot.yaw_deg,
+            pitch_deg=shot.pitch_deg,
+            roll_deg=shot.roll_deg,
+            status="captured",
+        )
+        for shot in plan_shots(base).shots
+    )
+    session = SessionMetadata(
+        base.schema_version,
+        base.session_id,
+        base.capture_mode,
+        base.horizontal_fov_deg,
+        base.vertical_fov_deg,
+        base.overlap_fraction,
+        frames,
+        base.completed,
+    )
+    for frame in frames:
+        Image.fromarray(_source_image(frame, 64, 64, 90.0)).save(tmp_path / frame.filename)
+
+    source_bytes = 64 * 64 * 3 * np.dtype(np.float32).itemsize * 3
+    row_bytes = 64 * 160
+    budget = 192 * 1024 * 1024 + source_bytes + 4 * row_bytes
+    serial_resources = estimate_render_resources(
+        session, tmp_path, width=64, memory_budget_bytes=budget, workers=1
+    )
+    parallel_resources = estimate_render_resources(
+        session, tmp_path, width=64, memory_budget_bytes=budget, workers=2
+    )
+    assert serial_resources.strip_height == 4
+    assert parallel_resources.worker_count == 2
+    assert parallel_resources.strip_height == 2
+
+    serial_path = tmp_path / "serial.png"
+    parallel_path = tmp_path / "parallel.png"
+    render_session(
+        session, tmp_path, serial_path, width=64, workers=1, memory_budget_bytes=budget
+    )
+    render_session(
+        session, tmp_path, parallel_path, width=64, workers=2, memory_budget_bytes=budget
+    )
+    with Image.open(serial_path) as serial, Image.open(parallel_path) as parallel:
+        np.testing.assert_array_equal(np.asarray(serial), np.asarray(parallel))
 
 
 def test_exr_round_trip_preserves_values_above_one(tmp_path: Path) -> None:

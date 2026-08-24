@@ -129,6 +129,7 @@ class StitcherApp:
         self.resolution_label_var = tk.StringVar()
         self.blend_var = tk.StringVar(value="feather")
         self.memory_var = tk.StringVar(value="768")
+        self.workers_var = tk.StringVar(value="Auto")
         self.allow_incomplete_var = tk.BooleanVar(value=False)
         self.coverage_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value="Choose a capture JSON and screenshots directory.")
@@ -221,12 +222,25 @@ class StitcherApp:
         ttk.Label(
             self.advanced_frame, text="Larger budgets can render faster if RAM is available."
         ).grid(row=4, column=1, sticky="w", padx=6)
+        worker_choices = ("Auto", *(str(worker) for worker in range(1, (os.cpu_count() or 1) + 1)))
+        self._option_row(
+            self.advanced_frame,
+            5,
+            "Workers",
+            ttk.Combobox(
+                self.advanced_frame,
+                textvariable=self.workers_var,
+                values=worker_choices,
+                state="readonly",
+                width=12,
+            ),
+        )
         ttk.Checkbutton(
             self.advanced_frame, text="Allow incomplete session", variable=self.allow_incomplete_var
-        ).grid(row=5, column=1, sticky="w", padx=6, pady=3)
+        ).grid(row=6, column=1, sticky="w", padx=6, pady=3)
         ttk.Checkbutton(
             self.advanced_frame, text="Write coverage diagnostic PNG", variable=self.coverage_var
-        ).grid(row=6, column=1, sticky="w", padx=6, pady=3)
+        ).grid(row=7, column=1, sticky="w", padx=6, pady=3)
 
         actions = ttk.Frame(self.root)
         actions.pack(fill="x", padx=12, pady=8)
@@ -468,9 +482,10 @@ class StitcherApp:
             memory = int(self.memory_var.get()) * 1024 * 1024
             if memory < 1 * 1024 * 1024 or memory > 8096 * 1024 * 1024:
                 raise ValueError("memory budget must be between 1 and 8096 MiB")
+            workers = None if self.workers_var.get() == "Auto" else int(self.workers_var.get())
             render_width = width
             if render_width is None and scale != 1:
-                full = estimate_render_resources(session, image_dir, None, memory)
+                full = estimate_render_resources(session, image_dir, None, memory, workers)
                 render_width = max(1, int(full.output_width * scale))
             suffix = self._suffix_for_format()
             output_name = self._default_output_name(session.session_id, suffix)
@@ -482,9 +497,13 @@ class StitcherApp:
                 if self.coverage_var.get()
                 else None
             )
-            resources = estimate_render_resources(session, image_dir, render_width, memory)
+            resources = estimate_render_resources(session, image_dir, render_width, memory, workers)
             self._events.put(
-                ("status", f"Rendering {resources.output_width}×{resources.output_height}…")
+                (
+                    "status",
+                    f"Rendering {resources.output_width}×{resources.output_height} "
+                    f"with {resources.worker_count} workers…",
+                )
             )
             exposure_report = render_session(
                 session,
@@ -498,6 +517,7 @@ class StitcherApp:
                 coverage,
                 self._cancel_event,
                 self.jpeg_quality_var.get(),
+                workers,
             )
             LOGGER.info("render completed: %s", output_path)
             self._events.put(

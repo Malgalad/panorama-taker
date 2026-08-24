@@ -997,10 +997,11 @@ mod retains its built-in defaults and capture remains usable.
 
 When present, register a `Panorama Capture` tab and `Capture` subcategory with:
 
-- The active in-game FPP FoV remains authoritative. A capture-only FoV override
-  and live planned-count control were prototyped but removed because the game
-  camera did not reliably accept the override and Native Settings could not
-  update the summary safely.
+- `Capture FoV`: optional 30–120 degree display-FoV override. Until the slider
+  is changed, capture planning uses the active in-game FPP FoV without an
+  override. This requires the separately installed first-party FOV Control
+  RED4ext helper when an override is selected; hide this control entirely when
+  that helper is absent.
 - `Settling delay`: 0.1–3.0 seconds, step 0.1, default 1.0. It is the time
   after a verified camera move and before a screenshot request, for temporal
   accumulation; it does not delay pitch-correction attempts.
@@ -1010,8 +1011,8 @@ When present, register a `Panorama Capture` tab and `Capture` subcategory with:
 - Native Settings restore-defaults resets these controls while idle. Active
   sessions retain their immutable start-of-session snapshot.
 
-Persist settings atomically in the existing relative bridge/runtime directory;
-never hard-code a game installation path. First prove `gameFPPCameraComponent`
+Persist settings in `settings.json` beside the CET script; never hard-code a
+game installation path. First prove `gameFPPCameraComponent`
 FoV override/readback and restoration in-game before making it the production
 path. If verification fails, abort before hiding the HUD or moving the camera.
 Do not alter existing CET bindings.

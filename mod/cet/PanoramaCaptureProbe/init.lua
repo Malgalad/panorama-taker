@@ -1,4 +1,4 @@
-local MOD_VERSION = "0.1.40"
+local MOD_VERSION = "0.1.47"
 local DEVELOPMENT_MODE = false
 
 local function log(message)
@@ -28,14 +28,26 @@ local nativeSettings = nil
 local settingsDraftSettle = nil
 local settingsDraftScreenshotCooldown = nil
 local settingsDraftCaptureFov = nil
+local fovControlInstalled = false
+local SETTINGS_FILE = "settings.json"
+local SETTINGS_DEFAULTS = {
+    settleSeconds = 1.0,
+    screenshotCooldownSeconds = 3.1,
+}
+local FOV_APPLY_TIMEOUT_SECONDS = 2.0
 
--- User-editable capture settings. Reload CET after changing them.
+local function isFiniteNumber(value)
+    return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
+end
+
+-- Native Settings values are persisted in settings.json beside this script.
 local captureConfig = {
     overlap = 0.08,
     adaptiveYawGuard = 0.05,
-    settleSeconds = 1.0,
-    captureFov = 70.0,
-    screenshotCooldownSeconds = 3.1,
+    settleSeconds = SETTINGS_DEFAULTS.settleSeconds,
+    -- nil uses the active in-game display FoV for this session.
+    captureFov = nil,
+    screenshotCooldownSeconds = SETTINGS_DEFAULTS.screenshotCooldownSeconds,
     screenshotAckTimeoutSeconds = 15.0,
     calibrationFrames = 2,
     pitchToleranceDegrees = 0.25,
@@ -45,6 +57,79 @@ local captureConfig = {
     bridgeDirectory = ".",
 }
 
+local function displayFov(camera)
+    local ok, value = pcall(function() return camera:GetDisplayFOV() end)
+    if ok and isFiniteNumber(value) and value > 0 and value < 180 then
+        return value, nil
+    end
+    return nil, ok and "GetDisplayFOV returned an invalid value" or tostring(value)
+end
+
+local function detectFovControl()
+    local ok, version = pcall(function() return FovControl.Version() end)
+    return ok and type(version) == "string" and version ~= ""
+end
+
+local function savePersistentSettings()
+    local settings = {
+        schemaVersion = 1,
+        settleSeconds = captureConfig.settleSeconds,
+        screenshotCooldownSeconds = captureConfig.screenshotCooldownSeconds,
+    }
+    if captureConfig.captureFov ~= nil then
+        settings.captureFov = captureConfig.captureFov
+    end
+    local okEncode, encoded = pcall(json.encode, settings)
+    if not okEncode then
+        log("Settings save failed: " .. tostring(encoded))
+        return false
+    end
+    local file, openError = io.open(SETTINGS_FILE, "w")
+    if file == nil then
+        log("Settings save failed: " .. tostring(openError))
+        return false
+    end
+    local writeResult, writeError = file:write(encoded)
+    local closeResult, closeError = file:close()
+    if writeResult == nil or closeResult == nil then
+        log("Settings save failed: " .. tostring(writeError or closeError))
+        return false
+    end
+    return true
+end
+
+local function loadPersistentSettings()
+    local file = io.open(SETTINGS_FILE, "r")
+    if file == nil then
+        return
+    end
+    local content = file:read("*a")
+    file:close()
+    local okDecode, settings = pcall(json.decode, content)
+    if not okDecode or type(settings) ~= "table" then
+        log("Settings load ignored: settings.json is not valid JSON.")
+        return
+    end
+    if isFiniteNumber(settings.settleSeconds) and settings.settleSeconds >= 0.1 and settings.settleSeconds <= 3.0 then
+        captureConfig.settleSeconds = settings.settleSeconds
+    end
+    if isFiniteNumber(settings.screenshotCooldownSeconds) and settings.screenshotCooldownSeconds >= 0 and
+        settings.screenshotCooldownSeconds <= 5.0 then
+        captureConfig.screenshotCooldownSeconds = settings.screenshotCooldownSeconds
+    end
+    if fovControlInstalled and isFiniteNumber(settings.captureFov) and
+        settings.captureFov >= 30 and settings.captureFov <= 120 then
+        captureConfig.captureFov = settings.captureFov
+    end
+end
+
+local function nativeSettingsCaptureFovDefault()
+    local player = Game.GetPlayer()
+    local camera = player and player:GetFPPCameraComponent()
+    local value = camera and displayFov(camera)
+    return value or 90.0
+end
+
 local function registerNativeSettings()
     local ok, settings = pcall(function() return GetMod("nativeSettings") end)
     if not ok or settings == nil then
@@ -53,41 +138,48 @@ local function registerNativeSettings()
     nativeSettings = settings
     settingsDraftSettle = captureConfig.settleSeconds
     settingsDraftScreenshotCooldown = captureConfig.screenshotCooldownSeconds
-    settingsDraftCaptureFov = 70.0
+    settingsDraftCaptureFov = captureConfig.captureFov
+    local visibleCaptureFov = settingsDraftCaptureFov or nativeSettingsCaptureFovDefault()
     local okApi = pcall(function()
         nativeSettings.addTab("/PanoramaCapture", "Panorama Capture", nil)
         nativeSettings.addSubcategory("/PanoramaCapture/Capture", "Capture", 1)
         nativeSettings.addRangeFloat(
             "/PanoramaCapture/Capture", "Settling delay", "Seconds to wait after the verified pose before requesting a screenshot.",
-            0.1, 3.0, 0.1, "%.1fs", settingsDraftSettle, captureConfig.settleSeconds,
+            0.1, 3.0, 0.1, "%.1fs", settingsDraftSettle, SETTINGS_DEFAULTS.settleSeconds,
             function(value)
                 settingsDraftSettle = value
                 captureConfig.settleSeconds = value
+                savePersistentSettings()
             end, 1)
         nativeSettings.addRangeFloat(
             "/PanoramaCapture/Capture", "ReShade toast cooldown",
             "Wait after each ReShade screenshot so its three-second toast cannot enter the next capture.",
             0.0, 5.0, 0.1, "%.1fs", settingsDraftScreenshotCooldown,
-            captureConfig.screenshotCooldownSeconds,
+            SETTINGS_DEFAULTS.screenshotCooldownSeconds,
             function(value)
                 settingsDraftScreenshotCooldown = value
                 captureConfig.screenshotCooldownSeconds = value
+                savePersistentSettings()
             end, 2)
-        nativeSettings.addRangeFloat(
-            "/PanoramaCapture/Capture", "Capture FoV",
-            "Display FoV to use during capture; lower values increase screenshot count and resolution.",
-            30.0, 120.0, 1.0, "%.0f°", settingsDraftCaptureFov, settingsDraftCaptureFov,
-            function(value)
-                settingsDraftCaptureFov = value
-                captureConfig.captureFov = value
-            end, 3)
+        if fovControlInstalled then
+            nativeSettings.addRangeFloat(
+                "/PanoramaCapture/Capture", "Capture FoV",
+                "Optional display FoV override. Until changed, capture uses the active in-game FoV; lower values increase screenshot count and resolution.",
+                30.0, 120.0, 1.0, "%.0f°", visibleCaptureFov, visibleCaptureFov,
+                function(value)
+                    settingsDraftCaptureFov = value
+                    captureConfig.captureFov = value
+                    savePersistentSettings()
+                end, 3)
+        end
         nativeSettings.registerRestoreDefaultsCallback("/PanoramaCapture/Capture", false, function()
-            settingsDraftSettle = 1.0
-            settingsDraftScreenshotCooldown = 3.1
-            captureConfig.settleSeconds = 1.0
-            captureConfig.screenshotCooldownSeconds = 3.1
-            settingsDraftCaptureFov = 70.0
-            captureConfig.captureFov = 70.0
+            settingsDraftSettle = SETTINGS_DEFAULTS.settleSeconds
+            settingsDraftScreenshotCooldown = SETTINGS_DEFAULTS.screenshotCooldownSeconds
+            captureConfig.settleSeconds = SETTINGS_DEFAULTS.settleSeconds
+            captureConfig.screenshotCooldownSeconds = SETTINGS_DEFAULTS.screenshotCooldownSeconds
+            settingsDraftCaptureFov = nil
+            captureConfig.captureFov = nil
+            savePersistentSettings()
         end)
     end)
     if not okApi then
@@ -104,13 +196,9 @@ local function syncNativeSettings()
     if settingsDraftScreenshotCooldown ~= nil then
         captureConfig.screenshotCooldownSeconds = settingsDraftScreenshotCooldown
     end
-    if settingsDraftCaptureFov ~= nil then
+    if fovControlInstalled and settingsDraftCaptureFov ~= nil then
         captureConfig.captureFov = settingsDraftCaptureFov
     end
-end
-
-local function isFiniteNumber(value)
-    return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
 end
 
 local function configurationError()
@@ -125,8 +213,8 @@ local function configurationError()
         captureConfig.settleSeconds > 60 then
         return "settleSeconds must be a finite number in [0, 60]"
     end
-    if not isFiniteNumber(captureConfig.captureFov) or captureConfig.captureFov < 30 or
-        captureConfig.captureFov > 120 then
+    if captureConfig.captureFov ~= nil and (not isFiniteNumber(captureConfig.captureFov) or
+        captureConfig.captureFov < 30 or captureConfig.captureFov > 120) then
         return "captureFov must be a finite number in [30, 120]"
     end
     if not isFiniteNumber(captureConfig.screenshotCooldownSeconds) or
@@ -314,13 +402,84 @@ local function effectiveFov()
     return horizontal, vertical, nil
 end
 
+local function fovControlValue(camera, methodName)
+    local ok, value = pcall(function() return camera[methodName](camera) end)
+    if ok and type(value) == "number" then
+        return string.format("%.3f", value)
+    end
+    if ok then
+        return tostring(value)
+    end
+    return "unavailable: " .. tostring(value)
+end
+
+local function fovControlNativeValue(methodName)
+    local ok, value = pcall(function() return FovControl[methodName]() end)
+    if ok then
+        return tostring(value)
+    end
+    return "unavailable: " .. tostring(value)
+end
+
+local function fovControlNativeCall(methodName)
+    return pcall(function() return FovControl[methodName]() end)
+end
+
+local function fovSchedulerActive(camera)
+    local ok, active = pcall(function() return camera:IsPendingSchedulerActive() end)
+    if not ok or type(active) ~= "boolean" then
+        return nil, ok and "PendingSetFOV returned an invalid state" or tostring(active)
+    end
+    return active, nil
+end
+
+local function cameraInternalFov(camera)
+    local ok, value = pcall(function() return camera:GetFOV() end)
+    if not ok or not isFiniteNumber(value) then
+        return nil, ok and "GetFOV returned an invalid value" or tostring(value)
+    end
+    return value, nil
+end
+
 local function setDisplayFov(camera, displayFov)
-    local okPending = pcall(function() camera:PendingSetFOV() end)
+    local internalBefore = fovControlValue(camera, "GetFOV")
+    local displayBefore = fovControlValue(camera, "GetDisplayFOV")
+    local lockStatus = "not required"
+    local patchingOk, patching = fovControlNativeCall("IsPatchingAllowed")
+    local lockedOk, locked = fovControlNativeCall("IsLocked")
+    if patchingOk and patching == true and lockedOk and locked == false then
+        local lockOk, lockResult = fovControlNativeCall("Lock")
+        lockStatus = tostring(lockResult)
+        if not lockOk or lockResult ~= true then
+            return false, "FOV Control lock failed: " .. tostring(lockResult)
+        end
+    elseif patchingOk and patching == true and (not lockedOk or locked ~= true) then
+        return false, "FOV Control lock state unavailable: " .. tostring(locked)
+    end
+    local okPending, pendingResult = pcall(function() return camera:PendingSetFOV() end)
+    if not okPending then
+        return false, "FOV Control PendingSetFOV unavailable: " .. tostring(pendingResult)
+    end
+    if pendingResult ~= true then
+        return false, "FOV Control PendingSetFOV refused: " .. tostring(pendingResult)
+    end
     local okSet, setError = pcall(function() camera:SetDisplayFOV(displayFov) end)
+    local internalAfter = fovControlValue(camera, "GetFOV")
+    local displayAfter = fovControlValue(camera, "GetDisplayFOV")
+    log(string.format(
+        "FOV Control: requested=%.3f; GetFOV %s -> %s; GetDisplayFOV %s -> %s; lock=%s; PendingSetFOV=%s; scheduler=%s; SetDisplayFOV=%s; native patching=%s locked=%s version=%s.",
+        displayFov, internalBefore, internalAfter, displayBefore, displayAfter,
+        lockStatus,
+        tostring(pendingResult),
+        fovControlValue(camera, "IsPendingSchedulerActive"),
+        okSet and "ok" or tostring(setError),
+        fovControlNativeValue("IsPatchingAllowed"),
+        fovControlNativeValue("IsLocked"),
+        fovControlNativeValue("Version")))
     if not okSet then
         return false, "FOV Control SetDisplayFOV unavailable: " .. tostring(setError)
     end
-    return true, okPending and nil or "PendingSetFOV unavailable"
+    return true, nil
 end
 
 local function buildFullSpherePlan(horizontal, vertical, overlap, adaptiveYawGuard)
@@ -663,14 +822,11 @@ local function applyEnvironmentControls(environment)
     end
     environment.timeApplied = true
 
-    local fovApplied, fovError = setDisplayFov(environment.camera, captureConfig.captureFov)
-    if not fovApplied and not tostring(fovError):find("unavailable", 1, true) then
-        return false, fovError
-    end
-
-    local inputLocked, inputError = applyInputRestrictions(environment)
-    if not inputLocked then
-        return false, inputError
+    if environment.inputRestrictions == nil then
+        local inputLocked, inputError = applyInputRestrictions(environment)
+        if not inputLocked then
+            return false, inputError
+        end
     end
 
     local okHud, hudError = hideHud(environment)
@@ -689,15 +845,15 @@ local function restoreEnvironmentControls(environment)
     restoreInputRestrictions(environment)
     restoreCaptureMeshes(environment)
     restoreHud(environment)
-    if environment.originalDisplayFov ~= nil then
-        pcall(function() setDisplayFov(environment.camera, environment.originalDisplayFov) end)
-    end
     if environment.timeApplied then
         pcall(function()
             local timeSystem = Game.GetTimeSystem()
             timeSystem:UnsetTimeDilation("PanoramaCapture")
             timeSystem:SetIgnoreTimeDilationOnLocalPlayerZero(false)
         end)
+    end
+    if environment.fovOverrideAttempted and environment.originalDisplayFov ~= nil then
+        pcall(function() setDisplayFov(environment.camera, environment.originalDisplayFov) end)
     end
 end
 
@@ -834,11 +990,12 @@ registerDevelopmentInput("panorama_capture_probe_environment", "Panorama: probe 
         log("Environment probe requires an active player, camera system, and FPP camera.")
         return
     end
-    local originalDisplayFov, _, originalFovError = effectiveFov()
-    if originalDisplayFov == nil then
+    local _, _, originalFovError = effectiveFov()
+    if originalFovError ~= nil then
         log("Environment probe cancelled: " .. tostring(originalFovError) .. ".")
         return
     end
+    local originalDisplayFov = displayFov(camera)
 
     local hud, hudError = snapshotHud()
     if hud == nil then
@@ -887,6 +1044,62 @@ registerDevelopmentInput("panorama_capture_probe_environment", "Panorama: probe 
     devLog("Environment probe active; press the same hotkey to restore.")
 end)
 
+local function beginProductionCapture(environment)
+    local okControls, controlError = applyEnvironmentControls(environment)
+    if not okControls then
+        return false, controlError
+    end
+    local captureHorizontal, captureVertical, captureFovError = effectiveFov()
+    if captureHorizontal == nil then
+        return false, "capture FoV readback failed: " .. tostring(captureFovError)
+    end
+    local plan, planError = buildFullSpherePlan(
+        captureHorizontal, captureVertical, captureConfig.overlap, captureConfig.adaptiveYawGuard)
+    if plan == nil then
+        return false, planError
+    end
+    local firstPose = plan.poses[1]
+    environment.targetYaw = firstPose.yaw
+    environment.targetPitch = firstPose.pitch
+    environment.pitchCommand = firstPose.pitch
+    bridgeSessionCounter = bridgeSessionCounter + 1
+    local sessionId = string.format("%d-%d", os.time(), bridgeSessionCounter)
+    productionSession = {
+        plan = plan,
+        index = 1,
+        sessionId = sessionId,
+        horizontalFov = captureHorizontal,
+        verticalFov = captureVertical,
+        settleSeconds = captureConfig.settleSeconds,
+        screenshotCooldownSeconds = captureConfig.screenshotCooldownSeconds,
+        screenshotAckTimeoutSeconds = captureConfig.screenshotAckTimeoutSeconds,
+        lastSettleSeconds = 0.0,
+        pitchCorrection = 0.0,
+        awaitingScreenshot = false,
+        screenshotWaitElapsed = 0.0,
+        screenshotCooldownRemaining = 0.0,
+        metadataPath = bridgeFile("pano-" .. sessionId .. ".json"),
+        location = {
+            position = environment.position,
+            yaw = environment.originalYaw,
+        },
+        metadataRecords = {},
+        pendingMetadata = nil,
+        metadataFailed = false,
+    }
+    if not writeSessionMetadata(productionSession, "active") then
+        discardSessionMetadata(productionSession)
+        productionSession = nil
+        return false, "initial metadata publication failed"
+    end
+    applyPose(environment, environment.originalYaw + firstPose.yaw)
+    environment.state = "pitch_calibration_pending"
+    log(string.format("Production session started: %d poses, %dx%d, HFoV=%.3f VFoV=%.3f, adaptive yaw guard=%.1f%%.",
+        #plan.poses, plan.columns, plan.rows, captureHorizontal, captureVertical,
+        plan.adaptiveYawGuard * 100.0))
+    return true, nil
+end
+
 local function startProductionSession()
     if productionSession ~= nil or environmentSequence ~= nil then
         devLog("Production session already active.")
@@ -915,11 +1128,6 @@ local function startProductionSession()
         log("Production session requires an active player, camera system, and FPP camera.")
         return
     end
-    local horizontal, vertical, fovError = effectiveFov()
-    if horizontal == nil then
-        log("Production session cancelled: " .. tostring(fovError) .. ".")
-        return
-    end
     local hud, hudError = snapshotHud()
     if hud == nil then
         log("Production session cancelled: " .. tostring(hudError))
@@ -943,10 +1151,10 @@ local function startProductionSession()
             player:GetWorldPosition().z, player:GetWorldPosition().w),
         originalOrientation = orientation,
         originalYaw = player:GetWorldYaw(),
-        originalDisplayFov = horizontal,
+        originalDisplayFov = displayFov(camera),
         hud = hud,
         meshes = meshes,
-        state = "applying",
+        state = "fov_preflight",
         waitFrames = 0,
         settleElapsed = 0.0,
         settleSecondsRequired = captureConfig.settleSeconds,
@@ -959,69 +1167,31 @@ local function startProductionSession()
         restoreRequested = false,
         production = true,
     }
-    local okControls, controlError = applyEnvironmentControls(environmentSequence)
-    if not okControls then
-        restoreEnvironmentControls(environmentSequence)
-        environmentSequence = nil
-        log("Production session cancelled: " .. tostring(controlError))
+    if fovControlInstalled and captureConfig.captureFov ~= nil then
+        local inputLocked, inputError = applyInputRestrictions(environmentSequence)
+        if not inputLocked then
+            restoreEnvironmentControls(environmentSequence)
+            environmentSequence = nil
+            log("Production session cancelled: " .. tostring(inputError))
+            return
+        end
+        environmentSequence.fovOverrideAttempted = true
+        environmentSequence.fovApplyElapsed = 0.0
+        environmentSequence.fovTarget = captureConfig.captureFov
+        local fovApplied, fovError = setDisplayFov(camera, captureConfig.captureFov)
+        if not fovApplied then
+            restoreEnvironmentControls(environmentSequence)
+            environmentSequence = nil
+            log("Production session cancelled: " .. tostring(fovError))
+        end
         return
     end
-    local captureHorizontal, captureVertical, captureFovError = effectiveFov()
-    if captureHorizontal == nil then
+    local started, startError = beginProductionCapture(environmentSequence)
+    if not started then
         restoreEnvironmentControls(environmentSequence)
         environmentSequence = nil
-        log("Production session cancelled: capture FoV readback failed: " .. tostring(captureFovError) .. ".")
-        return
+        log("Production session cancelled: " .. tostring(startError))
     end
-    local plan, planError = buildFullSpherePlan(
-        captureHorizontal, captureVertical, captureConfig.overlap, captureConfig.adaptiveYawGuard)
-    if plan == nil then
-        restoreEnvironmentControls(environmentSequence)
-        environmentSequence = nil
-        log("Production session cancelled: " .. tostring(planError))
-        return
-    end
-    local firstPose = plan.poses[1]
-    environmentSequence.targetYaw = firstPose.yaw
-    environmentSequence.targetPitch = firstPose.pitch
-    environmentSequence.pitchCommand = firstPose.pitch
-    bridgeSessionCounter = bridgeSessionCounter + 1
-    local sessionId = string.format("%d-%d", os.time(), bridgeSessionCounter)
-    productionSession = {
-        plan = plan,
-        index = 1,
-        sessionId = sessionId,
-        horizontalFov = captureHorizontal,
-        verticalFov = captureVertical,
-        settleSeconds = captureConfig.settleSeconds,
-        screenshotCooldownSeconds = captureConfig.screenshotCooldownSeconds,
-        screenshotAckTimeoutSeconds = captureConfig.screenshotAckTimeoutSeconds,
-        lastSettleSeconds = 0.0,
-        pitchCorrection = 0.0,
-        awaitingScreenshot = false,
-        screenshotWaitElapsed = 0.0,
-        screenshotCooldownRemaining = 0.0,
-        metadataPath = bridgeFile("pano-" .. sessionId .. ".json"),
-        location = {
-            position = environmentSequence.position,
-            yaw = environmentSequence.originalYaw,
-        },
-        metadataRecords = {},
-        pendingMetadata = nil,
-        metadataFailed = false,
-    }
-    if not writeSessionMetadata(productionSession, "active") then
-        discardSessionMetadata(productionSession)
-        restoreEnvironmentControls(environmentSequence)
-        environmentSequence = nil
-        productionSession = nil
-        log("Production session cancelled: initial metadata publication failed.")
-        return
-    end
-    applyPose(environmentSequence, environmentSequence.originalYaw + firstPose.yaw)
-    environmentSequence.state = "pitch_calibration_pending"
-    log(string.format("Production session started: %d poses, %dx%d, HFoV=%.3f VFoV=%.3f, adaptive yaw guard=%.1f%%.",
-        #plan.poses, plan.columns, plan.rows, horizontal, vertical, plan.adaptiveYawGuard * 100.0))
 end
 
 local function queueNextProductionPose()
@@ -1121,6 +1291,7 @@ local function abortEnvironment(reason)
     if environmentSequence == nil then
         return
     end
+    local wasProduction = productionSession ~= nil or environmentSequence.production == true
     discardBridgeFiles()
     if productionSession ~= nil then
         finalizeAbortedSessionMetadata(productionSession)
@@ -1128,7 +1299,11 @@ local function abortEnvironment(reason)
     restoreEnvironmentControls(environmentSequence)
     environmentSequence = nil
     productionSession = nil
-    log("Environment probe: aborted (" .. reason .. ").")
+    if wasProduction then
+        log("Production session aborted (" .. reason .. ").")
+    else
+        log("Environment probe: aborted (" .. reason .. ").")
+    end
 end
 
 local function restorePoseImmediately(environment)
@@ -1171,6 +1346,46 @@ registerForEvent("onUpdate", function(deltaTime)
         local currentPlayer = Game.GetPlayer()
         if currentPlayer == nil or entityHash(currentPlayer) ~= environmentSequence.playerHash then
             abortEnvironment("player changed or became unavailable during session transition")
+            return
+        end
+        if environmentSequence.state == "fov_preflight" then
+            if type(deltaTime) == "number" and deltaTime > 0 then
+                environmentSequence.fovApplyElapsed = environmentSequence.fovApplyElapsed + deltaTime
+            end
+            local schedulerActive, schedulerError = fovSchedulerActive(environmentSequence.camera)
+            if schedulerActive == nil then
+                restoreEnvironmentControls(environmentSequence)
+                environmentSequence = nil
+                log("Production session cancelled: FOV Control scheduler unavailable: " .. tostring(schedulerError))
+                return
+            end
+            local observedFov, observedError = displayFov(environmentSequence.camera)
+            local componentFov, componentError = cameraInternalFov(environmentSequence.camera)
+            local _, activeFov, activeError = effectiveFov()
+            local fovApplied = not schedulerActive and observedFov ~= nil and componentFov ~= nil and
+                activeFov ~= nil and math.abs(observedFov - environmentSequence.fovTarget) <= 0.25 and
+                math.abs(activeFov - componentFov) <= 0.25
+            if not fovApplied and environmentSequence.fovApplyElapsed < FOV_APPLY_TIMEOUT_SECONDS then
+                return
+            end
+            if not fovApplied then
+                local targetFov = environmentSequence.fovTarget
+                restoreEnvironmentControls(environmentSequence)
+                environmentSequence = nil
+                log(string.format(
+                    "Production session cancelled: capture FoV did not apply (requested %.3f, observed %s; active %s; component %s).",
+                    targetFov,
+                    observedFov and string.format("%.3f", observedFov) or tostring(observedError),
+                    activeFov and string.format("%.3f", activeFov) or tostring(activeError),
+                    componentFov and string.format("%.3f", componentFov) or tostring(componentError)))
+                return
+            end
+            local started, startError = beginProductionCapture(environmentSequence)
+            if not started then
+                restoreEnvironmentControls(environmentSequence)
+                environmentSequence = nil
+                log("Production session cancelled: " .. tostring(startError))
+            end
             return
         end
         if productionSession ~= nil and not productionSession.awaitingScreenshot and
@@ -1393,6 +1608,8 @@ registerForEvent("onUpdate", function(deltaTime)
 end)
 
 registerForEvent("onInit", function()
+    fovControlInstalled = detectFovControl()
+    loadPersistentSettings()
     registerNativeSettings()
     Observe("gameuiPopupsManager", "OnMenuUpdate", function(_, isInMenu)
         pauseEventState = isInMenu == true

@@ -9,6 +9,7 @@ import struct
 import tempfile
 import zlib
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from importlib import import_module
@@ -21,7 +22,7 @@ import numpy as np
 from numpy.typing import NDArray
 from PIL import Image
 
-from pano_stitch.metadata import ImageEncoding, SessionMetadata
+from pano_stitch.metadata import FrameMetadata, ImageEncoding, SessionMetadata
 from pano_stitch.projection import camera_maps, equirectangular_directions, remap_source
 
 FloatImage = NDArray[np.float32]
@@ -29,6 +30,7 @@ DEFAULT_MEMORY_BUDGET_BYTES = 768 * 1024 * 1024
 MAX_MEMORY_BUDGET_BYTES = 8192 * 1024 * 1024
 _RESERVED_RUNTIME_BYTES = 192 * 1024 * 1024
 _TILE_BYTES_PER_PIXEL = 160
+_MAX_AUTO_WORKERS = 8
 
 
 @dataclass(frozen=True)
@@ -47,6 +49,7 @@ class RenderResources:
     output_width: int
     output_height: int
     strip_height: int
+    worker_count: int
     scratch_bytes: int
 
 
@@ -490,7 +493,9 @@ class _CoverageWriter:
                 self._write_chunk(b"IDAT", compressed)
 
 
-def _choose_strip_height(source: SourceInfo, output_width: int, memory_budget_bytes: int) -> int:
+def _available_tile_bytes(
+    source: SourceInfo, output_width: int, memory_budget_bytes: int
+) -> int:
     if memory_budget_bytes <= 0 or memory_budget_bytes > MAX_MEMORY_BUDGET_BYTES:
         maximum_mib = MAX_MEMORY_BUDGET_BYTES // (1024 * 1024)
         raise ValueError(f"memory budget must be between 1 and {maximum_mib} MiB")
@@ -498,7 +503,34 @@ def _choose_strip_height(source: SourceInfo, output_width: int, memory_budget_by
     available = memory_budget_bytes - source_working_set - _RESERVED_RUNTIME_BYTES
     if available < output_width * _TILE_BYTES_PER_PIXEL:
         raise ValueError("memory budget is too small for one output row and one decoded source")
-    return max(1, available // (_TILE_BYTES_PER_PIXEL * output_width))
+    return available
+
+
+def _choose_render_plan(
+    source: SourceInfo,
+    output_width: int,
+    output_height: int,
+    memory_budget_bytes: int,
+    workers: int | None,
+) -> tuple[int, int]:
+    available = _available_tile_bytes(source, output_width, memory_budget_bytes)
+    bytes_per_worker_row = output_width * _TILE_BYTES_PER_PIXEL
+    maximum_workers = max(1, available // bytes_per_worker_row)
+    if workers is not None and workers < 1:
+        raise ValueError("workers must be at least 1")
+    requested_workers = workers or min(os.cpu_count() or 1, _MAX_AUTO_WORKERS)
+    worker_count = min(requested_workers, maximum_workers)
+    strip_height = max(1, available // (worker_count * bytes_per_worker_row))
+    return worker_count, min(strip_height, output_height)
+
+
+def _choose_strip_height(source: SourceInfo, output_width: int, memory_budget_bytes: int) -> int:
+    """Return the legacy single-worker strip height used by resource tests."""
+
+    _, strip_height = _choose_render_plan(
+        source, output_width, 2**31 - 1, memory_budget_bytes, workers=1
+    )
+    return strip_height
 
 
 def _read_tile(stream: BinaryIO, offset: int, shape: tuple[int, ...]) -> FloatImage:
@@ -517,6 +549,62 @@ def _write_tile(stream: BinaryIO, offset: int, tile: FloatImage) -> None:
 
 def _scratch_offset(row: int, width: int, channels: int) -> int:
     return row * width * channels * np.dtype(np.float32).itemsize
+
+
+def _composite_strip(
+    color_path: Path,
+    weight_path: Path,
+    source: FloatImage,
+    frame: FrameMetadata,
+    source_info: SourceInfo,
+    horizontal_fov_deg: float,
+    vertical_fov_deg: float,
+    latitude_span: float,
+    output_width: int,
+    output_height: int,
+    row_start: int,
+    strip_height: int,
+    blend: str,
+    cancel_event: Event | None,
+) -> None:
+    """Composite one row-disjoint strip using independent scratch-file handles."""
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise RenderCancelledError("render cancelled")
+    rows = min(strip_height, output_height - row_start)
+    directions = equirectangular_directions(
+        output_width, rows, latitude_span, row_start, output_height
+    )
+    map_x, map_y, valid, edge_distance = camera_maps(
+        directions,
+        frame,
+        source_info.width,
+        source_info.height,
+        horizontal_fov_deg,
+        vertical_fov_deg,
+    )
+    sampled = remap_source(source, map_x, map_y)
+    color_offset = _scratch_offset(row_start, output_width, 3)
+    weight_offset = _scratch_offset(row_start, output_width, 1)
+    with color_path.open("r+b") as color_scratch, weight_path.open("r+b") as weight_scratch:
+        color = _read_tile(color_scratch, color_offset, (rows, output_width, 3))
+        weight = _read_tile(weight_scratch, weight_offset, (rows, output_width))
+        if blend == "hard":
+            candidate = np.where(valid, np.maximum(edge_distance, 1e-6), 0.0)
+            selected = candidate > weight
+            color[selected] = sampled[selected]
+            weight[selected] = candidate[selected]
+        else:
+            feather_width = max(1.0, min(source_info.width, source_info.height) * 0.08)
+            candidate = np.where(
+                valid,
+                np.maximum(edge_distance / feather_width, 1e-6),
+                0.0,
+            )
+            color += sampled * candidate[..., np.newaxis]
+            weight += candidate
+        _write_tile(color_scratch, color_offset, color)
+        _write_tile(weight_scratch, weight_offset, weight)
 
 
 def _image_path(image_root: Path, filename: str) -> Path:
@@ -582,6 +670,7 @@ def estimate_render_resources(
     image_root: Path,
     width: int | None = None,
     memory_budget_bytes: int = DEFAULT_MEMORY_BUDGET_BYTES,
+    workers: int | None = None,
 ) -> RenderResources:
     """Return the output and scratch requirements without decoding source pixels."""
 
@@ -589,9 +678,11 @@ def estimate_render_resources(
         raise ValueError("session contains no frames")
     source = _source_info_for_session(session, image_root)
     output_width, output_height = _output_dimensions(session, source.width, width)
-    strip_height = _choose_strip_height(source, output_width, memory_budget_bytes)
+    worker_count, strip_height = _choose_render_plan(
+        source, output_width, output_height, memory_budget_bytes, workers
+    )
     scratch_bytes = output_height * output_width * 4 * np.dtype(np.float32).itemsize
-    return RenderResources(output_width, output_height, strip_height, scratch_bytes)
+    return RenderResources(output_width, output_height, strip_height, worker_count, scratch_bytes)
 
 
 def render_session(
@@ -606,6 +697,7 @@ def render_session(
     debug_coverage_path: Path | None = None,
     cancel_event: Event | None = None,
     jpeg_quality: int = 95,
+    workers: int | None = None,
 ) -> ExposureReport:
     """Render one session with bounded RAM and disk-backed strip accumulators."""
 
@@ -626,7 +718,9 @@ def render_session(
     output_suffix = output_path.suffix.lower()
     if output_suffix not in {".exr", ".jpg", ".jpeg", ".png"}:
         raise ValueError("output extension must be .exr, .jpg, .jpeg, or .png")
-    resources = estimate_render_resources(session, image_root, width, memory_budget_bytes)
+    resources = estimate_render_resources(
+        session, image_root, width, memory_budget_bytes, workers
+    )
     output_width = resources.output_width
     output_height = resources.output_height
     strip_height = resources.strip_height
@@ -671,59 +765,42 @@ def render_session(
                 output_height * output_width * np.dtype(np.float32).itemsize
             )
 
-        with color_path.open("r+b") as color_scratch, weight_path.open("r+b") as weight_scratch:
-            for frame_position, frame in enumerate(session.frames):
-                if cancel_event is not None and cancel_event.is_set():
-                    raise RenderCancelledError("render cancelled")
-                source = _read_source(
-                    _image_path(image_root, frame.filename), first_source.encoding
-                )
-                try:
-                    source *= np.float32(exposure_report.gains[frame_position])
-                    for row_start in range(0, output_height, strip_height):
-                        if cancel_event is not None and cancel_event.is_set():
-                            raise RenderCancelledError("render cancelled")
-                        rows = min(strip_height, output_height - row_start)
-                        directions = equirectangular_directions(
-                            output_width, rows, latitude_span, row_start, output_height
-                        )
-                        map_x, map_y, valid, edge_distance = camera_maps(
-                            directions,
+        for frame_position, frame in enumerate(session.frames):
+            if cancel_event is not None and cancel_event.is_set():
+                raise RenderCancelledError("render cancelled")
+            source = _read_source(_image_path(image_root, frame.filename), first_source.encoding)
+            try:
+                source *= np.float32(exposure_report.gains[frame_position])
+                with ThreadPoolExecutor(max_workers=resources.worker_count) as executor:
+                    futures = [
+                        executor.submit(
+                            _composite_strip,
+                            color_path,
+                            weight_path,
+                            source,
                             frame,
-                            first_source.width,
-                            first_source.height,
+                            first_source,
                             session.horizontal_fov_deg,
                             session.vertical_fov_deg,
+                            latitude_span,
+                            output_width,
+                            output_height,
+                            row_start,
+                            strip_height,
+                            blend,
+                            cancel_event,
                         )
-                        sampled = remap_source(source, map_x, map_y)
-                        color_offset = _scratch_offset(row_start, output_width, 3)
-                        weight_offset = _scratch_offset(row_start, output_width, 1)
-                        color = _read_tile(color_scratch, color_offset, (rows, output_width, 3))
-                        weight = _read_tile(weight_scratch, weight_offset, (rows, output_width))
-                        if blend == "hard":
-                            candidate = np.where(valid, np.maximum(edge_distance, 1e-6), 0.0)
-                            selected = candidate > weight
-                            color[selected] = sampled[selected]
-                            weight[selected] = candidate[selected]
-                        else:
-                            feather_width = max(
-                                1.0, min(first_source.width, first_source.height) * 0.08
-                            )
-                            candidate = np.where(
-                                valid,
-                                np.maximum(edge_distance / feather_width, 1e-6),
-                                0.0,
-                            )
-                            color += sampled * candidate[..., np.newaxis]
-                            weight += candidate
-                        _write_tile(color_scratch, color_offset, color)
-                        _write_tile(weight_scratch, weight_offset, weight)
+                        for row_start in range(0, output_height, strip_height)
+                    ]
+                    for future in as_completed(futures):
+                        future.result()
                         completed_work += 1
                         if progress_callback is not None:
                             progress_callback(completed_work, total_work, "compositing")
-                finally:
-                    del source
+            finally:
+                del source
 
+        with color_path.open("r+b") as color_scratch, weight_path.open("r+b") as weight_scratch:
             temporary_path = _temporary_output_path(output_path)
             temporary_coverage_path = (
                 _temporary_output_path(debug_coverage_path)

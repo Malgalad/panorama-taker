@@ -18,9 +18,10 @@ JSON and screenshots into JPEG, lossless PNG, or HDR EXR.
 - ReShade configured to save the desired screenshots. The verified HDR input
   is its 16-bit Rec.2020/PQ PNG mode.
 
-To use the capture FoV override, install the first-party FOV Control RED4ext
-plugin and redscript helper separately. Without it, Panorama Capture safely
-uses the game's active FoV.
+The capture FoV override is optional. Install the first-party FOV Control
+RED4ext plugin and redscript helper separately only if you want that override.
+Without it, Panorama Capture uses the game's active FoV and does not show a
+Capture FoV slider in Native Settings.
 
 Do not run FreeFly during capture. Vehicles are intentionally rejected, and a
 near-zero time dilation session prevents F9 quick-load from being processed
@@ -45,10 +46,12 @@ until the capture is restored or aborted.
    - `Panorama: abort full-sphere pose session`
    - `Panorama: report capture status` (development builds only)
 
-The shipped configuration enables automatic ReShade screenshots. Edit the
-`captureConfig` table at the top of `init.lua` only while the game is closed or
-before using CET's Reload All Mods action. Keep `bridgeDirectory = "."` unless
-the ReShade add-on and CET bridge are deliberately moved together.
+The shipped configuration enables automatic ReShade screenshots. With Native
+Settings installed, settling delay, toast cooldown, and an optional capture FoV
+override are saved immediately in `PanoramaCaptureProbe/settings.json` and
+survive CET reloads. Until the FoV slider is changed, a capture uses the active
+in-game FoV. Keep `bridgeDirectory = "."` unless the ReShade add-on and CET
+bridge are deliberately moved together.
 
 ## Capture workflow
 
@@ -161,6 +164,10 @@ cd stitcher
 ../.venv/bin/pano-stitch render <capture.json> --image-dir <screenshots-dir> --output <panorama.jpg>
 ../.venv/bin/pano-stitch-gui
 ```
+
+`pano-stitch render` uses bounded parallel strip compositing by default. Use
+`--workers N` to set a specific worker count, or leave the default `--workers 0`
+for Auto; `--memory-budget-mib` bounds the combined active strip working set.
 
 On native Windows, use the corresponding `.venv-win\Scripts\pano-stitch*.exe`
 entry points from the native checkout. Run `ruff`, `mypy`, and `pytest` before
