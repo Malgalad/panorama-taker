@@ -599,6 +599,15 @@ def _composite_strip(
         weight += candidate
 
 
+def _close_scratch_memmap(array: Any) -> None:
+    """Flush and release a scratch mapping before Windows deletes its backing file."""
+
+    array.flush()
+    mapping = array._mmap
+    if mapping is not None:
+        mapping.close()
+
+
 def _image_path(image_root: Path, filename: str) -> Path:
     path = Path(filename)
     return path if path.is_absolute() else image_root / path
@@ -831,22 +840,28 @@ def render_session(
                         if cancel_event is not None and cancel_event.is_set():
                             raise RenderCancelledError("render cancelled")
                         rows = min(strip_height, output_height - row_start)
-                        color = color_scratch[row_start : row_start + rows]
-                        weight = weight_scratch[row_start : row_start + rows]
-                        covered = weight > 0.0
-                        if coverage_writer is not None:
-                            coverage_writer.write(covered)
-                        if blend == "feather":
-                            color[covered] /= weight[covered, np.newaxis]
-                        uncovered = int(np.count_nonzero(~covered))
-                        if uncovered and not allow_incomplete:
-                            raise ValueError(f"capture does not cover {uncovered} output pixels")
-                        if uncovered and allow_incomplete:
-                            color[~covered] = np.array((1.0, 0.0, 1.0), dtype=np.float32)
-                        writer.write(color)
-                        completed_work += 1
-                        if progress_callback is not None:
-                            progress_callback(completed_work, total_work, "writing")
+                        color_rows = color_scratch[row_start : row_start + rows]
+                        weight_rows = weight_scratch[row_start : row_start + rows]
+                        try:
+                            covered = weight_rows > 0.0
+                            if coverage_writer is not None:
+                                coverage_writer.write(covered)
+                            if blend == "feather":
+                                color_rows[covered] /= weight_rows[covered, np.newaxis]
+                            uncovered = int(np.count_nonzero(~covered))
+                            if uncovered and not allow_incomplete:
+                                raise ValueError(
+                                    f"capture does not cover {uncovered} output pixels"
+                                )
+                            if uncovered and allow_incomplete:
+                                color_rows[~covered] = np.array((1.0, 0.0, 1.0), dtype=np.float32)
+                            writer.write(color_rows)
+                            completed_work += 1
+                            if progress_callback is not None:
+                                progress_callback(completed_work, total_work, "writing")
+                        finally:
+                            del color_rows
+                            del weight_rows
                 os.replace(temporary_path, output_path)
                 if temporary_coverage_path is not None and debug_coverage_path is not None:
                     os.replace(temporary_coverage_path, debug_coverage_path)
@@ -857,8 +872,8 @@ def render_session(
                 raise
             return exposure_report
         finally:
-            color_scratch.flush()
-            weight_scratch.flush()
+            _close_scratch_memmap(color_scratch)
+            _close_scratch_memmap(weight_scratch)
             del color_scratch
             del weight_scratch
 
