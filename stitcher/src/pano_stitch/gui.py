@@ -280,7 +280,8 @@ class StitcherApp:
             self._set_path(self.session_dir_var, session_path.parent)
             try:
                 loaded = load_session(session_path, image_directory=session_path.parent)
-                self._set_default_output_name(loaded.session_id)
+                # A newly selected capture must not inherit the previous session's output name.
+                self._set_default_output_name(loaded.session_id, force=True)
                 inferred = self._inferred_image_directory(loaded, session_path.parent)
                 if inferred is not None:
                     self._set_path(self.image_dir_var, inferred)
@@ -366,8 +367,8 @@ class StitcherApp:
     def _suffix_for_format(self) -> str:
         return {"PNG": ".png", "JPEG": ".jpg", "EXR": ".exr"}[self.format_var.get()]
 
-    def _set_default_output_name(self, session_id: str) -> None:
-        if self._output_name_dirty:
+    def _set_default_output_name(self, session_id: str, force: bool = False) -> None:
+        if self._output_name_dirty and not force:
             return
         self.output_name_var.set(f"panorama-{session_id}{self._suffix_for_format()}")
         self._output_name_dirty = False

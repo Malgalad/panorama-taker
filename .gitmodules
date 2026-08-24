@@ -1,0 +1,3 @@
+[submodule "vendor/FovControl"]
+	path = vendor/FovControl
+	url = https://github.com/koryboc/CP2077-FovControl.git

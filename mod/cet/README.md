@@ -34,4 +34,7 @@ After a manual session completes, use `stitcher/scripts/extract_cet_pose_manifes
 
 The user-editable `captureConfig` table is at the top of `init.lua`; reload CET after changing it. Supported settings are `overlap` in `[0, 0.5)`, `adaptiveYawGuard` in `[0, 0.25)`, a positive integer `settleFrames`, `settleSeconds` in `[0, 60]`, a positive `pitchToleranceDegrees` no greater than 10, and non-negative integer correction counts. Invalid values prevent a probe or production session from starting and log the exact field error.
 
-Bind **Panorama: report capture status** to print the current state. While idle it reports active FoV, real FPS, normalized frame-generation state, overlap, and settling settings. During a session it additionally reports pose progress and the remaining settling gate with an FPS-based readiness estimate. CET input bindings remain configurable through CET's binding UI.
+Development builds may bind **Panorama: report capture status** to print the
+current state. The release build keeps the user-facing bindings limited to
+start and abort; status and manual-advance controls are development-only.
+CET input bindings remain configurable through CET's binding UI.

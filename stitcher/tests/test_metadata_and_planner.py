@@ -58,6 +58,15 @@ def test_version_one_timing_metadata_remains_accepted(tmp_path: Path) -> None:
     assert session.frames[0].filename == "legacy.png"
 
 
+def test_location_metadata_is_accepted(tmp_path: Path) -> None:
+    document = json.loads(EXAMPLE.read_text(encoding="utf-8"))
+    document["location"] = {"position": [1.0, 2.0, 3.0], "yaw_deg": 45.0}
+    path = tmp_path / "located.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+
+    assert load_session(path, SCHEMA).session_id == "example"
+
+
 def test_frozen_schema_path_uses_pyinstaller_bundle(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

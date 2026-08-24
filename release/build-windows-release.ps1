@@ -6,7 +6,8 @@ param(
 
     [string]$Version = "0.1.0",
     [string]$PythonCommand = "python",
-    [string]$OutputDirectory = ""
+    [string]$OutputDirectory = "",
+    [string]$FovControlRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -20,6 +21,10 @@ $buildRoot = Join-Path $projectRoot "build\release"
 $venvRoot = Join-Path $projectRoot ".venv-release"
 $python = Join-Path $venvRoot "Scripts\python.exe"
 $addon = (Resolve-Path $AddonPath).Path
+$fovControlRoot = $null
+if ($FovControlRoot) {
+    $fovControlRoot = (Resolve-Path $FovControlRoot).Path
+}
 $pyproject = Get-Content -LiteralPath (Join-Path $projectRoot "stitcher\pyproject.toml") -Raw
 $versionMatch = [regex]::Match($pyproject, '(?m)^version\s*=\s*"(?<version>[^"]+)"\s*\r?$')
 
@@ -62,6 +67,20 @@ $reshadeDestination = Join-Path $modStage "bin\x64"
 New-Item -ItemType Directory -Force -Path $cetDestination, $reshadeDestination | Out-Null
 Copy-Item "$projectRoot\mod\cet\PanoramaCaptureProbe\init.lua" $cetDestination
 Copy-Item $addon (Join-Path $reshadeDestination "PanoramaCaptureReShade.addon64")
+if ($fovControlRoot) {
+    $fovDll = Get-ChildItem -LiteralPath $fovControlRoot -Recurse -File -Filter "FovControl.dll" |
+        Select-Object -First 1
+    $fovScript = Join-Path $fovControlRoot "bin\r6\scripts\FovControl\FovControl.reds"
+    if ($null -eq $fovDll -or -not (Test-Path -LiteralPath $fovScript)) {
+        throw "FovControl build outputs were not found under $fovControlRoot"
+    }
+    $fovDestination = Join-Path $modStage "red4ext\plugins\FovControl"
+    $fovScriptDestination = Join-Path $modStage "r6\scripts\FovControl"
+    New-Item -ItemType Directory -Force -Path $fovDestination, $fovScriptDestination | Out-Null
+    Copy-Item $fovDll.FullName (Join-Path $fovDestination "FovControl.dll")
+    Copy-Item $fovScript (Join-Path $fovScriptDestination "FovControl.reds")
+    Copy-Item (Join-Path $fovControlRoot "LICENSE.txt") (Join-Path $fovDestination "FovControl-LICENSE.txt")
+}
 Copy-Item "$projectRoot\README.md" (Join-Path $cetDestination "README.md")
 
 $stitcherStage = Join-Path $buildRoot "PanoramaCapture-Stitcher-$Version-win-x64"

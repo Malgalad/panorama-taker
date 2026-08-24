@@ -392,6 +392,27 @@ and ReShade contract suite pass (31 tests). The latest reviewer pass found no
 remaining actionable correctness issues. Jenkins/native MSVC compilation and
 in-game testing remain the required acceptance gates for a tagged release.
 
+Session location metadata v0.1.39 (2026-08-22): production CET captures now
+write an optional root `location` object containing the player world position
+from `GetWorldPosition()` and heading from `GetWorldYaw()` at session start,
+before camera movement. The shared schema accepts this field while keeping it
+optional so older version-1 manifests remain renderable.
+
+Capture FoV integration v0.1.40 (2026-08-24): Native Settings now exposes a
+30–120° capture FoV control. The release bundles the MIT-licensed FOV Control
+RED4ext plugin and redscript helper, so no separate Unlock FOV/FOV Control mod
+is required. PanoramaCapture applies the requested display FoV through
+`SetDisplayFOV()` (and uses `PendingSetFOV()` when a compatible helper exposes
+it), reads back the effective projection, plans from the observed values, and
+restores the original FoV on completion or abort. If the bundled component is
+not loaded, capture remains usable with the game’s current FoV and the override
+is skipped safely.
+
+Bundled FOV Control release integration (2026-08-24): `vendor/FovControl` is a
+pinned recursive submodule. The Windows release workflow builds its x64
+RED4ext DLL, stages `FovControl.reds`, and includes the upstream MIT license in
+the Mod archive. Release verification checks both runtime payloads.
+
 Manual release-build acceptance (2026-08-21): the GitHub Actions Windows
 workflow-dispatch dry run completed successfully. Native MSVC ReShade
 compilation, PyInstaller stitcher bundling, separate mod/stitcher archives,

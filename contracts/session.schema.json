@@ -56,6 +56,16 @@
       }
     },
     "base_pose": { "$ref": "#/$defs/pose" },
+    "location": {
+      "description": "Player location and heading captured when the session began.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["position", "yaw_deg"],
+      "properties": {
+        "position": { "$ref": "#/$defs/vector3" },
+        "yaw_deg": { "$ref": "#/$defs/finiteNumber" }
+      }
+    },
     "planner": {
       "type": "object",
       "additionalProperties": false,

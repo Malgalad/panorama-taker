@@ -25,6 +25,7 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           fetch-depth: 0
+          submodules: recursive
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
@@ -51,6 +52,11 @@ jobs:
         run: |
           cmake -S reshade-addon -B build/reshade-addon -G "Visual Studio 17 2022" -A x64
           cmake --build build/reshade-addon --config Release
+      - name: Build bundled FOV Control
+        shell: pwsh
+        run: |
+          cmake -S vendor/FovControl -B build/fovcontrol -G "Visual Studio 17 2022" -A x64
+          cmake --build build/fovcontrol --config Release
       - name: Build release archives
         shell: pwsh
         run: |
@@ -58,6 +64,7 @@ jobs:
           .\release\build-windows-release.ps1 `
             -AddonPath .\build\reshade-addon\Release\PanoramaCaptureReShade.addon64 `
             -Version $version `
+            -FovControlRoot .\vendor\FovControl `
             -PythonCommand python
       - name: Verify archive contents and generate checksums
         shell: pwsh
@@ -68,8 +75,12 @@ jobs:
           Expand-Archive "dist\PanoramaCapture-Stitcher-$version-win-x64.zip" (Join-Path $verify "stitcher")
           $cet = Join-Path $verify "mod\bin\x64\plugins\cyber_engine_tweaks\mods\PanoramaCaptureProbe\init.lua"
           $addon = Join-Path $verify "mod\bin\x64\PanoramaCaptureReShade.addon64"
+          $fovDll = Join-Path $verify "mod\red4ext\plugins\FovControl\FovControl.dll"
+          $fovScript = Join-Path $verify "mod\r6\scripts\FovControl\FovControl.reds"
           $stitcher = Join-Path $verify "stitcher\PanoramaCaptureStitcher\PanoramaCaptureStitcher.exe"
-          if (-not (Test-Path $cet) -or -not (Test-Path $addon) -or -not (Test-Path $stitcher)) {
+          if (-not (Test-Path $cet) -or -not (Test-Path $addon) -or
+              -not (Test-Path $fovDll) -or -not (Test-Path $fovScript) -or
+              -not (Test-Path $stitcher)) {
             throw "Release archive content validation failed"
           }
           Get-ChildItem dist -File -Filter "*.zip" | ForEach-Object {

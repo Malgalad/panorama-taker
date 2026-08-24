@@ -1,4 +1,4 @@
-local MOD_VERSION = "0.1.38"
+local MOD_VERSION = "0.1.40"
 local DEVELOPMENT_MODE = false
 
 local function log(message)
@@ -27,12 +27,14 @@ local bridgeSessionCounter = 0
 local nativeSettings = nil
 local settingsDraftSettle = nil
 local settingsDraftScreenshotCooldown = nil
+local settingsDraftCaptureFov = nil
 
 -- User-editable capture settings. Reload CET after changing them.
 local captureConfig = {
     overlap = 0.08,
     adaptiveYawGuard = 0.05,
     settleSeconds = 1.0,
+    captureFov = 70.0,
     screenshotCooldownSeconds = 3.1,
     screenshotAckTimeoutSeconds = 15.0,
     calibrationFrames = 2,
@@ -51,6 +53,7 @@ local function registerNativeSettings()
     nativeSettings = settings
     settingsDraftSettle = captureConfig.settleSeconds
     settingsDraftScreenshotCooldown = captureConfig.screenshotCooldownSeconds
+    settingsDraftCaptureFov = 70.0
     local okApi = pcall(function()
         nativeSettings.addTab("/PanoramaCapture", "Panorama Capture", nil)
         nativeSettings.addSubcategory("/PanoramaCapture/Capture", "Capture", 1)
@@ -70,11 +73,21 @@ local function registerNativeSettings()
                 settingsDraftScreenshotCooldown = value
                 captureConfig.screenshotCooldownSeconds = value
             end, 2)
+        nativeSettings.addRangeFloat(
+            "/PanoramaCapture/Capture", "Capture FoV",
+            "Display FoV to use during capture; lower values increase screenshot count and resolution.",
+            30.0, 120.0, 1.0, "%.0f°", settingsDraftCaptureFov, settingsDraftCaptureFov,
+            function(value)
+                settingsDraftCaptureFov = value
+                captureConfig.captureFov = value
+            end, 3)
         nativeSettings.registerRestoreDefaultsCallback("/PanoramaCapture/Capture", false, function()
             settingsDraftSettle = 1.0
             settingsDraftScreenshotCooldown = 3.1
             captureConfig.settleSeconds = 1.0
             captureConfig.screenshotCooldownSeconds = 3.1
+            settingsDraftCaptureFov = 70.0
+            captureConfig.captureFov = 70.0
         end)
     end)
     if not okApi then
@@ -90,6 +103,9 @@ local function syncNativeSettings()
     end
     if settingsDraftScreenshotCooldown ~= nil then
         captureConfig.screenshotCooldownSeconds = settingsDraftScreenshotCooldown
+    end
+    if settingsDraftCaptureFov ~= nil then
+        captureConfig.captureFov = settingsDraftCaptureFov
     end
 end
 
@@ -108,6 +124,10 @@ local function configurationError()
     if not isFiniteNumber(captureConfig.settleSeconds) or captureConfig.settleSeconds < 0 or
         captureConfig.settleSeconds > 60 then
         return "settleSeconds must be a finite number in [0, 60]"
+    end
+    if not isFiniteNumber(captureConfig.captureFov) or captureConfig.captureFov < 30 or
+        captureConfig.captureFov > 120 then
+        return "captureFov must be a finite number in [30, 120]"
     end
     if not isFiniteNumber(captureConfig.screenshotCooldownSeconds) or
         captureConfig.screenshotCooldownSeconds < 0 or captureConfig.screenshotCooldownSeconds > 60 then
@@ -210,6 +230,8 @@ local function writeSessionMetadata(session, state)
 
     if not writeChunk("{\n", string.format("  \"schema_version\":1,\n  \"session_id\":\"%s\",\n",
         jsonEscape(session.sessionId))) or
+        not writeChunk(string.format("  \"location\":{\"position\":%s,\"yaw_deg\":%.9f},\n",
+            vectorJson(session.location.position), session.location.yaw)) or
         not writeChunk(string.format("  \"horizontal_fov_deg\":%.9f,\n  \"vertical_fov_deg\":%.9f,\n",
             session.horizontalFov, session.verticalFov)) or
         not writeChunk(string.format("  \"state\":\"%s\",\n  \"poses\":[\n", jsonEscape(state))) then
@@ -290,6 +312,15 @@ local function effectiveFov()
         return nil, nil, "derived horizontal FoV is invalid"
     end
     return horizontal, vertical, nil
+end
+
+local function setDisplayFov(camera, displayFov)
+    local okPending = pcall(function() camera:PendingSetFOV() end)
+    local okSet, setError = pcall(function() camera:SetDisplayFOV(displayFov) end)
+    if not okSet then
+        return false, "FOV Control SetDisplayFOV unavailable: " .. tostring(setError)
+    end
+    return true, okPending and nil or "PendingSetFOV unavailable"
 end
 
 local function buildFullSpherePlan(horizontal, vertical, overlap, adaptiveYawGuard)
@@ -632,6 +663,11 @@ local function applyEnvironmentControls(environment)
     end
     environment.timeApplied = true
 
+    local fovApplied, fovError = setDisplayFov(environment.camera, captureConfig.captureFov)
+    if not fovApplied and not tostring(fovError):find("unavailable", 1, true) then
+        return false, fovError
+    end
+
     local inputLocked, inputError = applyInputRestrictions(environment)
     if not inputLocked then
         return false, inputError
@@ -653,6 +689,9 @@ local function restoreEnvironmentControls(environment)
     restoreInputRestrictions(environment)
     restoreCaptureMeshes(environment)
     restoreHud(environment)
+    if environment.originalDisplayFov ~= nil then
+        pcall(function() setDisplayFov(environment.camera, environment.originalDisplayFov) end)
+    end
     if environment.timeApplied then
         pcall(function()
             local timeSystem = Game.GetTimeSystem()
@@ -795,6 +834,11 @@ registerDevelopmentInput("panorama_capture_probe_environment", "Panorama: probe 
         log("Environment probe requires an active player, camera system, and FPP camera.")
         return
     end
+    local originalDisplayFov, _, originalFovError = effectiveFov()
+    if originalDisplayFov == nil then
+        log("Environment probe cancelled: " .. tostring(originalFovError) .. ".")
+        return
+    end
 
     local hud, hudError = snapshotHud()
     if hud == nil then
@@ -819,6 +863,7 @@ registerDevelopmentInput("panorama_capture_probe_environment", "Panorama: probe 
         position = Vector4.new(position.x, position.y, position.z, position.w),
         originalOrientation = orientation,
         originalYaw = player:GetWorldYaw(),
+        originalDisplayFov = originalDisplayFov,
         hud = hud,
         meshes = meshes,
         state = "applying",
@@ -875,12 +920,6 @@ local function startProductionSession()
         log("Production session cancelled: " .. tostring(fovError) .. ".")
         return
     end
-    local plan, planError = buildFullSpherePlan(
-        horizontal, vertical, captureConfig.overlap, captureConfig.adaptiveYawGuard)
-    if plan == nil then
-        log("Production session cancelled: " .. tostring(planError))
-        return
-    end
     local hud, hudError = snapshotHud()
     if hud == nil then
         log("Production session cancelled: " .. tostring(hudError))
@@ -896,7 +935,6 @@ local function startProductionSession()
         log("Production session cancelled: FPP local orientation unavailable.")
         return
     end
-    local firstPose = plan.poses[1]
     environmentSequence = {
         camera = camera,
         player = player,
@@ -905,15 +943,16 @@ local function startProductionSession()
             player:GetWorldPosition().z, player:GetWorldPosition().w),
         originalOrientation = orientation,
         originalYaw = player:GetWorldYaw(),
+        originalDisplayFov = horizontal,
         hud = hud,
         meshes = meshes,
         state = "applying",
         waitFrames = 0,
         settleElapsed = 0.0,
         settleSecondsRequired = captureConfig.settleSeconds,
-        targetYaw = firstPose.yaw,
-        targetPitch = firstPose.pitch,
-        pitchCommand = firstPose.pitch,
+        targetYaw = 0.0,
+        targetPitch = 0.0,
+        pitchCommand = 0.0,
         pitchCorrections = 0,
         pitchCorrectionPending = false,
         timeApplied = false,
@@ -927,14 +966,33 @@ local function startProductionSession()
         log("Production session cancelled: " .. tostring(controlError))
         return
     end
+    local captureHorizontal, captureVertical, captureFovError = effectiveFov()
+    if captureHorizontal == nil then
+        restoreEnvironmentControls(environmentSequence)
+        environmentSequence = nil
+        log("Production session cancelled: capture FoV readback failed: " .. tostring(captureFovError) .. ".")
+        return
+    end
+    local plan, planError = buildFullSpherePlan(
+        captureHorizontal, captureVertical, captureConfig.overlap, captureConfig.adaptiveYawGuard)
+    if plan == nil then
+        restoreEnvironmentControls(environmentSequence)
+        environmentSequence = nil
+        log("Production session cancelled: " .. tostring(planError))
+        return
+    end
+    local firstPose = plan.poses[1]
+    environmentSequence.targetYaw = firstPose.yaw
+    environmentSequence.targetPitch = firstPose.pitch
+    environmentSequence.pitchCommand = firstPose.pitch
     bridgeSessionCounter = bridgeSessionCounter + 1
     local sessionId = string.format("%d-%d", os.time(), bridgeSessionCounter)
     productionSession = {
         plan = plan,
         index = 1,
         sessionId = sessionId,
-        horizontalFov = horizontal,
-        verticalFov = vertical,
+        horizontalFov = captureHorizontal,
+        verticalFov = captureVertical,
         settleSeconds = captureConfig.settleSeconds,
         screenshotCooldownSeconds = captureConfig.screenshotCooldownSeconds,
         screenshotAckTimeoutSeconds = captureConfig.screenshotAckTimeoutSeconds,
@@ -944,6 +1002,10 @@ local function startProductionSession()
         screenshotWaitElapsed = 0.0,
         screenshotCooldownRemaining = 0.0,
         metadataPath = bridgeFile("pano-" .. sessionId .. ".json"),
+        location = {
+            position = environmentSequence.position,
+            yaw = environmentSequence.originalYaw,
+        },
         metadataRecords = {},
         pendingMetadata = nil,
         metadataFailed = false,
