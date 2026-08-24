@@ -1,4 +1,4 @@
-local MOD_VERSION = "0.1.51"
+local MOD_VERSION = "0.1.53"
 local DEVELOPMENT_MODE = false
 
 local function log(message)
@@ -192,11 +192,12 @@ local function registerNativeSettings()
                 text:SetName("panoramaCaptureSummary")
                 text:SetFontFamily("base\\gameplay\\gui\\fonts\\raj\\raj.inkfontfamily")
                 text:SetFontStyle("Medium")
-                text:SetFontSize(30)
+                text:SetFontSize(32)
                 text:SetLetterCase(textLetterCase.OriginalCase)
-                text:SetTintColor(HDRColor.new({ Red = 0.65, Green = 0.75, Blue = 0.85, Alpha = 1.0 }))
+                text:SetTintColor(HDRColor.new({ Red = 1.0, Green = 1.0, Blue = 1.0, Alpha = 1.0 }))
                 text:SetHorizontalAlignment(textHorizontalAlignment.Left)
                 text:SetVerticalAlignment(textVerticalAlignment.Center)
+                text:SetMargin(inkMargin.new({ left = 64.0, top = 6.0, right = 0.0, bottom = 6.0 }))
                 text:SetText(option.text or "Capture estimate loading…")
                 text:SetInteractive(false)
                 text:Reparent(parent, -1)
@@ -454,25 +455,6 @@ local function effectiveFov()
     return horizontal, vertical, nil
 end
 
-local function fovControlValue(camera, methodName)
-    local ok, value = pcall(function() return camera[methodName](camera) end)
-    if ok and type(value) == "number" then
-        return string.format("%.3f", value)
-    end
-    if ok then
-        return tostring(value)
-    end
-    return "unavailable: " .. tostring(value)
-end
-
-local function fovControlNativeValue(methodName)
-    local ok, value = pcall(function() return FovControl[methodName]() end)
-    if ok then
-        return tostring(value)
-    end
-    return "unavailable: " .. tostring(value)
-end
-
 local function fovControlNativeCall(methodName)
     return pcall(function() return FovControl[methodName]() end)
 end
@@ -494,14 +476,10 @@ local function cameraInternalFov(camera)
 end
 
 local function setDisplayFov(camera, displayFov)
-    local internalBefore = fovControlValue(camera, "GetFOV")
-    local displayBefore = fovControlValue(camera, "GetDisplayFOV")
-    local lockStatus = "not required"
     local patchingOk, patching = fovControlNativeCall("IsPatchingAllowed")
     local lockedOk, locked = fovControlNativeCall("IsLocked")
     if patchingOk and patching == true and lockedOk and locked == false then
         local lockOk, lockResult = fovControlNativeCall("Lock")
-        lockStatus = tostring(lockResult)
         if not lockOk or lockResult ~= true then
             return false, "FOV Control lock failed: " .. tostring(lockResult)
         end
@@ -516,18 +494,6 @@ local function setDisplayFov(camera, displayFov)
         return false, "FOV Control PendingSetFOV refused: " .. tostring(pendingResult)
     end
     local okSet, setError = pcall(function() camera:SetDisplayFOV(displayFov) end)
-    local internalAfter = fovControlValue(camera, "GetFOV")
-    local displayAfter = fovControlValue(camera, "GetDisplayFOV")
-    log(string.format(
-        "FOV Control: requested=%.3f; GetFOV %s -> %s; GetDisplayFOV %s -> %s; lock=%s; PendingSetFOV=%s; scheduler=%s; SetDisplayFOV=%s; native patching=%s locked=%s version=%s.",
-        displayFov, internalBefore, internalAfter, displayBefore, displayAfter,
-        lockStatus,
-        tostring(pendingResult),
-        fovControlValue(camera, "IsPendingSchedulerActive"),
-        okSet and "ok" or tostring(setError),
-        fovControlNativeValue("IsPatchingAllowed"),
-        fovControlNativeValue("IsLocked"),
-        fovControlNativeValue("Version")))
     if not okSet then
         return false, "FOV Control SetDisplayFOV unavailable: " .. tostring(setError)
     end
