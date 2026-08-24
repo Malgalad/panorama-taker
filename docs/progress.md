@@ -399,22 +399,12 @@ before camera movement. The shared schema accepts this field while keeping it
 optional so older version-1 manifests remain renderable.
 
 Capture FoV integration v0.1.40 (2026-08-24): Native Settings now exposes a
-30–120° capture FoV control. The release bundles a collision-safe,
-MIT-licensed PanoramaFovControl RED4ext plugin and redscript helper, so no
-separate Unlock FOV/FOV Control mod is required. PanoramaCapture applies the
-requested display FoV through `SetPanoramaDisplayFOV()` (and uses
-`PendingSetFOV()` when a compatible helper exposes it), reads back the effective
-projection, plans from the observed values, and
-restores the original FoV on completion or abort. If the bundled component is
-not loaded, capture remains usable with the game’s current FoV and the override
-is skipped safely.
-
-Bundled FOV Control release integration (2026-08-24): `vendor/FovControl` is a
-pinned recursive submodule. The Windows release workflow applies a tracked
-build-time rename overlay, builds its x64 RED4ext DLL, stages the uniquely
-named `PanoramaFovControl.reds`, and includes the upstream MIT license in the
-Mod archive. This avoids duplicate `FovControl` classes and generic camera
-extension methods when users previously installed the standalone mod.
+30–120° capture FoV control. When the first-party FOV Control redscript
+integration is installed separately, PanoramaCapture applies that display FoV
+to the FPP camera through `PendingSetFOV()`/`SetDisplayFOV()`, reads back the
+effective projection, plans from the observed values, and restores the original
+FoV on completion or abort. Without the integration, capture remains usable
+with the game’s current FoV and the requested override is skipped safely.
 
 Manual release-build acceptance (2026-08-21): the GitHub Actions Windows
 workflow-dispatch dry run completed successfully. Native MSVC ReShade
