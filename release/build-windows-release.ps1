@@ -21,9 +21,9 @@ $buildRoot = Join-Path $projectRoot "build\release"
 $venvRoot = Join-Path $projectRoot ".venv-release"
 $python = Join-Path $venvRoot "Scripts\python.exe"
 $addon = (Resolve-Path $AddonPath).Path
-$fovControlRoot = $null
+$fovRoot = $null
 if ($FovControlRoot) {
-    $fovControlRoot = (Resolve-Path $FovControlRoot).Path
+    $fovRoot = (Resolve-Path $FovControlRoot).Path
 }
 $pyproject = Get-Content -LiteralPath (Join-Path $projectRoot "stitcher\pyproject.toml") -Raw
 $versionMatch = [regex]::Match($pyproject, '(?m)^version\s*=\s*"(?<version>[^"]+)"\s*\r?$')
@@ -67,19 +67,19 @@ $reshadeDestination = Join-Path $modStage "bin\x64"
 New-Item -ItemType Directory -Force -Path $cetDestination, $reshadeDestination | Out-Null
 Copy-Item "$projectRoot\mod\cet\PanoramaCaptureProbe\init.lua" $cetDestination
 Copy-Item $addon (Join-Path $reshadeDestination "PanoramaCaptureReShade.addon64")
-if ($fovControlRoot) {
-    $fovDll = Get-ChildItem -LiteralPath $fovControlRoot -Recurse -File -Filter "PanoramaFovControl.dll" |
+if ($fovRoot) {
+    $fovDll = Get-ChildItem -LiteralPath $fovRoot -Recurse -File -Filter "PanoramaFovControl.dll" |
         Select-Object -First 1
-    $fovScript = Join-Path $fovControlRoot "bin\r6\scripts\PanoramaFovControl\PanoramaFovControl.reds"
+    $fovScript = Join-Path $fovRoot "bin\r6\scripts\PanoramaFovControl\PanoramaFovControl.reds"
     if ($null -eq $fovDll -or -not (Test-Path -LiteralPath $fovScript)) {
-        throw "PanoramaFovControl build outputs were not found under $fovControlRoot"
+        throw "PanoramaFovControl build outputs were not found under $fovRoot"
     }
     $fovDestination = Join-Path $modStage "red4ext\plugins\PanoramaFovControl"
     $fovScriptDestination = Join-Path $modStage "r6\scripts\PanoramaFovControl"
     New-Item -ItemType Directory -Force -Path $fovDestination, $fovScriptDestination | Out-Null
     Copy-Item $fovDll.FullName (Join-Path $fovDestination "PanoramaFovControl.dll")
     Copy-Item $fovScript (Join-Path $fovScriptDestination "PanoramaFovControl.reds")
-    Copy-Item (Join-Path $fovControlRoot "LICENSE.txt") (Join-Path $fovDestination "PanoramaFovControl-LICENSE.txt")
+    Copy-Item (Join-Path $fovRoot "LICENSE.txt") (Join-Path $fovDestination "PanoramaFovControl-LICENSE.txt")
 }
 Copy-Item "$projectRoot\README.md" (Join-Path $cetDestination "README.md")
 

@@ -31,4 +31,13 @@ Get-ChildItem -LiteralPath $destinationPath -Recurse -File | Where-Object {
     Set-Content -LiteralPath $_.FullName -Value $content -Encoding utf8NoBOM
 }
 
+$cmakePath = Join-Path $destinationPath "CMakeLists.txt"
+$cmake = Get-Content -LiteralPath $cmakePath -Raw
+$cmake = [regex]::Replace(
+    $cmake,
+    '(?s)add_custom_command\(\s*TARGET PanoramaFovControl.*?\n\)',
+    ""
+)
+Set-Content -LiteralPath $cmakePath -Value $cmake -Encoding utf8NoBOM
+
 Write-Host "Prepared collision-safe FOV Control source at $destinationPath"

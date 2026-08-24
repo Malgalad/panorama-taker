@@ -58,6 +58,8 @@ jobs:
           .\release\prepare-fovcontrol.ps1 -Source .\vendor\FovControl -Destination .\build\fovcontrol-source
           cmake -S build/fovcontrol-source -B build/fovcontrol -G "Visual Studio 17 2022" -A x64
           cmake --build build/fovcontrol --config Release
+          New-Item -ItemType Directory -Force -Path .\build\fovcontrol-source\bin\r6\scripts\PanoramaFovControl | Out-Null
+          Copy-Item .\build\fovcontrol-source\src\redscript\PanoramaFovControl.reds .\build\fovcontrol-source\bin\r6\scripts\PanoramaFovControl\PanoramaFovControl.reds -Force
       - name: Build release archives
         shell: pwsh
         run: |
