@@ -45,6 +45,7 @@ std::atomic<bool> g_worker_running {false};
 std::thread g_worker;
 std::filesystem::path g_bridge_request_path;
 std::filesystem::path g_bridge_ack_path;
+std::filesystem::path g_bridge_status_path;
 
 void log_info(const char *message)
 {
@@ -103,6 +104,47 @@ void write_ack(const BridgeCompletion &completion)
     std::filesystem::rename(temporary, g_bridge_ack_path, error);
     if (error)
         log_error("PanoramaCaptureReShade: cannot publish bridge acknowledgement file");
+}
+
+void write_capture_range_status(reshade::api::color_space color_space)
+{
+    const char *range = "unknown";
+    switch (color_space)
+    {
+    case reshade::api::color_space::scrgb:
+    case reshade::api::color_space::hdr10_pq:
+    case reshade::api::color_space::hdr10_hlg:
+        range = "hdr";
+        break;
+    case reshade::api::color_space::srgb:
+        range = "sdr";
+        break;
+    default:
+        break;
+    }
+
+    const auto temporary = g_bridge_status_path.string() + ".tmp";
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    if (!output)
+    {
+        log_error("PanoramaCaptureReShade: cannot open bridge status file");
+        return;
+    }
+    output << "1\t" << range << '\n';
+    output.flush();
+    output.close();
+    if (!output)
+    {
+        log_error("PanoramaCaptureReShade: failed writing bridge status file");
+        std::error_code cleanup_error;
+        std::filesystem::remove(temporary, cleanup_error);
+        return;
+    }
+    std::error_code error;
+    std::filesystem::remove(g_bridge_status_path, error);
+    std::filesystem::rename(temporary, g_bridge_status_path, error);
+    if (error)
+        log_error("PanoramaCaptureReShade: cannot publish bridge status file");
 }
 
 void bridge_worker_loop()
@@ -169,6 +211,13 @@ void resolve_bridge_paths()
         "PanoramaCaptureProbe";
     g_bridge_request_path = bridge_directory / "PanoramaCaptureBridge.request";
     g_bridge_ack_path = bridge_directory / "PanoramaCaptureBridge.ack";
+    g_bridge_status_path = bridge_directory / "PanoramaCaptureBridge.status";
+}
+
+void on_init_swapchain(reshade::api::swapchain *swapchain, bool)
+{
+    if (swapchain != nullptr && swapchain->get_hwnd() != nullptr)
+        write_capture_range_status(swapchain->get_color_space());
 }
 
 void on_init_runtime(reshade::api::effect_runtime *runtime)
@@ -317,6 +366,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
     {
         if (!reshade::register_addon(module))
             return FALSE;
+        reshade::register_event<reshade::addon_event::init_swapchain>(on_init_swapchain);
         reshade::register_event<reshade::addon_event::init_effect_runtime>(on_init_runtime);
         reshade::register_event<reshade::addon_event::destroy_effect_runtime>(on_destroy_runtime);
         reshade::register_event<reshade::addon_event::reshade_present>(on_present);

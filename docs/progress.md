@@ -411,3 +411,15 @@ workflow-dispatch dry run completed successfully. Native MSVC ReShade
 compilation, PyInstaller stitcher bundling, separate mod/stitcher archives,
 archive validation, checksums, and build provenance were verified. No public
 version tag has been created; code review remains the release gate.
+
+Packet 12 capture and compositor acceptance (2026-08-24): `settings.json`
+persistence is verified. With the separately installed first-party FOV Control
+helper, Panorama Capture applies the requested FoV before time dilation,
+waits for the camera transition, plans from the observed FoV, and restores the
+original FoV after abort; the 35°-FoV capture plan stitched with 100% coverage.
+The stitcher now safely splits OpenCV remaps wider or taller than 32,766 pixels,
+uses bounded parallel strip compositing with OpenCV's nested worker pool
+temporarily limited to one thread, and stores its colour/weight accumulators in
+disk-backed memory maps. The resulting large render has verified improved CPU
+utilization, negligible disk reads, and modest resident RAM; Windows CI now
+explicitly closes mappings before temporary-file cleanup.

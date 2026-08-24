@@ -546,7 +546,7 @@ Rendering must be out of core:
 - Never retain all decoded source images or a complete floating-point panorama in resident memory.
 - Probe source headers and encoding sequentially during validation, then decode at most one source image at a time.
 - Convert transfer functions to linear `float32` in bounded row chunks so PQ decoding does not create several full-image temporaries.
-- Composite bounded output strips or tiles. Store the panorama and hard/feather weight accumulators in disk-backed scratch files, reading and writing only the active tile rather than relying on the operating system to evict a whole-file memory map.
+- Composite bounded output strips or tiles. Store the panorama and hard/feather weight accumulators in disk-backed memory-mapped scratch arrays; workers may update only disjoint active rows, while the operating system retains or evicts backing pages within the configured working-budget model.
 - Derive tile dimensions from a conservative worst-case allocation estimate that includes directions, projection maps, masks, sampled RGB, blend weights, the decoded source, decoder buffers, and writer buffers.
 - Stream completed output rows or tiles into an EXR/PNG backend proven not to stage the complete output image. If a selected encoder cannot do that, reject it rather than silently exceeding the memory limit.
 - Create output and scratch files atomically where practical, and remove incomplete scratch data after success or a handled failure.

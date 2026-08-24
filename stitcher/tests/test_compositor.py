@@ -12,6 +12,7 @@ from pano_stitch.compositor import (
     SourceInfo,
     _choose_strip_height,
     _estimate_exposure_gains,
+    _output_dimensions,
     _pq_to_linear,
     _probe_source,
     _write_exr,
@@ -298,6 +299,27 @@ def test_render_resource_estimate_uses_color_and_weight_scratch(tmp_path: Path) 
 
     assert resources.output_height == 32
     assert resources.scratch_bytes == 64 * 32 * 4 * np.dtype(np.float32).itemsize
+
+
+def test_full_sphere_output_dimensions_are_always_two_to_one() -> None:
+    session = _synthetic_session()
+
+    assert _output_dimensions(session, source_width=3840, width=1235) == (1234, 617)
+
+
+def test_horizontal_output_dimensions_remain_cropped() -> None:
+    session = SessionMetadata(
+        schema_version=1,
+        session_id="horizontal",
+        capture_mode=CaptureMode.HORIZONTAL,
+        horizontal_fov_deg=90.0,
+        vertical_fov_deg=60.0,
+        overlap_fraction=0.08,
+        frames=(),
+        completed=True,
+    )
+
+    assert _output_dimensions(session, source_width=3840, width=1235) == (1235, 206)
 
 
 def test_parallel_strips_match_single_worker_output(

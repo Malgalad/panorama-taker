@@ -619,6 +619,9 @@ def _output_dimensions(
     if width is None:
         focal_x = source_width / (2.0 * np.tan(np.radians(session.horizontal_fov_deg) / 2.0))
         width = max(2, int(round(2.0 * np.pi * focal_x)))
+    if session.capture_mode.value == "full_sphere":
+        width = max(2, width - width % 2)
+        return width, width // 2
     latitude_span = (
         180.0 if session.capture_mode.value == "full_sphere" else session.vertical_fov_deg
     )

@@ -1,4 +1,4 @@
-local MOD_VERSION = "0.1.47"
+local MOD_VERSION = "0.1.51"
 local DEVELOPMENT_MODE = false
 
 local function log(message)
@@ -29,6 +29,10 @@ local settingsDraftSettle = nil
 local settingsDraftScreenshotCooldown = nil
 local settingsDraftCaptureFov = nil
 local fovControlInstalled = false
+local nativeSettingsCaptureSummaryOption = nil
+local updateCaptureSummary = nil
+local bridgeCaptureRange = "unknown"
+local bridgeStatusPollElapsed = 0.0
 local SETTINGS_FILE = "settings.json"
 local SETTINGS_DEFAULTS = {
     settleSeconds = 1.0,
@@ -144,33 +148,62 @@ local function registerNativeSettings()
         nativeSettings.addTab("/PanoramaCapture", "Panorama Capture", nil)
         nativeSettings.addSubcategory("/PanoramaCapture/Capture", "Capture", 1)
         nativeSettings.addRangeFloat(
-            "/PanoramaCapture/Capture", "Settling delay", "Seconds to wait after the verified pose before requesting a screenshot.",
+            "/PanoramaCapture/Capture", "Settling delay",
+            "Wait for temporal accumulation after a verified pose before taking a screenshot. Path tracing needs this most; other modes may use less.",
             0.1, 3.0, 0.1, "%.1fs", settingsDraftSettle, SETTINGS_DEFAULTS.settleSeconds,
             function(value)
                 settingsDraftSettle = value
                 captureConfig.settleSeconds = value
                 savePersistentSettings()
+                if updateCaptureSummary ~= nil then
+                    updateCaptureSummary()
+                end
             end, 1)
         nativeSettings.addRangeFloat(
             "/PanoramaCapture/Capture", "ReShade toast cooldown",
-            "Wait after each ReShade screenshot so its three-second toast cannot enter the next capture.",
+            "Wait for ReShade's screenshot toast before the next capture. Set to 0 when ReShade screenshot notifications are disabled.",
             0.0, 5.0, 0.1, "%.1fs", settingsDraftScreenshotCooldown,
             SETTINGS_DEFAULTS.screenshotCooldownSeconds,
             function(value)
                 settingsDraftScreenshotCooldown = value
                 captureConfig.screenshotCooldownSeconds = value
                 savePersistentSettings()
-            end, 2)
+                if updateCaptureSummary ~= nil then
+                    updateCaptureSummary()
+                end
+        end, 2)
         if fovControlInstalled then
             nativeSettings.addRangeFloat(
                 "/PanoramaCapture/Capture", "Capture FoV",
-                "Optional display FoV override. Until changed, capture uses the active in-game FoV; lower values increase screenshot count and resolution.",
+                "Optional display FoV override. Until changed, capture uses the active in-game FoV.",
                 30.0, 120.0, 1.0, "%.0f°", visibleCaptureFov, visibleCaptureFov,
                 function(value)
                     settingsDraftCaptureFov = value
                     captureConfig.captureFov = value
                     savePersistentSettings()
+                    if updateCaptureSummary ~= nil then
+                        updateCaptureSummary()
+                    end
                 end, 3)
+        end
+        nativeSettingsCaptureSummaryOption = nativeSettings.addCustom(
+            "/PanoramaCapture/Capture", function(parent, option)
+                local text = inkText.new()
+                text:SetName("panoramaCaptureSummary")
+                text:SetFontFamily("base\\gameplay\\gui\\fonts\\raj\\raj.inkfontfamily")
+                text:SetFontStyle("Medium")
+                text:SetFontSize(30)
+                text:SetLetterCase(textLetterCase.OriginalCase)
+                text:SetTintColor(HDRColor.new({ Red = 0.65, Green = 0.75, Blue = 0.85, Alpha = 1.0 }))
+                text:SetHorizontalAlignment(textHorizontalAlignment.Left)
+                text:SetVerticalAlignment(textVerticalAlignment.Center)
+                text:SetText(option.text or "Capture estimate loading…")
+                text:SetInteractive(false)
+                text:Reparent(parent, -1)
+                option.textWidget = text
+            end, 4)
+        if updateCaptureSummary ~= nil then
+            updateCaptureSummary()
         end
         nativeSettings.registerRestoreDefaultsCallback("/PanoramaCapture/Capture", false, function()
             settingsDraftSettle = SETTINGS_DEFAULTS.settleSeconds
@@ -180,6 +213,9 @@ local function registerNativeSettings()
             settingsDraftCaptureFov = nil
             captureConfig.captureFov = nil
             savePersistentSettings()
+            if updateCaptureSummary ~= nil then
+                updateCaptureSummary()
+            end
         end)
     end)
     if not okApi then
@@ -248,6 +284,22 @@ end
 
 local function bridgeFile(name)
     return captureConfig.bridgeDirectory .. "/PanoramaCaptureBridge." .. name
+end
+
+local function refreshBridgeCaptureRange()
+    local input = io.open(bridgeFile("status"), "rb")
+    if input == nil then
+        bridgeCaptureRange = "unknown"
+        return
+    end
+    local line = input:read("*l")
+    input:close()
+    local version, captureRange = line and line:match("^([^\t]+)\t([^\t]+)$")
+    if version == "1" and (captureRange == "hdr" or captureRange == "sdr") then
+        bridgeCaptureRange = captureRange
+    else
+        bridgeCaptureRange = "unknown"
+    end
 end
 
 local function writeBridgeRequest(sessionId, poseIndex, token)
@@ -514,6 +566,87 @@ local function buildFullSpherePlan(horizontal, vertical, overlap, adaptiveYawGua
         rows = rows,
         poses = plan,
     }, nil
+end
+
+local function captureFovPreview(displayFov)
+    local cameraSystem = Game.GetCameraSystem()
+    local aspect = nil
+    if cameraSystem ~= nil then
+        local okAspect, value = pcall(function() return cameraSystem:GetAspectRatio() end)
+        if okAspect and isFiniteNumber(value) and value > 0 then
+            aspect = value
+        end
+    end
+    local screenshotWidth, screenshotHeight = GetDisplayResolution()
+    if aspect == nil and isFiniteNumber(screenshotWidth) and isFiniteNumber(screenshotHeight) and screenshotHeight > 0 then
+        aspect = screenshotWidth / screenshotHeight
+    end
+    if aspect == nil or not isFiniteNumber(displayFov) or displayFov <= 0 or displayFov >= 180 then
+        return nil, "camera aspect unavailable"
+    end
+    local vertical = math.deg(2.0 * math.atan(math.tan(math.rad(displayFov) / 2.0) / aspect))
+    local plan = buildFullSpherePlan(displayFov, vertical, captureConfig.overlap, captureConfig.adaptiveYawGuard)
+    if plan == nil then
+        return nil, "capture plan unavailable"
+    end
+    if not isFiniteNumber(screenshotWidth) or not isFiniteNumber(screenshotHeight) or
+        screenshotWidth <= 0 or screenshotHeight <= 0 then
+        return { shots = #plan.poses }, nil
+    end
+    local focalX = screenshotWidth / (2.0 * math.tan(math.rad(displayFov) / 2.0))
+    local panoramaWidth = math.max(2, math.floor(2.0 * math.pi * focalX + 0.5))
+    local panoramaHeight = math.max(1, math.floor(panoramaWidth / 2.0 + 0.5))
+    return {
+        shots = #plan.poses,
+        megapixels = panoramaWidth * panoramaHeight / 1000000.0,
+        screenshotWidth = screenshotWidth,
+        screenshotHeight = screenshotHeight,
+    }, nil
+end
+
+local function estimateCaptureSeconds(shotCount)
+    if bridgeCaptureRange == "unknown" then
+        return nil
+    end
+    local screenshotSeconds = bridgeCaptureRange == "hdr" and 0.5 or 0.1
+    return captureConfig.settleSeconds + shotCount * screenshotSeconds +
+        math.max(0, shotCount - 1) * math.max(captureConfig.settleSeconds,
+            captureConfig.screenshotCooldownSeconds)
+end
+
+local function formatDuration(seconds)
+    local rounded = math.max(0, math.floor(seconds + 0.5))
+    return string.format("~%dm %02ds", math.floor(rounded / 60), rounded % 60)
+end
+
+local function previewCaptureFov()
+    if fovControlInstalled and isFiniteNumber(captureConfig.captureFov) then
+        return captureConfig.captureFov
+    end
+    return nativeSettingsCaptureFovDefault()
+end
+
+updateCaptureSummary = function()
+    local option = nativeSettingsCaptureSummaryOption
+    if option == nil then
+        return
+    end
+    local displayFov = previewCaptureFov()
+    local preview, previewError = captureFovPreview(displayFov)
+    if preview == nil then
+        option.text = "Capture estimate unavailable: " .. tostring(previewError)
+    elseif preview.megapixels == nil then
+        option.text = string.format("Capture estimate: %d shots", preview.shots)
+    else
+        local duration = estimateCaptureSeconds(preview.shots)
+        local timing = duration and (" · " .. formatDuration(duration) .. " " .. string.upper(bridgeCaptureRange)) or
+            " · timing unavailable"
+        option.text = string.format("Capture estimate: %d shots · ~%.1f MP%s",
+            preview.shots, preview.megapixels, timing)
+    end
+    if option.textWidget ~= nil then
+        pcall(function() option.textWidget:SetText(option.text) end)
+    end
 end
 
 local function componentClassName(component)
@@ -1336,6 +1469,16 @@ local function requestProductionScreenshot()
 end
 
 registerForEvent("onUpdate", function(deltaTime)
+    if type(deltaTime) == "number" and deltaTime > 0 then
+        bridgeStatusPollElapsed = bridgeStatusPollElapsed + deltaTime
+        if bridgeStatusPollElapsed >= 1.0 then
+            bridgeStatusPollElapsed = 0.0
+            refreshBridgeCaptureRange()
+            if updateCaptureSummary ~= nil then
+                updateCaptureSummary()
+            end
+        end
+    end
     if environmentSequence ~= nil then
         if hudRehideFrames > 0 then
             if not environmentSequence.restoreRequested then
@@ -1610,7 +1753,11 @@ end)
 registerForEvent("onInit", function()
     fovControlInstalled = detectFovControl()
     loadPersistentSettings()
+    refreshBridgeCaptureRange()
     registerNativeSettings()
+    if updateCaptureSummary ~= nil then
+        updateCaptureSummary()
+    end
     Observe("gameuiPopupsManager", "OnMenuUpdate", function(_, isInMenu)
         pauseEventState = isInMenu == true
         if environmentSequence ~= nil then
