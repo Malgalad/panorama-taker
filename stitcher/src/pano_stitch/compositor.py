@@ -10,7 +10,7 @@ import tempfile
 import zlib
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from importlib import import_module
 from pathlib import Path
@@ -64,6 +64,21 @@ class ExposureReport:
 
 class RenderCancelledError(RuntimeError):
     """Raised when a cooperative render cancellation is requested."""
+
+
+@contextmanager
+def _limit_opencv_threads(worker_count: int) -> Any:
+    """Avoid nested OpenCV and strip-worker pools competing for the same cores."""
+
+    if worker_count <= 1:
+        yield
+        return
+    previous_threads = cv2.getNumThreads()
+    cv2.setNumThreads(1)
+    try:
+        yield
+    finally:
+        cv2.setNumThreads(previous_threads)
 
 
 def _exposure_luminance(image: FloatImage) -> FloatImage:
@@ -765,40 +780,43 @@ def render_session(
                 output_height * output_width * np.dtype(np.float32).itemsize
             )
 
-        for frame_position, frame in enumerate(session.frames):
-            if cancel_event is not None and cancel_event.is_set():
-                raise RenderCancelledError("render cancelled")
-            source = _read_source(_image_path(image_root, frame.filename), first_source.encoding)
-            try:
-                source *= np.float32(exposure_report.gains[frame_position])
-                with ThreadPoolExecutor(max_workers=resources.worker_count) as executor:
-                    futures = [
-                        executor.submit(
-                            _composite_strip,
-                            color_path,
-                            weight_path,
-                            source,
-                            frame,
-                            first_source,
-                            session.horizontal_fov_deg,
-                            session.vertical_fov_deg,
-                            latitude_span,
-                            output_width,
-                            output_height,
-                            row_start,
-                            strip_height,
-                            blend,
-                            cancel_event,
-                        )
-                        for row_start in range(0, output_height, strip_height)
-                    ]
-                    for future in as_completed(futures):
-                        future.result()
-                        completed_work += 1
-                        if progress_callback is not None:
-                            progress_callback(completed_work, total_work, "compositing")
-            finally:
-                del source
+        with _limit_opencv_threads(resources.worker_count):
+            for frame_position, frame in enumerate(session.frames):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RenderCancelledError("render cancelled")
+                source = _read_source(
+                    _image_path(image_root, frame.filename), first_source.encoding
+                )
+                try:
+                    source *= np.float32(exposure_report.gains[frame_position])
+                    with ThreadPoolExecutor(max_workers=resources.worker_count) as executor:
+                        futures = [
+                            executor.submit(
+                                _composite_strip,
+                                color_path,
+                                weight_path,
+                                source,
+                                frame,
+                                first_source,
+                                session.horizontal_fov_deg,
+                                session.vertical_fov_deg,
+                                latitude_span,
+                                output_width,
+                                output_height,
+                                row_start,
+                                strip_height,
+                                blend,
+                                cancel_event,
+                            )
+                            for row_start in range(0, output_height, strip_height)
+                        ]
+                        for future in as_completed(futures):
+                            future.result()
+                            completed_work += 1
+                            if progress_callback is not None:
+                                progress_callback(completed_work, total_work, "compositing")
+                finally:
+                    del source
 
         with color_path.open("r+b") as color_scratch, weight_path.open("r+b") as weight_scratch:
             temporary_path = _temporary_output_path(output_path)

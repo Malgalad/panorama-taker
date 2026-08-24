@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from pano_stitch import compositor
 from pano_stitch.compositor import (
     DEFAULT_MEMORY_BUDGET_BYTES,
     MAX_MEMORY_BUDGET_BYTES,
@@ -299,7 +300,9 @@ def test_render_resource_estimate_uses_color_and_weight_scratch(tmp_path: Path) 
     assert resources.scratch_bytes == 64 * 32 * 4 * np.dtype(np.float32).itemsize
 
 
-def test_parallel_strips_match_single_worker_output(tmp_path: Path) -> None:
+def test_parallel_strips_match_single_worker_output(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     base = _synthetic_session()
     frames = tuple(
         FrameMetadata(
@@ -343,9 +346,13 @@ def test_parallel_strips_match_single_worker_output(tmp_path: Path) -> None:
     render_session(
         session, tmp_path, serial_path, width=64, workers=1, memory_budget_bytes=budget
     )
+    opencv_thread_changes: list[int] = []
+    monkeypatch.setattr(compositor.cv2, "getNumThreads", lambda: 6)
+    monkeypatch.setattr(compositor.cv2, "setNumThreads", opencv_thread_changes.append)
     render_session(
         session, tmp_path, parallel_path, width=64, workers=2, memory_budget_bytes=budget
     )
+    assert opencv_thread_changes == [1, 6]
     with Image.open(serial_path) as serial, Image.open(parallel_path) as parallel:
         np.testing.assert_array_equal(np.asarray(serial), np.asarray(parallel))
 
