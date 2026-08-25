@@ -769,7 +769,13 @@ def render_session(
     strip_height = resources.strip_height
     composite_strips = (output_height + strip_height - 1) // strip_height
     exposure_work = len(session.frames)
-    total_work = exposure_work + len(session.frames) * composite_strips + composite_strips
+    local_exposure_work = (len(session.frames) + 1) * composite_strips
+    total_work = (
+        exposure_work
+        + local_exposure_work
+        + len(session.frames) * composite_strips
+        + composite_strips
+    )
     completed_work = exposure_work
     latitude_span = (
         180.0 if session.capture_mode.value == "full_sphere" else session.vertical_fov_deg
@@ -835,8 +841,20 @@ def render_session(
                         exposure_report.log_gains[frame_position]
                     )
                     local_weight[row_start : row_start + rows] += weights
-            covered_exposure = local_weight > 0.0
-            local_exposure[covered_exposure] /= local_weight[covered_exposure]
+                    completed_work += 1
+                    if progress_callback is not None:
+                        progress_callback(completed_work, total_work, "exposure mapping")
+            for row_start in range(0, output_height, strip_height):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RenderCancelledError("render cancelled")
+                rows = min(strip_height, output_height - row_start)
+                exposure_rows = local_exposure[row_start : row_start + rows]
+                weight_rows = local_weight[row_start : row_start + rows]
+                covered_exposure = weight_rows > 0.0
+                exposure_rows[covered_exposure] /= weight_rows[covered_exposure]
+                completed_work += 1
+                if progress_callback is not None:
+                    progress_callback(completed_work, total_work, "exposure mapping")
             local_exposure.flush()
         except Exception:
             if local_weight is not None:
