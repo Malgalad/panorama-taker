@@ -12,6 +12,8 @@ from pano_stitch.compositor import (
     SourceInfo,
     _choose_strip_height,
     _estimate_exposure_gains,
+    _exposure_clipped,
+    _local_exposure_multiplier,
     _output_dimensions,
     _pq_to_linear,
     _probe_source,
@@ -208,6 +210,29 @@ def test_exposure_solver_recovers_relative_sdr_gain(tmp_path: Path) -> None:
     assert report.gains[1] / report.gains[0] == pytest.approx(4.0, rel=0.03)
 
 
+def test_local_exposure_compensation_preserves_single_source_regions() -> None:
+    log_gains = (0.0, math.log(4.0))
+    single_left = np.asarray([[log_gains[0]]], dtype=np.float32)
+    single_right = np.asarray([[log_gains[1]]], dtype=np.float32)
+    assert _local_exposure_multiplier(log_gains[0], single_left)[0, 0] == pytest.approx(1.0)
+    assert _local_exposure_multiplier(log_gains[1], single_right)[0, 0] == pytest.approx(1.0)
+
+    overlap = np.asarray([[math.log(2.0)]], dtype=np.float32)
+    left = _local_exposure_multiplier(log_gains[0], overlap)[0, 0]
+    right = _local_exposure_multiplier(log_gains[1], overlap)[0, 0]
+    assert right / left == pytest.approx(4.0)
+    shifted = overlap + np.float32(7.0)
+    assert _local_exposure_multiplier(log_gains[0] + 7.0, shifted) == pytest.approx(
+        _local_exposure_multiplier(log_gains[0], overlap)
+    )
+
+
+def test_linear_hdr_highlights_are_not_treated_as_clipped() -> None:
+    image = np.full((2, 2, 3), 4.0, dtype=np.float32)
+    assert not np.any(_exposure_clipped(image, ImageEncoding("float32", "rec2020", "linear")))
+    assert np.all(_exposure_clipped(image, ImageEncoding("uint16", "rec2020", "pq")))
+
+
 def test_4k_source_uses_bounded_output_strips() -> None:
     source = SourceInfo(3840, 2160, ImageEncoding("uint16", "rec2020", "pq", 203.0))
     strip_height = _choose_strip_height(source, 21274, DEFAULT_MEMORY_BUDGET_BYTES)
@@ -298,7 +323,7 @@ def test_render_resource_estimate_uses_color_and_weight_scratch(tmp_path: Path) 
     resources = estimate_render_resources(session, tmp_path, width=64)
 
     assert resources.output_height == 32
-    assert resources.scratch_bytes == 64 * 32 * 4 * np.dtype(np.float32).itemsize
+    assert resources.scratch_bytes == 64 * 32 * 5 * np.dtype(np.float32).itemsize
 
 
 def test_full_sphere_output_dimensions_are_always_two_to_one() -> None:
@@ -351,7 +376,7 @@ def test_parallel_strips_match_single_worker_output(
         Image.fromarray(_source_image(frame, 64, 64, 90.0)).save(tmp_path / frame.filename)
 
     source_bytes = 64 * 64 * 3 * np.dtype(np.float32).itemsize * 3
-    row_bytes = 64 * 160
+    row_bytes = 64 * 164
     budget = 192 * 1024 * 1024 + source_bytes + 4 * row_bytes
     serial_resources = estimate_render_resources(
         session, tmp_path, width=64, memory_budget_bytes=budget, workers=1

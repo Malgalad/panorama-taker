@@ -146,7 +146,7 @@ def main() -> None:
             gains = ", ".join(f"{gain:.3f}" for gain in exposure_report.gains)
             print(
                 f"exposure normalization: anchor={exposure_report.anchor_frame + 1}, "
-                f"overlap edges={exposure_report.edge_count}, gains=[{gains}]"
+                f"overlap edges={exposure_report.edge_count}, relative exposure estimates=[{gains}]"
             )
             print(f"wrote {arguments.output}")
         else:

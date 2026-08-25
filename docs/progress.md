@@ -435,3 +435,39 @@ range field from the valid `1<TAB>hdr` bridge record was corrected. The custom
 summary widget was restyled to 36 px with the NSUI label hue at 80% brightness
 and a 40 px left indent. CET v0.1.58 is copied to the game directory; the
 updated live HDR timing display awaits in-game confirmation.
+
+Exposure compensation follow-up (implementation brief, 2026-08-25): the
+current solver estimates relative log-exposure offsets correctly, but applying
+one global gain to every pixel of each source relights areas that were not part
+of the overlap (for example, a dark ground beneath a bright sky). Replace that
+application with overlap-local compensation. Keep the geometric overlap
+solver, but treat its values as relative log corrections `c[i]`. Construct a
+disk-backed float32 correction field before compositing using the same smooth
+feather weights as the compositor: `C(p) = sum(w[i,p] * c[i]) / sum(w[i,p])`.
+While sampling frame `i`, multiply linear RGB only at valid pixels by
+`exp(c[i] - C(p))`, then perform the normal hard or feather blend. In
+single-source regions the multiplier is exactly one; overlaps share a smoothly
+varying exposure, and any constant added to all corrections cancels. Never use
+histogram matching, CLAHE, tone mapping, or global per-image normalization.
+Preserve unclipped float HDR for EXR and the existing deterministic SDR output
+conversion for PNG/JPEG.
+
+Centralize weight calculation so exposure mapping and final blending cannot
+drift. Account for the extra one-channel scratch map in resource estimates and
+progress reporting, close all memmaps explicitly on Windows, and retain bounded
+strip parallelism. Keep relative-exposure diagnostics, but describe them as
+estimates rather than applied global gains. Add tests proving that non-overlap
+bright/dark regions remain unchanged, overlap seams have no luminance step for
+hard and feather modes, HDR extrema remain unclipped, a global correction offset
+is invariant, and serial/parallel output remains deterministic. Also exercise
+rejection of near-black, clipped, high-gradient, non-finite, and high-MAD
+overlap samples plus the existing disconnected-graph failure.
+
+Exposure-local compensation implementation (2026-08-25): renders now build a
+disk-backed per-output-pixel exposure field from geometric feather weights and
+apply only `exp(frame_log_gain - local_exposure)` to valid linear samples. The
+previous global per-source gain application was removed; single-source regions
+therefore retain their original exposure while overlaps transition smoothly.
+The resource estimate includes the additional float map, OpenCV remap limits
+remain handled, and overlap estimation now rejects clipped/high-gradient
+samples and high-MAD edges. Focused stitcher tests and mypy pass (35 tests).

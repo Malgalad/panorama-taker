@@ -29,7 +29,7 @@ FloatImage = NDArray[np.float32]
 DEFAULT_MEMORY_BUDGET_BYTES = 768 * 1024 * 1024
 MAX_MEMORY_BUDGET_BYTES = 8192 * 1024 * 1024
 _RESERVED_RUNTIME_BYTES = 192 * 1024 * 1024
-_TILE_BYTES_PER_PIXEL = 160
+_TILE_BYTES_PER_PIXEL = 164
 _MAX_AUTO_WORKERS = 8
 
 
@@ -61,6 +61,10 @@ class ExposureReport:
     edge_count: int
     gains: tuple[float, ...]
 
+    @property
+    def log_gains(self) -> tuple[float, ...]:
+        return tuple(float(np.log(max(gain, 1e-6))) for gain in self.gains)
+
 
 class RenderCancelledError(RuntimeError):
     """Raised when a cooperative render cancellation is requested."""
@@ -88,6 +92,14 @@ def _exposure_luminance(image: FloatImage) -> FloatImage:
         + image[..., 2] * np.float32(0.0722),
         dtype=np.float32,
     )
+
+
+def _exposure_clipped(image: FloatImage, encoding: ImageEncoding) -> NDArray[np.bool_]:
+    """Return saturated-code samples, excluding unbounded linear HDR sources."""
+
+    if encoding.transfer_function == "linear":
+        return np.zeros(image.shape[:2], dtype=bool)
+    return np.any(image >= np.float32(0.995), axis=-1)
 
 
 def _exposure_proxy(source: FloatImage, maximum_width: int = 256) -> FloatImage:
@@ -144,8 +156,14 @@ def _estimate_exposure_gains(
             del source
         luminance = _exposure_luminance(sampled)
         finite = np.isfinite(luminance) & (luminance > np.float32(1e-5))
+        clipped = _exposure_clipped(sampled, source_info.encoding)
+        log_luminance = np.log(np.maximum(luminance, np.float32(1e-5)))
+        gradient_x = cv2.Sobel(log_luminance, cv2.CV_32F, 1, 0, ksize=3)
+        gradient_y = cv2.Sobel(log_luminance, cv2.CV_32F, 0, 1, ksize=3)
+        gradient = np.hypot(gradient_x, gradient_y)
+        gradient_limit = float(np.quantile(gradient[np.isfinite(gradient)], 0.9))
         luminances.append(luminance)
-        valid_masks.append(valid & finite)
+        valid_masks.append(valid & finite & ~clipped & (gradient <= gradient_limit))
         if progress_callback is not None:
             progress_callback(position + 1)
 
@@ -166,7 +184,11 @@ def _estimate_exposure_gains(
             inliers = finite_ratios[(finite_ratios >= low) & (finite_ratios <= high)]
             if inliers.size < 12:
                 continue
-            equations.append((left, right, float(np.median(inliers)), float(np.sqrt(inliers.size))))
+            median = float(np.median(inliers))
+            mad = float(np.median(np.abs(inliers - median)))
+            if mad > 0.5:
+                continue
+            equations.append((left, right, median, float(np.sqrt(inliers.size) / (1.0 + mad))))
             adjacency[left].add(right)
             adjacency[right].add(left)
 
@@ -563,6 +585,8 @@ def _composite_strip(
     strip_height: int,
     blend: str,
     cancel_event: Event | None,
+    local_exposure: FloatImage | None = None,
+    log_gain: float = 0.0,
 ) -> None:
     """Composite one row-disjoint strip in disk-backed shared array views."""
 
@@ -581,6 +605,11 @@ def _composite_strip(
         vertical_fov_deg,
     )
     sampled = remap_source(source, map_x, map_y)
+    if local_exposure is not None:
+        correction = _local_exposure_multiplier(
+            log_gain, local_exposure[row_start : row_start + rows]
+        )
+        sampled *= correction[..., np.newaxis]
     color = color_scratch[row_start : row_start + rows]
     weight = weight_scratch[row_start : row_start + rows]
     if blend == "hard":
@@ -589,14 +618,24 @@ def _composite_strip(
         color[selected] = sampled[selected]
         weight[selected] = candidate[selected]
     else:
-        feather_width = max(1.0, min(source_info.width, source_info.height) * 0.08)
-        candidate = np.where(
-            valid,
-            np.maximum(edge_distance / feather_width, 1e-6),
-            0.0,
-        )
+        candidate = _exposure_weight(valid, edge_distance, source_info)
         color += sampled * candidate[..., np.newaxis]
         weight += candidate
+
+
+def _exposure_weight(
+    valid: NDArray[np.bool_], edge_distance: FloatImage, source_info: SourceInfo
+) -> FloatImage:
+    feather_width = max(1.0, min(source_info.width, source_info.height) * 0.08)
+    return np.where(valid, np.maximum(edge_distance / feather_width, 1e-6), 0.0).astype(
+        np.float32
+    )
+
+
+def _local_exposure_multiplier(log_gain: float, local_exposure: FloatImage) -> FloatImage:
+    """Return overlap-only compensation; a constant exposure gauge cancels."""
+
+    return np.exp(np.float32(log_gain) - local_exposure).astype(np.float32)
 
 
 def _close_scratch_memmap(array: Any) -> None:
@@ -685,7 +724,7 @@ def estimate_render_resources(
     worker_count, strip_height = _choose_render_plan(
         source, output_width, output_height, memory_budget_bytes, workers
     )
-    scratch_bytes = output_height * output_width * 4 * np.dtype(np.float32).itemsize
+    scratch_bytes = output_height * output_width * 5 * np.dtype(np.float32).itemsize
     return RenderResources(output_width, output_height, strip_height, worker_count, scratch_bytes)
 
 
@@ -756,20 +795,84 @@ def render_session(
             ),
         )
         scratch_root = Path(scratch_directory)
+        local_exposure_path = scratch_root / "local-exposure.f32"
+        local_weight_path = scratch_root / "local-exposure-weight.f32"
+        local_exposure: Any | None = None
+        local_weight: Any | None = None
+        try:
+            local_exposure = np.memmap(
+                local_exposure_path,
+                mode="w+",
+                dtype=np.float32,
+                shape=(output_height, output_width),
+            )
+            local_weight = np.memmap(
+                local_weight_path,
+                mode="w+",
+                dtype=np.float32,
+                shape=(output_height, output_width),
+            )
+            local_exposure[:] = 0.0
+            local_weight[:] = 0.0
+            for frame_position, frame in enumerate(session.frames):
+                for row_start in range(0, output_height, strip_height):
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise RenderCancelledError("render cancelled")
+                    rows = min(strip_height, output_height - row_start)
+                    directions = equirectangular_directions(
+                        output_width, rows, latitude_span, row_start, output_height
+                    )
+                    _, _, valid, edge_distance = camera_maps(
+                        directions,
+                        frame,
+                        first_source.width,
+                        first_source.height,
+                        session.horizontal_fov_deg,
+                        session.vertical_fov_deg,
+                    )
+                    weights = _exposure_weight(valid, edge_distance, first_source)
+                    local_exposure[row_start : row_start + rows] += weights * np.float32(
+                        exposure_report.log_gains[frame_position]
+                    )
+                    local_weight[row_start : row_start + rows] += weights
+            covered_exposure = local_weight > 0.0
+            local_exposure[covered_exposure] /= local_weight[covered_exposure]
+            local_exposure.flush()
+        except Exception:
+            if local_weight is not None:
+                _close_scratch_memmap(local_weight)
+            if local_exposure is not None:
+                _close_scratch_memmap(local_exposure)
+            raise
+        _close_scratch_memmap(local_weight)
+        del local_weight
+        assert local_exposure is not None
         color_path = scratch_root / "color.f32"
         weight_path = scratch_root / "weight.f32"
-        color_scratch = np.memmap(
-            color_path,
-            mode="w+",
-            dtype=np.float32,
-            shape=(output_height, output_width, 3),
-        )
-        weight_scratch = np.memmap(
-            weight_path,
-            mode="w+",
-            dtype=np.float32,
-            shape=(output_height, output_width),
-        )
+        color_scratch: Any | None = None
+        weight_scratch: Any | None = None
+        try:
+            color_scratch = np.memmap(
+                color_path,
+                mode="w+",
+                dtype=np.float32,
+                shape=(output_height, output_width, 3),
+            )
+            weight_scratch = np.memmap(
+                weight_path,
+                mode="w+",
+                dtype=np.float32,
+                shape=(output_height, output_width),
+            )
+        except Exception:
+            if color_scratch is not None:
+                _close_scratch_memmap(color_scratch)
+            if weight_scratch is not None:
+                _close_scratch_memmap(weight_scratch)
+            _close_scratch_memmap(local_exposure)
+            raise
+        assert color_scratch is not None
+        assert weight_scratch is not None
         try:
             with _limit_opencv_threads(resources.worker_count):
                 for frame_position, frame in enumerate(session.frames):
@@ -779,7 +882,6 @@ def render_session(
                         _image_path(image_root, frame.filename), first_source.encoding
                     )
                     try:
-                        source *= np.float32(exposure_report.gains[frame_position])
                         with ThreadPoolExecutor(max_workers=resources.worker_count) as executor:
                             futures = [
                                 executor.submit(
@@ -798,6 +900,8 @@ def render_session(
                                     strip_height,
                                     blend,
                                     cancel_event,
+                                    local_exposure,
+                                    exposure_report.log_gains[frame_position],
                                 )
                                 for row_start in range(0, output_height, strip_height)
                             ]
@@ -877,8 +981,10 @@ def render_session(
         finally:
             _close_scratch_memmap(color_scratch)
             _close_scratch_memmap(weight_scratch)
+            _close_scratch_memmap(local_exposure)
             del color_scratch
             del weight_scratch
+            del local_exposure
 
 
 def validate_images(
