@@ -7,10 +7,10 @@ import logging
 import os
 import queue
 import threading
-import tkinter as tk  # type: ignore[import-untyped]
+import tkinter as tk
 from fractions import Fraction
 from pathlib import Path
-from tkinter import filedialog, font, messagebox, ttk  # type: ignore[import-untyped]
+from tkinter import filedialog, font, messagebox, ttk
 from typing import Any
 
 from pano_stitch.compositor import (
@@ -21,6 +21,13 @@ from pano_stitch.compositor import (
     validate_images,
 )
 from pano_stitch.metadata import load_session
+from pano_stitch.sessions import (
+    SessionRecord,
+    delete_files,
+    deletion_targets,
+    discover_sessions,
+    mark_stitched,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -37,17 +44,21 @@ class StitcherApp:
         self._worker: threading.Thread | None = None
         self._validation_after: str | None = None
         self._validated = False
+        self._history: dict[str, Any] = {}
+        self._sessions: tuple[SessionRecord, ...] = ()
         self._build_variables()
         self._load_settings()
         self._build_widgets()
         self._form_controls = self._form_control_widgets()
         self.session_var.trace_add("write", self._input_changed)
+        self.game_dir_var.trace_add("write", lambda *_args: self._refresh_sessions())
         self.image_dir_var.trace_add("write", self._input_changed)
         self.output_name_var.trace_add("write", self._output_name_changed)
         self.format_var.trace_add("write", self._format_changed)
         self._update_resolution_label()
         self._update_jpeg_quality_label()
         self._format_changed()
+        self._refresh_sessions()
         self.root.after(100, self._drain_events)
         self.root.protocol("WM_DELETE_WINDOW", self._close)
 
@@ -65,10 +76,12 @@ class StitcherApp:
         try:
             with self._settings_path().open(encoding="utf-8") as stream:
                 settings = json.load(stream)
-            self.session_dir_var.set(self._display_path(settings.get("session_dir", "")))
+            self.game_dir_var.set(self._display_path(settings.get("game_dir", "")))
             self.image_dir_var.set(self._display_path(settings.get("image_dir", "")))
             self.output_dir_var.set(self._display_path(settings.get("output_dir", "")))
             self.auto_contrast_var.set(settings.get("auto_contrast", True))
+            history = settings.get("stitched_sessions", {})
+            self._history = history if isinstance(history, dict) else {}
         except (OSError, ValueError):
             pass
 
@@ -80,9 +93,10 @@ class StitcherApp:
             temporary.write_text(
                 json.dumps(
                     {
-                        "session_dir": self.session_dir_var.get(),
+                        "game_dir": self.game_dir_var.get(),
                         "image_dir": self.image_dir_var.get(),
                         "output_dir": self.output_dir_var.get(),
+                        "stitched_sessions": self._history,
                         "auto_contrast": self.auto_contrast_var.get(),
                     },
                     indent=2,
@@ -117,7 +131,7 @@ class StitcherApp:
 
     def _build_variables(self) -> None:
         self.session_var = tk.StringVar()
-        self.session_dir_var = tk.StringVar()
+        self.game_dir_var = tk.StringVar()
         self.image_dir_var = tk.StringVar()
         self.output_dir_var = tk.StringVar()
         self.output_name_var = tk.StringVar(value="panorama.jpg")
@@ -135,15 +149,44 @@ class StitcherApp:
         self.allow_incomplete_var = tk.BooleanVar(value=False)
         self.coverage_var = tk.BooleanVar(value=False)
         self.auto_contrast_var = tk.BooleanVar(value=True)
-        self.status_var = tk.StringVar(value="Choose a capture JSON and screenshots directory.")
+        self.status_var = tk.StringVar(value="Choose a game directory and session.")
 
     def _build_widgets(self) -> None:
         paths = ttk.LabelFrame(self.root, text="Capture")
         paths.pack(fill="x", padx=12, pady=8)
-        self._path_row(paths, 0, "Capture JSON", self.session_var, self._pick_session)
-        self._path_row(paths, 1, "Screenshots", self.image_dir_var, self._pick_image_dir)
-        self._path_row(paths, 2, "Output directory", self.output_dir_var, self._pick_output_dir)
-        self._path_row(paths, 3, "Output filename", self.output_name_var, None)
+        self._path_row(paths, 0, "Game directory", self.game_dir_var, self._pick_game_dir)
+        self.sessions_tree = ttk.Treeview(
+            paths, columns=("date", "status", "stitched"), show="headings", height=6
+        )
+        for column, heading, width in (
+            ("date", "Local date", 180),
+            ("status", "Status", 120),
+            ("stitched", "Stitched", 100),
+        ):
+            self.sessions_tree.heading(column, text=heading)
+            self.sessions_tree.column(column, width=width, anchor="w")
+        self.sessions_tree.grid(row=1, column=1, columnspan=2, sticky="ew", padx=6, pady=4)
+        self.sessions_tree.bind("<<TreeviewSelect>>", self._session_selected)
+        ttk.Button(paths, text="Refresh", command=self._refresh_sessions).grid(
+            row=1, column=0, padx=6, pady=4, sticky="w"
+        )
+        self.delete_json_button = ttk.Button(
+            paths,
+            text="Delete JSON",
+            command=lambda: self._delete_selected(False),
+            state="disabled",
+        )
+        self.delete_json_button.grid(row=2, column=0, padx=6, pady=4, sticky="w")
+        self.delete_sources_button = ttk.Button(
+            paths,
+            text="Delete JSON and screenshots",
+            command=lambda: self._delete_selected(True),
+            state="disabled",
+        )
+        self.delete_sources_button.grid(row=2, column=1, columnspan=2, padx=6, pady=4, sticky="w")
+        self._path_row(paths, 3, "Screenshots", self.image_dir_var, self._pick_image_dir)
+        self._path_row(paths, 4, "Output directory", self.output_dir_var, self._pick_output_dir)
+        self._path_row(paths, 5, "Output filename", self.output_name_var, None)
 
         options = ttk.LabelFrame(self.root, text="Render options")
         options.pack(fill="x", padx=12, pady=8)
@@ -288,38 +331,85 @@ class StitcherApp:
         ttk.Label(parent, text=label, width=24).grid(row=row, column=0, sticky="w", padx=6, pady=3)
         widget.grid(row=row, column=1, sticky="w", padx=6, pady=3)
 
-    def _pick_session(self) -> None:
-        chosen = filedialog.askopenfilename(
-            title="Select capture metadata",
-            initialdir=self.session_dir_var.get() or None,
-            filetypes=(("JSON files", "*.json"), ("All files", "*.*")),
+    def _pick_game_dir(self) -> None:
+        chosen = filedialog.askdirectory(
+            title="Select Cyberpunk 2077 game directory", initialdir=self.game_dir_var.get() or None
         )
         if chosen:
-            self._set_path(self.session_var, chosen)
-            session_path = Path(chosen).resolve()
-            self._set_path(self.session_dir_var, session_path.parent)
-            try:
-                loaded = load_session(session_path, image_directory=session_path.parent)
-                # A newly selected capture must not inherit the previous session's output name.
-                self._set_default_output_name(loaded.session_id, force=True)
-                inferred = self._inferred_image_directory(loaded, session_path.parent)
-                if inferred is not None:
-                    self._set_path(self.image_dir_var, inferred)
-            except (OSError, ValueError):
-                pass
+            self._set_path(self.game_dir_var, chosen)
+            self._refresh_sessions()
 
     def _pick_image_dir(self) -> None:
         chosen = filedialog.askdirectory(
             title="Select screenshots directory",
-            initialdir=self.image_dir_var.get() or self.session_dir_var.get() or None,
+            initialdir=self.image_dir_var.get() or self.game_dir_var.get() or None,
         )
         if chosen:
             self._set_path(self.image_dir_var, chosen)
 
+    def _refresh_sessions(self) -> None:
+        game_text = self.game_dir_var.get().strip()
+        self._sessions = discover_sessions(Path(game_text), self._history) if game_text else ()
+        if not hasattr(self, "sessions_tree"):
+            return
+        self.sessions_tree.delete(*self.sessions_tree.get_children())
+        for index, record in enumerate(self._sessions):
+            status = (
+                "Invalid" if record.error else ("Complete" if record.complete else "Incomplete")
+            )
+            stitched = "Yes" if record.stitched_name else "No"
+            self.sessions_tree.insert(
+                "", "end", iid=str(index), values=(record.local_date, status, stitched)
+            )
+        self._validated = False
+        self.render_button.configure(state="disabled")
+        self.delete_json_button.configure(state="disabled")
+        self.delete_sources_button.configure(state="disabled")
+
+    def _session_selected(self, _event: object) -> None:
+        selected = self.sessions_tree.selection()
+        if not selected:
+            return
+        record = self._sessions[int(selected[0])]
+        if record.error:
+            self.status_var.set(f"Cannot load {record.path.name}: {record.error}")
+            return
+        self._set_path(self.session_var, record.path)
+        self._set_default_output_name(record.metadata.session_id, force=True)
+        if record.stitched_name:
+            format_by_suffix = {".png": "PNG", ".jpg": "JPEG", ".jpeg": "JPEG", ".exr": "EXR"}
+            restored_format = format_by_suffix.get(Path(record.stitched_name).suffix.lower())
+            if restored_format is not None:
+                self.format_var.set(restored_format)
+            self.output_name_var.set(record.stitched_name)
+            self._output_name_dirty = False
+        inferred = self._inferred_image_directory(record.metadata, record.path.parent)
+        if inferred is not None:
+            self._set_path(self.image_dir_var, inferred)
+        self.delete_json_button.configure(state="normal")
+        self.delete_sources_button.configure(state="normal")
+
+    def _delete_selected(self, include_images: bool) -> None:
+        selected = self.sessions_tree.selection()
+        if not selected:
+            return
+        record = self._sessions[int(selected[0])]
+        if record.error:
+            return
+        if include_images or record.complete:
+            if not messagebox.askyesno(
+                "Delete session files",
+                "Are you sure?\n\nThis will delete the selected session files.",
+            ):
+                return
+        deleted, missing = delete_files(deletion_targets(record, include_images))
+        self.status_var.set(f"Deleted {deleted} file(s); {missing} already missing.")
+        self._refresh_sessions()
+
     def _pick_output_dir(self) -> None:
         chosen = filedialog.askdirectory(
             title="Select output directory",
-            initialdir=self.output_dir_var.get() or self.session_dir_var.get() or None,
+            initialdir=self.output_dir_var.get() or self.game_dir_var.get() or None,
         )
         if chosen:
             self._set_path(self.output_dir_var, chosen)
@@ -422,7 +512,7 @@ class StitcherApp:
         if self.session_var.get().strip() and self.image_dir_var.get().strip():
             self._validation_after = self.root.after(300, self._start_validation)
         else:
-            self.status_var.set("Choose a capture JSON and screenshots directory.")
+            self.status_var.set("Choose a game directory and session.")
 
     def _start_validation(self) -> None:
         self._validation_after = None
@@ -447,9 +537,7 @@ class StitcherApp:
             else None
         )
         existing = [
-            path
-            for path in (output_path, coverage_path)
-            if path is not None and path.exists()
+            path for path in (output_path, coverage_path) if path is not None and path.exists()
         ]
         if existing:
             if not messagebox.askyesno(
@@ -527,6 +615,7 @@ class StitcherApp:
                 self.auto_contrast_var.get(),
             )
             LOGGER.info("render completed: %s", output_path)
+            self._events.put(("stitched", (session.session_id, output_path.name)))
             auto_state = (
                 "skipped for EXR"
                 if output_path.suffix.lower() == ".exr"
@@ -545,9 +634,7 @@ class StitcherApp:
             self._events.put(("cancelled", "Render cancelled; partial files were removed."))
         except Exception as error:
             LOGGER.exception("%s failed", operation)
-            self._events.put(
-                ("error", f"{error}\n\nDetails were written to {self._log_path()}")
-            )
+            self._events.put(("error", f"{error}\n\nDetails were written to {self._log_path()}"))
         finally:
             self._events.put(("idle", ""))
 
@@ -570,7 +657,15 @@ class StitcherApp:
                     self.status_var.set(payload)
                 elif kind == "success":
                     self.status_var.set(payload)
+                    self._refresh_sessions()
                     messagebox.showinfo("Panorama stitcher", payload)
+                elif kind == "stitched":
+                    session_id, output_name = payload
+                    mark_stitched(
+                        self._history, Path(self.game_dir_var.get()), session_id, output_name
+                    )
+                    self._save_settings()
+                    self._refresh_sessions()
                 elif kind == "error":
                     self.status_var.set(f"Error: {payload}")
                     messagebox.showerror("Panorama stitcher", payload)
