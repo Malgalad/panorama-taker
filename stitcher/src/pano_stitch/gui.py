@@ -144,7 +144,7 @@ class StitcherApp:
         self.resolution_percent_var = tk.IntVar(value=100)
         self.resolution_label_var = tk.StringVar()
         self.blend_var = tk.StringVar(value="feather")
-        self.memory_var = tk.StringVar(value="768")
+        self.memory_var = tk.StringVar(value="1024")
         self.workers_var = tk.StringVar(value="Auto")
         self.allow_incomplete_var = tk.BooleanVar(value=False)
         self.coverage_var = tk.BooleanVar(value=False)

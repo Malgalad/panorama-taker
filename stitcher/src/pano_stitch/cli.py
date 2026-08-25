@@ -86,8 +86,8 @@ def _parser() -> argparse.ArgumentParser:
     render.add_argument(
         "--memory-budget-mib",
         type=int,
-        default=768,
-        help="maximum compositor working budget; production default is 768 MiB, cap is 8192 MiB",
+        default=1024,
+        help="maximum compositor working budget; production default is 1024 MiB, cap is 8192 MiB",
     )
     render.add_argument(
         "--workers",

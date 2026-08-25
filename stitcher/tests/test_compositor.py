@@ -277,7 +277,7 @@ def test_4k_source_uses_bounded_output_strips() -> None:
     source = SourceInfo(3840, 2160, ImageEncoding("uint16", "rec2020", "pq", 203.0))
     strip_height = _choose_strip_height(source, 21274, DEFAULT_MEMORY_BUDGET_BYTES)
 
-    assert 1 <= strip_height < 128
+    assert 1 <= strip_height < 256
     with pytest.raises(ValueError, match="memory budget"):
         _choose_strip_height(source, 21274, MAX_MEMORY_BUDGET_BYTES + 1)
 

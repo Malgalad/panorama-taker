@@ -1,41 +1,30 @@
-# PanoramaCaptureProbe
+# Panorama Capture mod
 
-This Packet 4 probe supports Cyberpunk 2077 2.31 and RED4ext v1.30.0. `PANORAMA_PROBE_STAGE` selects progressively riskier read-only diagnostics; stage 0 only registers a game-state callback. No stage changes the camera, UI, input, or screenshots.
+## Install
 
-## Build
+1. Close Cyberpunk 2077.
+2. Extract the release archive into the game directory.
+3. Confirm these files exist:
 
-Run these commands from the **x64 Native Tools Command Prompt for VS 2026**:
+   ```text
+   bin\x64\PanoramaCaptureReShade.addon64
+   bin\x64\plugins\cyber_engine_tweaks\mods\PanoramaCaptureProbe\init.lua
+   ```
 
-```bat
-pushd \\wsl.localhost\<your-distro>\home\pogorelov\panorama-taker
-cmake -S mod -B C:\build\panorama-taker-x64 -G Ninja -DCMAKE_BUILD_TYPE=Debug -DRED4EXT_USE_PCH=ON
-cmake --build C:\build\panorama-taker-x64
-popd
-```
+4. Start the game and load a save.
+5. In CET's bindings UI, assign:
+   - `Panorama: start full-sphere pose session`
+   - `Panorama: abort full-sphere pose session`
+   - `Panorama: report capture status` (development builds only)
 
-The DLL is `C:\build\panorama-taker-x64\PanoramaCaptureProbe.dll`.
+## Capture
 
-## Manual deployment and verification
+Use normal first-person gameplay outside Photo Mode, vehicles, menus, and scripted camera scenes. Frame the scene and press the start binding. The mod captures the planned views automatically, requests a ReShade screenshot for each view, and restores the camera and game state when finished.
 
-Close the game, then copy the DLL into this new directory (leave every existing RED4ext/Vortex file untouched):
+If capture stops, inspect the latest `[PanoramaCaptureProbe]` message in the CET log. Keep the generated `PanoramaCaptureBridge.pano-<session-id>.json` and its screenshots together.
 
-```bat
-mkdir "F:\GoG Games\Cyberpunk 2077\red4ext\plugins\PanoramaCaptureProbe"
-copy /Y "C:\build\panorama-taker-x64\PanoramaCaptureProbe.dll" "F:\GoG Games\Cyberpunk 2077\red4ext\plugins\PanoramaCaptureProbe\"
-```
+## Settings
 
-Configure a stage explicitly when testing:
+The optional CET Native Settings panel controls settling delay, screenshot cooldown, and capture FoV. Settings are saved in `PanoramaCaptureProbe/settings.json`.
 
-```bat
-cmake -S mod -B C:\build\panorama-taker-x64 -G Ninja -DCMAKE_BUILD_TYPE=Debug -DPANORAMA_PROBE_STAGE=1
-```
-
-Stages 1–3 are the RTTI lookup, `ScriptGameInstance` construction, and deferred `GetCameraSystem` invocation. Stage 3 waits roughly 10 seconds of update frames before invoking the getter. Stages 4–6 then test `GetType()`, class-name conversion, and method lookups separately. Launch the game, load a save, and inspect `F:\GoG Games\Cyberpunk 2077\red4ext\logs\red4ext.log`.
-
-```text
-PanoramaCaptureProbe loaded for Cyberpunk 2077 2.31.0.
-Camera probe: running stage 1.
-Camera probe: RTTI lookup succeeded.
-```
-
-If a stage crashes, revert to the previous stage and provide the last log line. Delete only `PanoramaCaptureProbe.dll` to disable this probe.
+Keep `bridgeDirectory` set to `.` unless the CET mod and ReShade add-on bridge are moved together.

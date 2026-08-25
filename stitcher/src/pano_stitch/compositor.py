@@ -26,7 +26,7 @@ from pano_stitch.metadata import FrameMetadata, ImageEncoding, SessionMetadata
 from pano_stitch.projection import camera_maps, equirectangular_directions, remap_source
 
 FloatImage = NDArray[np.float32]
-DEFAULT_MEMORY_BUDGET_BYTES = 768 * 1024 * 1024
+DEFAULT_MEMORY_BUDGET_BYTES = 1024 * 1024 * 1024
 MAX_MEMORY_BUDGET_BYTES = 8192 * 1024 * 1024
 _RESERVED_RUNTIME_BYTES = 192 * 1024 * 1024
 _TILE_BYTES_PER_PIXEL = 164

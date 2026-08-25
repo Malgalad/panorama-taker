@@ -356,6 +356,56 @@ local function vectorJson(vector)
     return string.format("[%.9f,%.9f,%.9f]", vector.x, vector.y, vector.z)
 end
 
+local function numberArrayJson(values, count)
+    if type(values) ~= "table" then
+        return nil
+    end
+    local result = {}
+    for index = 1, count do
+        if not isFiniteNumber(values[index]) then
+            return nil
+        end
+        result[index] = string.format("%.9f", values[index])
+    end
+    return "[" .. table.concat(result, ",") .. "]"
+end
+
+local function cameraDiagnosticCall(cameraSystem, methodName)
+    local ok, value = pcall(function() return cameraSystem[methodName](cameraSystem) end)
+    return ok and value or nil
+end
+
+local function validVector(value)
+    local ok, x, y, z = pcall(function() return value.x, value.y, value.z end)
+    return ok and isFiniteNumber(x) and isFiniteNumber(y) and isFiniteNumber(z)
+end
+
+local function activeCameraDiagnostics(cameraSystem)
+    local position = cameraDiagnosticCall(cameraSystem, "GetActiveCameraWorldPosition")
+    if position == nil then
+        position = cameraDiagnosticCall(cameraSystem, "GetActiveCameraPosition")
+    end
+    local projection = cameraDiagnosticCall(cameraSystem, "GetActiveCameraProjectionMatrix")
+    local view = cameraDiagnosticCall(cameraSystem, "GetActiveCameraViewMatrix")
+    local viewport = cameraDiagnosticCall(cameraSystem, "GetActiveCameraViewport")
+    local width, height = nil, nil
+    if type(viewport) == "table" then
+        width, height = viewport.width or viewport.x, viewport.height or viewport.y
+    end
+    local activeViewport = isFiniteNumber(width) and isFiniteNumber(height)
+    if not activeViewport then
+        width, height = GetDisplayResolution()
+    end
+    return {
+        position = validVector(position) and position or nil,
+        projection = numberArrayJson(projection, 16),
+        view = numberArrayJson(view, 16),
+        viewportWidth = isFiniteNumber(width) and width or nil,
+        viewportHeight = isFiniteNumber(height) and height or nil,
+        viewportSource = activeViewport and "active_camera" or "display_resolution",
+    }
+end
+
 local function writeSessionMetadata(session, state)
     local temporary = session.metadataPath .. ".tmp"
     local output, openError = io.open(temporary, "wb")
@@ -388,10 +438,16 @@ local function writeSessionMetadata(session, state)
         if not writeChunk(string.format(
             "    {\"index\":%d,\"row\":%d,\"column\":%d,\"commanded_yaw_deg\":%.9f," ..
             "\"commanded_pitch_deg\":%.9f,\"observed_pitch_deg\":%.9f,\"forward\":%s," ..
-            "\"right\":%s,\"up\":%s,\"settle_seconds\":%.6f,\"screenshot_path\":\"%s\"}%s\n",
+            "\"right\":%s,\"up\":%s,\"settle_seconds\":%.6f,\"screenshot_path\":\"%s\"%s%s%s%s%s%s}%s\n",
             record.index, record.row, record.column, record.commandedYaw, record.commandedPitch,
             record.observedPitch, vectorJson(record.forward), vectorJson(record.right),
             vectorJson(record.up), record.settleSeconds, jsonEscape(record.screenshotPath),
+            record.cameraPosition ~= nil and string.format(",\"camera_position\":%s", vectorJson(record.cameraPosition)) or "",
+            record.cameraDisplacement ~= nil and string.format(",\"camera_displacement\":%.9f", record.cameraDisplacement) or "",
+            record.horizontalFov ~= nil and string.format(",\"horizontal_fov_deg\":%.9f,\"vertical_fov_deg\":%.9f", record.horizontalFov, record.verticalFov) or "",
+            record.viewportWidth ~= nil and string.format(",\"viewport\":{\"width\":%d,\"height\":%d,\"source\":\"%s\"}", record.viewportWidth, record.viewportHeight, record.viewportSource) or "",
+            record.projectionMatrix ~= nil and string.format(",\"projection_matrix_row_major\":%s", record.projectionMatrix) or "",
+            record.viewMatrix ~= nil and string.format(",\"view_matrix_row_major\":%s", record.viewMatrix) or "",
             index < #session.metadataRecords and "," or "")) then
             output:close()
             os.remove(temporary)
@@ -407,6 +463,20 @@ local function writeSessionMetadata(session, state)
     if not closed then
         os.remove(temporary)
         log("Metadata warning: cannot close " .. session.metadataPath .. ": " .. tostring(closeError))
+        return false
+    end
+    local verificationInput, verificationOpenError = io.open(temporary, "rb")
+    if verificationInput == nil then
+        log("Metadata warning: cannot verify " .. temporary .. ": " ..
+            tostring(verificationOpenError))
+        return false
+    end
+    local content = verificationInput:read("*a")
+    verificationInput:close()
+    local validJson, decoded = pcall(json.decode, content)
+    if not validJson or type(decoded) ~= "table" then
+        log("Metadata warning: generated JSON is invalid; retaining " .. temporary ..
+            " and the previous session metadata: " .. tostring(decoded))
         return false
     end
     os.remove(session.metadataPath)
@@ -425,12 +495,8 @@ local function discardSessionMetadata(session)
 end
 
 local function finalizeAbortedSessionMetadata(session)
-    if DEVELOPMENT_MODE then
-        if not writeSessionMetadata(session, "aborted") then
-            discardSessionMetadata(session)
-        end
-    else
-        discardSessionMetadata(session)
+    if not writeSessionMetadata(session, "aborted") then
+        log("Metadata warning: aborted session could not be published; retaining existing files.")
     end
 end
 
@@ -1025,6 +1091,7 @@ local function observedCameraMetadata()
         math.abs(dot(forward, right)) < 0.02 and math.abs(dot(forward, up)) < 0.02 and
         math.abs(dot(right, up)) < 0.02
     local clampedForwardZ = math.max(-1.0, math.min(1.0, forward.z))
+    local diagnostics = activeCameraDiagnostics(cameraSystem)
     return {
         forward = forward,
         right = right,
@@ -1033,6 +1100,12 @@ local function observedCameraMetadata()
         verticalFov = fov,
         pitch = math.deg(math.asin(clampedForwardZ)),
         basisValid = basisValid,
+        cameraPosition = diagnostics.position,
+        projectionMatrix = diagnostics.projection,
+        viewMatrix = diagnostics.view,
+        viewportWidth = diagnostics.viewportWidth,
+        viewportHeight = diagnostics.viewportHeight,
+        viewportSource = diagnostics.viewportSource,
     }, nil
 end
 
@@ -1048,6 +1121,26 @@ local function logPoseMetadata(session, pose, observed)
         session.index, #session.plan.poses, pose.row, pose.column, pose.yaw, pose.pitch,
         f.x, f.y, f.z, r.x, r.y, r.z, u.x, u.y, u.z, observed.horizontalFov,
         observed.verticalFov, session.lastSettleSeconds, tostring(observed.basisValid), observed.pitch))
+    local cameraDisplacement = nil
+    if observed.cameraPosition ~= nil and session.referenceCameraPosition ~= nil then
+        local dx = observed.cameraPosition.x - session.referenceCameraPosition.x
+        local dy = observed.cameraPosition.y - session.referenceCameraPosition.y
+        local dz = observed.cameraPosition.z - session.referenceCameraPosition.z
+        cameraDisplacement = math.sqrt(dx * dx + dy * dy + dz * dz)
+    elseif observed.cameraPosition ~= nil then
+        session.referenceCameraPosition = observed.cameraPosition
+    end
+    if cameraDisplacement ~= nil then
+        devLog(string.format("POSE_CAMERA_DIAGNOSTIC index=%d displacement=%.9f", session.index,
+            cameraDisplacement))
+    elseif observed.cameraPosition == nil then
+        devLog(string.format("POSE_CAMERA_DIAGNOSTIC index=%d active camera position unavailable",
+            session.index))
+    end
+    if observed.projectionMatrix == nil or observed.viewMatrix == nil then
+        devLog(string.format(
+            "POSE_CAMERA_DIAGNOSTIC index=%d projection/view matrix unavailable", session.index))
+    end
     return {
         index = session.index,
         row = pose.row,
@@ -1059,6 +1152,15 @@ local function logPoseMetadata(session, pose, observed)
         right = observed.right,
         up = observed.up,
         settleSeconds = session.lastSettleSeconds,
+        cameraPosition = observed.cameraPosition,
+        cameraDisplacement = cameraDisplacement,
+        horizontalFov = observed.horizontalFov,
+        verticalFov = observed.verticalFov,
+        viewportWidth = observed.viewportWidth,
+        viewportHeight = observed.viewportHeight,
+        viewportSource = observed.viewportSource,
+        projectionMatrix = observed.projectionMatrix,
+        viewMatrix = observed.viewMatrix,
     }
 end
 
@@ -1431,6 +1533,14 @@ local function requestProductionScreenshot()
     if productionSession == nil or environmentSequence == nil then
         return
     end
+    local observed, observedError = observedCameraMetadata()
+    if observed == nil then
+        log("Production session cancelled: pre-screenshot camera readback failed: " .. tostring(observedError))
+        environmentSequence.restoreRequested = true
+        return
+    end
+    productionSession.pendingMetadata = logPoseMetadata(
+        productionSession, productionSession.plan.poses[productionSession.index], observed)
     local token = string.format("pano-%s-%03d", productionSession.sessionId, productionSession.index)
     local requestOk, requestError = writeBridgeRequest(
         productionSession.sessionId, productionSession.index, token)
@@ -1706,7 +1816,7 @@ registerForEvent("onUpdate", function(deltaTime)
                         productionSession.metadataFailed = true
                         completedProductionSession = false
                         log("Production session aborted: final metadata publication failed.")
-                        discardSessionMetadata(productionSession)
+                        finalizeAbortedSessionMetadata(productionSession)
                     end
                 else
                     finalizeAbortedSessionMetadata(productionSession)
