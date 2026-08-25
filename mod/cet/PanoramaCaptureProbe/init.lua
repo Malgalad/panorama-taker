@@ -1,4 +1,4 @@
-local MOD_VERSION = "0.1.59"
+local MOD_VERSION = "0.1.64"
 local DEVELOPMENT_MODE = false
 
 local function log(message)
@@ -21,6 +21,7 @@ log("reload verification marker v" .. MOD_VERSION)
 
 local environmentSequence = nil
 local productionSession = nil
+local destroyStandaloneCamera
 local pauseEventState = nil
 local hudRehideFrames = 0
 local bridgeSessionCounter = 0
@@ -28,7 +29,6 @@ local nativeSettings = nil
 local settingsDraftSettle = nil
 local settingsDraftScreenshotCooldown = nil
 local settingsDraftCaptureFov = nil
-local fovControlInstalled = false
 local nativeSettingsCaptureSummaryOption = nil
 local updateCaptureSummary = nil
 local bridgeCaptureRange = "unknown"
@@ -38,7 +38,6 @@ local SETTINGS_DEFAULTS = {
     settleSeconds = 1.0,
     screenshotCooldownSeconds = 3.1,
 }
-local FOV_APPLY_TIMEOUT_SECONDS = 2.0
 
 local function isFiniteNumber(value)
     return type(value) == "number" and value == value and value ~= math.huge and value ~= -math.huge
@@ -53,26 +52,17 @@ local captureConfig = {
     captureFov = nil,
     screenshotCooldownSeconds = SETTINGS_DEFAULTS.screenshotCooldownSeconds,
     screenshotAckTimeoutSeconds = 15.0,
-    calibrationFrames = 2,
-    pitchToleranceDegrees = 0.25,
-    maxPitchCorrections = 3,
     -- Release captures require true after installing PanoramaCaptureReShade.addon64.
     automatedScreenshots = true,
     bridgeDirectory = ".",
 }
+local STANDALONE_CAMERA_PATH = "base\\entities\\cameras\\simple_free_camera.ent"
+local CAMERA_SPAWN_TIMEOUT_SECONDS = 3.0
+local CAMERA_POSITION_TOLERANCE = 0.001
+local CAMERA_FOV_TOLERANCE_DEGREES = 0.05
+local CAMERA_PITCH_TOLERANCE_DEGREES = 0.25
+local CAMERA_YAW_TOLERANCE_DEGREES = 0.25
 
-local function displayFov(camera)
-    local ok, value = pcall(function() return camera:GetDisplayFOV() end)
-    if ok and isFiniteNumber(value) and value > 0 and value < 180 then
-        return value, nil
-    end
-    return nil, ok and "GetDisplayFOV returned an invalid value" or tostring(value)
-end
-
-local function detectFovControl()
-    local ok, version = pcall(function() return FovControl.Version() end)
-    return ok and type(version) == "string" and version ~= ""
-end
 
 local function savePersistentSettings()
     local settings = {
@@ -121,17 +111,22 @@ local function loadPersistentSettings()
         settings.screenshotCooldownSeconds <= 5.0 then
         captureConfig.screenshotCooldownSeconds = settings.screenshotCooldownSeconds
     end
-    if fovControlInstalled and isFiniteNumber(settings.captureFov) and
+    if isFiniteNumber(settings.captureFov) and
         settings.captureFov >= 30 and settings.captureFov <= 120 then
         captureConfig.captureFov = settings.captureFov
     end
 end
 
 local function nativeSettingsCaptureFovDefault()
-    local player = Game.GetPlayer()
-    local camera = player and player:GetFPPCameraComponent()
-    local value = camera and displayFov(camera)
-    return value or 90.0
+    local cameraSystem = Game.GetCameraSystem()
+    local ok, vertical, aspect = pcall(function()
+        return cameraSystem:GetActiveCameraFOV(), cameraSystem:GetAspectRatio()
+    end)
+    if ok and isFiniteNumber(vertical) and isFiniteNumber(aspect) and
+        vertical > 0 and vertical < 180 and aspect > 0 then
+        return math.deg(2.0 * math.atan(math.tan(math.rad(vertical) / 2.0) * aspect))
+    end
+    return 90.0
 end
 
 local function registerNativeSettings()
@@ -172,8 +167,7 @@ local function registerNativeSettings()
                     updateCaptureSummary()
                 end
         end, 2)
-        if fovControlInstalled then
-            nativeSettings.addRangeFloat(
+        nativeSettings.addRangeFloat(
                 "/PanoramaCapture/Capture", "Capture FoV",
                 "Optional display FoV override. Until changed, capture uses the active in-game FoV.",
                 30.0, 120.0, 1.0, "%.0f°", visibleCaptureFov, visibleCaptureFov,
@@ -185,7 +179,6 @@ local function registerNativeSettings()
                         updateCaptureSummary()
                     end
                 end, 3)
-        end
         nativeSettingsCaptureSummaryOption = nativeSettings.addCustom(
             "/PanoramaCapture/Capture", function(parent, option)
                 local text = inkText.new()
@@ -233,7 +226,7 @@ local function syncNativeSettings()
     if settingsDraftScreenshotCooldown ~= nil then
         captureConfig.screenshotCooldownSeconds = settingsDraftScreenshotCooldown
     end
-    if fovControlInstalled and settingsDraftCaptureFov ~= nil then
+    if settingsDraftCaptureFov ~= nil then
         captureConfig.captureFov = settingsDraftCaptureFov
     end
 end
@@ -261,18 +254,6 @@ local function configurationError()
     if not isFiniteNumber(captureConfig.screenshotAckTimeoutSeconds) or
         captureConfig.screenshotAckTimeoutSeconds < 1 or captureConfig.screenshotAckTimeoutSeconds > 60 then
         return "screenshotAckTimeoutSeconds must be a finite number in [1, 60]"
-    end
-    if not isFiniteNumber(captureConfig.calibrationFrames) or captureConfig.calibrationFrames < 1 or
-        captureConfig.calibrationFrames % 1 ~= 0 then
-        return "calibrationFrames must be a positive integer"
-    end
-    if not isFiniteNumber(captureConfig.pitchToleranceDegrees) or captureConfig.pitchToleranceDegrees <= 0 or
-        captureConfig.pitchToleranceDegrees > 10 then
-        return "pitchToleranceDegrees must be a finite number in (0, 10]"
-    end
-    if not isFiniteNumber(captureConfig.maxPitchCorrections) or captureConfig.maxPitchCorrections < 0 or
-        captureConfig.maxPitchCorrections % 1 ~= 0 then
-        return "maxPitchCorrections must be a non-negative integer"
     end
     if not DEVELOPMENT_MODE and captureConfig.automatedScreenshots ~= true then
         return "automatedScreenshots must remain true; manual mode is development-only"
@@ -378,6 +359,58 @@ end
 local function validVector(value)
     local ok, x, y, z = pcall(function() return value.x, value.y, value.z end)
     return ok and isFiniteNumber(x) and isFiniteNumber(y) and isFiniteNumber(z)
+end
+
+local function componentWorldPosition(component)
+    local okMatrix, matrix = pcall(function() return component:GetLocalToWorld() end)
+    if not okMatrix or matrix == nil then
+        return nil
+    end
+    local okPosition, position = pcall(function() return Matrix.GetTranslation(matrix) end)
+    if not okPosition or not validVector(position) then
+        okPosition, position = pcall(function()
+            return GetSingleton("Matrix"):GetTranslation(matrix)
+        end)
+    end
+    return okPosition and validVector(position) and position or nil
+end
+
+local function activeCameraPosition(cameraSystem, fallbackComponent)
+    local position = cameraDiagnosticCall(cameraSystem, "GetActiveCameraWorldPosition") or
+        cameraDiagnosticCall(cameraSystem, "GetActiveCameraPosition")
+    if validVector(position) then
+        return position
+    end
+    local okTransform, transform = pcall(function()
+        return cameraSystem:GetActiveCameraWorldTransform()
+    end)
+    if okTransform and transform ~= nil then
+        local okPosition, transformPosition = pcall(function()
+            return transform.position or transform:GetPosition()
+        end)
+        if okPosition and validVector(transformPosition) then
+            return transformPosition
+        end
+    end
+    return componentWorldPosition(fallbackComponent)
+end
+
+local function horizontalYaw(forward)
+    local x, y = forward.x, forward.y
+    local length = math.sqrt(x * x + y * y)
+    if length < 0.000001 then
+        return nil
+    end
+    if x > 0 then
+        return math.deg(math.atan(y / x))
+    elseif x < 0 then
+        return math.deg(math.atan(y / x) + (y >= 0 and math.pi or -math.pi))
+    end
+    return y >= 0 and 90.0 or -90.0
+end
+
+local function angularDifference(left, right)
+    return (left - right + 180.0) % 360.0 - 180.0
 end
 
 local function activeCameraDiagnostics(cameraSystem)
@@ -518,56 +551,16 @@ local function effectiveFov()
     if not okAspect or type(aspect) ~= "number" or aspect <= 0 then
         return nil, nil, "active aspect ratio unavailable"
     end
-    local horizontal = math.deg(2.0 * math.atan(math.tan(math.rad(vertical) / 2.0) * aspect))
+    local horizontal = captureConfig.captureFov
+    if horizontal ~= nil then
+        vertical = math.deg(2.0 * math.atan(math.tan(math.rad(horizontal) / 2.0) / aspect))
+    else
+        horizontal = math.deg(2.0 * math.atan(math.tan(math.rad(vertical) / 2.0) * aspect))
+    end
     if horizontal <= 0 or horizontal >= 180 then
         return nil, nil, "derived horizontal FoV is invalid"
     end
     return horizontal, vertical, nil
-end
-
-local function fovControlNativeCall(methodName)
-    return pcall(function() return FovControl[methodName]() end)
-end
-
-local function fovSchedulerActive(camera)
-    local ok, active = pcall(function() return camera:IsPendingSchedulerActive() end)
-    if not ok or type(active) ~= "boolean" then
-        return nil, ok and "PendingSetFOV returned an invalid state" or tostring(active)
-    end
-    return active, nil
-end
-
-local function cameraInternalFov(camera)
-    local ok, value = pcall(function() return camera:GetFOV() end)
-    if not ok or not isFiniteNumber(value) then
-        return nil, ok and "GetFOV returned an invalid value" or tostring(value)
-    end
-    return value, nil
-end
-
-local function setDisplayFov(camera, displayFov)
-    local patchingOk, patching = fovControlNativeCall("IsPatchingAllowed")
-    local lockedOk, locked = fovControlNativeCall("IsLocked")
-    if patchingOk and patching == true and lockedOk and locked == false then
-        local lockOk, lockResult = fovControlNativeCall("Lock")
-        if not lockOk or lockResult ~= true then
-            return false, "FOV Control lock failed: " .. tostring(lockResult)
-        end
-    elseif patchingOk and patching == true and (not lockedOk or locked ~= true) then
-        return false, "FOV Control lock state unavailable: " .. tostring(locked)
-    end
-    local okPending, pendingResult = pcall(function() return camera:PendingSetFOV() end)
-    if not okPending then
-        return false, "FOV Control PendingSetFOV unavailable: " .. tostring(pendingResult)
-    end
-    if pendingResult ~= true then
-        return false, "FOV Control PendingSetFOV refused: " .. tostring(pendingResult)
-    end
-    local okSet, setError = pcall(function() camera:SetDisplayFOV(displayFov) end)
-    if not okSet then
-        return false, "FOV Control SetDisplayFOV unavailable: " .. tostring(setError)
-    end
-    return true, nil
 end
 
 local function buildFullSpherePlan(horizontal, vertical, overlap, adaptiveYawGuard)
@@ -656,7 +649,7 @@ local function formatDuration(seconds)
 end
 
 local function previewCaptureFov()
-    if fovControlInstalled and isFiniteNumber(captureConfig.captureFov) then
+    if isFiniteNumber(captureConfig.captureFov) then
         return captureConfig.captureFov
     end
     return nativeSettingsCaptureFovDefault()
@@ -757,7 +750,7 @@ end
 local function hideCaptureMeshes(environment)
     local player = Game.GetPlayer()
     if player == nil or entityHash(player) ~= environment.playerHash then
-        return false, "player changed during environment probe"
+        return false, "player changed during capture"
     end
     for _, entity in ipairs(captureMeshEntities(player)) do
         local components = entity:GetComponents()
@@ -928,7 +921,7 @@ local function hasConflictingTimeDilation()
     for _, reason in ipairs({ "console", "consoleCommand", "pause", "radial" }) do
         local ok, active = pcall(function() return timeSystem:IsTimeDilationActive(reason) end)
         if ok and active then
-            log("Environment probe: conflicting time dilation is active for " .. reason)
+            log("Production session: conflicting time dilation is active for " .. reason)
             return true
         end
     end
@@ -1020,9 +1013,6 @@ local function restoreEnvironmentControls(environment)
             timeSystem:SetIgnoreTimeDilationOnLocalPlayerZero(false)
         end)
     end
-    if environment.fovOverrideAttempted and environment.originalDisplayFov ~= nil then
-        pcall(function() setDisplayFov(environment.camera, environment.originalDisplayFov) end)
-    end
 end
 
 local function photoModeActive()
@@ -1054,13 +1044,13 @@ local function captureBlockReason()
         return "player is mounted in a vehicle"
     end
 
-    local freeflyActive = false
-    local okFreefly = pcall(function()
-        freeflyActive = type(freefly) == "table" and type(freefly.runtimeData) == "table" and
-            freefly.runtimeData.active == true
+    local ammCameraActive = false
+    pcall(function()
+        ammCameraActive = AMM ~= nil and AMM.Director ~= nil and
+            AMM.Director.activeCamera ~= nil
     end)
-    if okFreefly and freeflyActive then
-        return "FreeFly is active; disable it before starting a panorama capture"
+    if ammCameraActive then
+        return "Appearance Menu Mod camera is active; deactivate it before starting a panorama capture"
     end
     return nil
 end
@@ -1164,98 +1154,28 @@ local function logPoseMetadata(session, pose, observed)
     }
 end
 
-local function applyPose(snapshot, yawDegrees)
-    Game.GetTeleportationFacility():Teleport(snapshot.player, snapshot.position,
-        EulerAngles.new(0, 0, yawDegrees))
-    snapshot.waitFrames = 2
+destroyStandaloneCamera = function(environment)
+    local standalone = environment.standaloneCamera
+    if standalone == nil then
+        return
+    end
+    if standalone.component ~= nil then
+        pcall(function() standalone.component:Deactivate(0, false) end)
+    end
+    if environment.playerCamera ~= nil then
+        pcall(function() environment.playerCamera:Activate() end)
+    end
+    if standalone.handle ~= nil then
+        pcall(function() standalone.handle:Dispose() end)
+    end
+    environment.standaloneCamera = nil
 end
 
-registerDevelopmentInput("panorama_capture_probe_environment", "Panorama: probe FPP capture environment", function(down)
-    if not down then
-        return
-    end
-
-    if environmentSequence ~= nil then
-        environmentSequence.restoreRequested = true
-        devLog("Environment probe: restore queued; release the camera after the next update.")
-        return
-    end
-    local configError = configurationError()
-    if configError ~= nil then
-        log("Environment probe cancelled: invalid configuration: " .. configError .. ".")
-        return
-    end
-    local blockReason = captureBlockReason()
-    if blockReason ~= nil then
-        log("Environment probe cancelled: " .. blockReason .. ".")
-        return
-    end
-    if photoModeActive() then
-        log("Environment probe requires normal FPP view; exit Photo Mode first.")
-        return
-    end
-
-    local player = Game.GetPlayer()
-    local cameraSystem = Game.GetCameraSystem()
-    local camera = player and player:GetFPPCameraComponent()
-    local playerHash = player and entityHash(player)
-    if player == nil or playerHash == nil or cameraSystem == nil or camera == nil then
-        log("Environment probe requires an active player, camera system, and FPP camera.")
-        return
-    end
-    local _, _, originalFovError = effectiveFov()
-    if originalFovError ~= nil then
-        log("Environment probe cancelled: " .. tostring(originalFovError) .. ".")
-        return
-    end
-    local originalDisplayFov = displayFov(camera)
-
-    local hud, hudError = snapshotHud()
-    if hud == nil then
-        log("Environment probe cancelled: " .. tostring(hudError))
-        return
-    end
-    local meshes, meshError = snapshotCaptureMeshes(player)
-    if meshes == nil then
-        log("Environment probe cancelled: " .. tostring(meshError))
-        return
-    end
-    local okOrientation, orientation = pcall(function() return camera:GetLocalOrientation() end)
-    if not okOrientation or orientation == nil then
-        log("Environment probe cancelled: FPP local orientation unavailable.")
-        return
-    end
-    local position = player:GetWorldPosition()
-    environmentSequence = {
-        camera = camera,
-        player = player,
-        playerHash = playerHash,
-        position = Vector4.new(position.x, position.y, position.z, position.w),
-        originalOrientation = orientation,
-        originalYaw = player:GetWorldYaw(),
-        originalDisplayFov = originalDisplayFov,
-        hud = hud,
-        meshes = meshes,
-        state = "applying",
-        waitFrames = 0,
-        settleElapsed = 0.0,
-        settleSecondsRequired = captureConfig.settleSeconds,
-        targetYaw = 45.0,
-        targetPitch = 15.0,
-        timeApplied = false,
-        restoreRequested = false,
-    }
-    local okControls, controlError = applyEnvironmentControls(environmentSequence)
-    if not okControls then
-        restoreEnvironmentControls(environmentSequence)
-        environmentSequence = nil
-        log("Environment probe cancelled: " .. tostring(controlError))
-        return
-    end
-    applyPose(environmentSequence, environmentSequence.originalYaw + environmentSequence.targetYaw)
-    environmentSequence.state = "rotated_pending"
-    devLog("Environment probe active; press the same hotkey to restore.")
-end)
+local function applyStandalonePose(environment, yawDegrees)
+    local angles = EulerAngles.new(0, environment.targetPitch, yawDegrees)
+    environment.standaloneCamera.component:SetLocalOrientation(angles:ToQuat())
+    environment.waitFrames = 2
+end
 
 local function beginProductionCapture(environment)
     local okControls, controlError = applyEnvironmentControls(environment)
@@ -1274,7 +1194,6 @@ local function beginProductionCapture(environment)
     local firstPose = plan.poses[1]
     environment.targetYaw = firstPose.yaw
     environment.targetPitch = firstPose.pitch
-    environment.pitchCommand = firstPose.pitch
     bridgeSessionCounter = bridgeSessionCounter + 1
     local sessionId = string.format("%d-%d", os.time(), bridgeSessionCounter)
     productionSession = {
@@ -1287,7 +1206,6 @@ local function beginProductionCapture(environment)
         screenshotCooldownSeconds = captureConfig.screenshotCooldownSeconds,
         screenshotAckTimeoutSeconds = captureConfig.screenshotAckTimeoutSeconds,
         lastSettleSeconds = 0.0,
-        pitchCorrection = 0.0,
         awaitingScreenshot = false,
         screenshotWaitElapsed = 0.0,
         screenshotCooldownRemaining = 0.0,
@@ -1305,8 +1223,35 @@ local function beginProductionCapture(environment)
         productionSession = nil
         return false, "initial metadata publication failed"
     end
-    applyPose(environment, environment.originalYaw + firstPose.yaw)
-    environment.state = "pitch_calibration_pending"
+    if exEntitySpawner == nil or type(exEntitySpawner.Spawn) ~= "function" then
+        discardSessionMetadata(productionSession)
+        productionSession = nil
+        return false, "Codeware exEntitySpawner is unavailable"
+    end
+    local cameraPosition = environment.initialCameraPosition
+    if cameraPosition == nil then
+        discardSessionMetadata(productionSession)
+        productionSession = nil
+        return false, "active gameplay-camera optical center is unavailable"
+    end
+    local transform = environment.player:GetWorldTransform()
+    transform:SetPosition(cameraPosition)
+    local spawnOk, entityID = pcall(function()
+        return exEntitySpawner.Spawn(STANDALONE_CAMERA_PATH, transform, "")
+    end)
+    if not spawnOk or entityID == nil then
+        discardSessionMetadata(productionSession)
+        productionSession = nil
+        return false, "standalone camera spawn failed"
+    end
+    environment.standaloneCamera = {
+        entityID = entityID,
+        handle = nil,
+        component = nil,
+        referencePosition = nil,
+        spawnElapsed = 0.0,
+    }
+    environment.state = "camera_spawn_pending"
     log(string.format("Production session started: %d poses, %dx%d, HFoV=%.3f VFoV=%.3f, adaptive yaw guard=%.1f%%.",
         #plan.poses, plan.columns, plan.rows, captureHorizontal, captureVertical,
         plan.adaptiveYawGuard * 100.0))
@@ -1330,15 +1275,24 @@ local function startProductionSession()
         return
     end
     if photoModeActive() then
-        log("Production session requires normal FPP view; exit Photo Mode first.")
+        log("Production session requires normal gameplay view; exit Photo Mode first.")
         return
     end
     local player = Game.GetPlayer()
     local cameraSystem = Game.GetCameraSystem()
-    local camera = player and player:GetFPPCameraComponent()
+    local playerCamera = player and player:GetFPPCameraComponent()
     local playerHash = player and entityHash(player)
-    if player == nil or playerHash == nil or cameraSystem == nil or camera == nil then
-        log("Production session requires an active player, camera system, and FPP camera.")
+    if player == nil or playerHash == nil or cameraSystem == nil or playerCamera == nil then
+        log("Production session requires an active player and gameplay camera.")
+        return
+    end
+    local initialCameraPosition = activeCameraPosition(cameraSystem, playerCamera)
+    local okForward, initialForward = pcall(function()
+        return cameraSystem:GetActiveCameraForward()
+    end)
+    local initialCameraYaw = okForward and initialForward and horizontalYaw(initialForward) or nil
+    if initialCameraPosition == nil or initialCameraYaw == nil then
+        log("Production session cancelled: active camera origin or heading is unavailable.")
         return
     end
     local hud, hudError = snapshotHud()
@@ -1351,54 +1305,26 @@ local function startProductionSession()
         log("Production session cancelled: " .. tostring(meshError))
         return
     end
-    local okOrientation, orientation = pcall(function() return camera:GetLocalOrientation() end)
-    if not okOrientation or orientation == nil then
-        log("Production session cancelled: FPP local orientation unavailable.")
-        return
-    end
     environmentSequence = {
-        camera = camera,
+        playerCamera = playerCamera,
+        initialCameraPosition = initialCameraPosition,
+        initialCameraYaw = initialCameraYaw,
         player = player,
         playerHash = playerHash,
         position = Vector4.new(player:GetWorldPosition().x, player:GetWorldPosition().y,
             player:GetWorldPosition().z, player:GetWorldPosition().w),
-        originalOrientation = orientation,
         originalYaw = player:GetWorldYaw(),
-        originalDisplayFov = displayFov(camera),
         hud = hud,
         meshes = meshes,
-        state = "fov_preflight",
+        state = "starting",
         waitFrames = 0,
         settleElapsed = 0.0,
         settleSecondsRequired = captureConfig.settleSeconds,
         targetYaw = 0.0,
         targetPitch = 0.0,
-        pitchCommand = 0.0,
-        pitchCorrections = 0,
-        pitchCorrectionPending = false,
         timeApplied = false,
         restoreRequested = false,
-        production = true,
     }
-    if fovControlInstalled and captureConfig.captureFov ~= nil then
-        local inputLocked, inputError = applyInputRestrictions(environmentSequence)
-        if not inputLocked then
-            restoreEnvironmentControls(environmentSequence)
-            environmentSequence = nil
-            log("Production session cancelled: " .. tostring(inputError))
-            return
-        end
-        environmentSequence.fovOverrideAttempted = true
-        environmentSequence.fovApplyElapsed = 0.0
-        environmentSequence.fovTarget = captureConfig.captureFov
-        local fovApplied, fovError = setDisplayFov(camera, captureConfig.captureFov)
-        if not fovApplied then
-            restoreEnvironmentControls(environmentSequence)
-            environmentSequence = nil
-            log("Production session cancelled: " .. tostring(fovError))
-        end
-        return
-    end
     local started, startError = beginProductionCapture(environmentSequence)
     if not started then
         restoreEnvironmentControls(environmentSequence)
@@ -1420,12 +1346,9 @@ local function queueNextProductionPose()
     local pose = productionSession.plan.poses[productionSession.index]
     environmentSequence.targetYaw = pose.yaw
     environmentSequence.targetPitch = pose.pitch
-    environmentSequence.pitchCommand = pose.pitch + productionSession.pitchCorrection
-    environmentSequence.pitchCorrections = 0
-    environmentSequence.pitchCorrectionPending = false
     environmentSequence.settleElapsed = 0.0
     environmentSequence.state = "rotated_pending"
-    applyPose(environmentSequence, environmentSequence.originalYaw + pose.yaw)
+    applyStandalonePose(environmentSequence, pose.yaw)
     devLog(string.format("Production pose %d/%d queued: row=%d column=%d yaw=%.3f pitch=%.3f.",
         productionSession.index, #productionSession.plan.poses,
         pose.row, pose.column, pose.yaw, pose.pitch))
@@ -1504,29 +1427,15 @@ local function abortEnvironment(reason)
     if environmentSequence == nil then
         return
     end
-    local wasProduction = productionSession ~= nil or environmentSequence.production == true
     discardBridgeFiles()
     if productionSession ~= nil then
         finalizeAbortedSessionMetadata(productionSession)
     end
+    destroyStandaloneCamera(environmentSequence)
     restoreEnvironmentControls(environmentSequence)
     environmentSequence = nil
     productionSession = nil
-    if wasProduction then
-        log("Production session aborted (" .. reason .. ").")
-    else
-        log("Environment probe: aborted (" .. reason .. ").")
-    end
-end
-
-local function restorePoseImmediately(environment)
-    pcall(function()
-        Game.GetTeleportationFacility():Teleport(environment.player, environment.position,
-            EulerAngles.new(0, 0, environment.originalYaw))
-    end)
-    pcall(function()
-        environment.camera:SetLocalOrientation(environment.originalOrientation)
-    end)
+    log("Production session aborted (" .. reason .. ").")
 end
 
 local function requestProductionScreenshot()
@@ -1536,6 +1445,38 @@ local function requestProductionScreenshot()
     local observed, observedError = observedCameraMetadata()
     if observed == nil then
         log("Production session cancelled: pre-screenshot camera readback failed: " .. tostring(observedError))
+        environmentSequence.restoreRequested = true
+        return
+    end
+    if environmentSequence.standaloneCamera ~= nil and
+        environmentSequence.standaloneCamera.handle ~= nil then
+        local positionOk, position = pcall(function()
+            return environmentSequence.standaloneCamera.handle:GetWorldPosition()
+        end)
+        if positionOk and validVector(position) then
+            observed.cameraPosition = position
+        end
+    end
+    if observed.cameraPosition == nil then
+        log("Production session cancelled: standalone camera position readback failed")
+        environmentSequence.restoreRequested = true
+        return
+    end
+    if math.abs(observed.horizontalFov - productionSession.horizontalFov) > CAMERA_FOV_TOLERANCE_DEGREES or
+        math.abs(observed.verticalFov - productionSession.verticalFov) > CAMERA_FOV_TOLERANCE_DEGREES then
+        log(string.format(
+            "Production session cancelled: standalone camera FoV mismatch (expected %.3fx%.3f, observed %.3fx%.3f)",
+            productionSession.horizontalFov, productionSession.verticalFov,
+            observed.horizontalFov, observed.verticalFov))
+        environmentSequence.restoreRequested = true
+        return
+    end
+    local reference = environmentSequence.standaloneCamera.referencePosition
+    local dx = observed.cameraPosition.x - reference.x
+    local dy = observed.cameraPosition.y - reference.y
+    local dz = observed.cameraPosition.z - reference.z
+    if math.sqrt(dx * dx + dy * dy + dz * dz) > CAMERA_POSITION_TOLERANCE then
+        log("Production session cancelled: standalone camera moved beyond position tolerance")
         environmentSequence.restoreRequested = true
         return
     end
@@ -1579,43 +1520,55 @@ registerForEvent("onUpdate", function(deltaTime)
             abortEnvironment("player changed or became unavailable during session transition")
             return
         end
-        if environmentSequence.state == "fov_preflight" then
+        if environmentSequence.state == "camera_spawn_pending" then
+            local standalone = environmentSequence.standaloneCamera
+            if standalone == nil then
+                abortEnvironment("standalone camera state is missing")
+                return
+            end
             if type(deltaTime) == "number" and deltaTime > 0 then
-                environmentSequence.fovApplyElapsed = environmentSequence.fovApplyElapsed + deltaTime
+                standalone.spawnElapsed = standalone.spawnElapsed + deltaTime
             end
-            local schedulerActive, schedulerError = fovSchedulerActive(environmentSequence.camera)
-            if schedulerActive == nil then
-                restoreEnvironmentControls(environmentSequence)
-                environmentSequence = nil
-                log("Production session cancelled: FOV Control scheduler unavailable: " .. tostring(schedulerError))
+            local handle = Game.FindEntityByID(standalone.entityID)
+            if handle ~= nil then
+                local componentOk, component = pcall(function()
+                    return handle:FindComponentByName("camera")
+                end)
+                if not componentOk then
+                    abortEnvironment("standalone camera component lookup failed")
+                    return
+                end
+                if component == nil then
+                    abortEnvironment("standalone camera component is unavailable")
+                    return
+                end
+                standalone.handle = handle
+                standalone.component = component
+                local positionOk, position = pcall(function() return handle:GetWorldPosition() end)
+                if not positionOk or not validVector(position) then
+                    abortEnvironment("standalone camera position readback failed")
+                    return
+                end
+                standalone.referencePosition = position
+                local fovOk = pcall(function() component:SetFOV(productionSession.verticalFov) end)
+                if not fovOk then
+                    abortEnvironment("standalone camera FoV assignment failed")
+                    return
+                end
+                environmentSequence.targetPitch = productionSession.plan.poses[1].pitch
+                local poseOk = pcall(function()
+                    applyStandalonePose(environmentSequence, productionSession.plan.poses[1].yaw)
+                    component:Activate(0, false)
+                end)
+                if not poseOk then
+                    abortEnvironment("standalone camera activation failed")
+                    return
+                end
+                environmentSequence.state = "rotated_pending"
                 return
             end
-            local observedFov, observedError = displayFov(environmentSequence.camera)
-            local componentFov, componentError = cameraInternalFov(environmentSequence.camera)
-            local _, activeFov, activeError = effectiveFov()
-            local fovApplied = not schedulerActive and observedFov ~= nil and componentFov ~= nil and
-                activeFov ~= nil and math.abs(observedFov - environmentSequence.fovTarget) <= 0.25 and
-                math.abs(activeFov - componentFov) <= 0.25
-            if not fovApplied and environmentSequence.fovApplyElapsed < FOV_APPLY_TIMEOUT_SECONDS then
-                return
-            end
-            if not fovApplied then
-                local targetFov = environmentSequence.fovTarget
-                restoreEnvironmentControls(environmentSequence)
-                environmentSequence = nil
-                log(string.format(
-                    "Production session cancelled: capture FoV did not apply (requested %.3f, observed %s; active %s; component %s).",
-                    targetFov,
-                    observedFov and string.format("%.3f", observedFov) or tostring(observedError),
-                    activeFov and string.format("%.3f", activeFov) or tostring(activeError),
-                    componentFov and string.format("%.3f", componentFov) or tostring(componentError)))
-                return
-            end
-            local started, startError = beginProductionCapture(environmentSequence)
-            if not started then
-                restoreEnvironmentControls(environmentSequence)
-                environmentSequence = nil
-                log("Production session cancelled: " .. tostring(startError))
+            if standalone.spawnElapsed >= CAMERA_SPAWN_TIMEOUT_SECONDS then
+                abortEnvironment("standalone camera spawn timed out")
             end
             return
         end
@@ -1681,118 +1634,71 @@ registerForEvent("onUpdate", function(deltaTime)
         end
         if environmentSequence.restoreRequested and environmentSequence.state ~= "restore_pending" and
             environmentSequence.state ~= "restore_correcting" then
-            applyPose(environmentSequence, environmentSequence.originalYaw)
             environmentSequence.state = "restore_pending"
             environmentSequence.waitFrames = 2
         elseif environmentSequence.waitFrames > 0 then
             environmentSequence.waitFrames = environmentSequence.waitFrames - 1
-        elseif environmentSequence.state == "pitch_calibration_pending" then
-            environmentSequence.camera:SetLocalOrientation(Quaternion.new(0, 0, 0, 1))
-            environmentSequence.state = "pitch_calibration_observing"
-            environmentSequence.waitFrames = captureConfig.calibrationFrames
-        elseif environmentSequence.state == "pitch_calibration_observing" then
-            local observed, observedError = observedCameraMetadata()
-            if observed == nil or not observed.basisValid then
-                log("Production session cancelled: initial pitch calibration failed: " ..
-                    tostring(observedError or "active camera basis is not orthonormal"))
-                environmentSequence.restoreRequested = true
-            elseif math.abs(observed.horizontalFov - productionSession.horizontalFov) > 0.5 then
-                log(string.format(
-                    "Production session cancelled: capture FoV did not apply (requested %.3f, observed %.3f).",
-                    productionSession.horizontalFov, observed.horizontalFov))
-                environmentSequence.restoreRequested = true
-            else
-                productionSession.pitchCorrection = -observed.pitch
-                environmentSequence.pitchCommand = environmentSequence.targetPitch +
-                    productionSession.pitchCorrection
-                environmentSequence.state = "rotated_pending"
-                log(string.format(
-                    "Production pitch calibration: zero-command observed=%.3f; offset=%.3f.",
-                    observed.pitch, productionSession.pitchCorrection))
-            end
         elseif environmentSequence.state == "rotated_pending" then
-            environmentSequence.camera:SetLocalOrientation(Quaternion.new(
-                math.sin(math.rad(environmentSequence.pitchCommand or environmentSequence.targetPitch) / 2.0),
-                0, 0,
-                math.cos(math.rad(environmentSequence.pitchCommand or environmentSequence.targetPitch) / 2.0)))
             local hidden, hideError = hideHud(environmentSequence)
             local meshesHidden, meshError = hideCaptureMeshes(environmentSequence)
             if not hidden or not meshesHidden then
-                log("Environment probe: transition re-hide failed: " .. tostring(hideError or meshError))
+                log("Production session cancelled: transition re-hide failed: " ..
+                    tostring(hideError or meshError))
                 environmentSequence.restoreRequested = true
                 environmentSequence.state = "active"
             else
                 environmentSequence.state = "settling"
                 environmentSequence.settleElapsed = 0.0
-                environmentSequence.settleSecondsRequired = productionSession and
-                    productionSession.settleSeconds or captureConfig.settleSeconds
+                environmentSequence.settleSecondsRequired = productionSession.settleSeconds
             end
         elseif environmentSequence.state == "settling" then
             if type(deltaTime) == "number" and deltaTime > 0 then
                 environmentSequence.settleElapsed = environmentSequence.settleElapsed + deltaTime
             end
             if environmentSequence.settleElapsed >= environmentSequence.settleSecondsRequired then
-                if environmentSequence.production then
-                    local observed, observedError = observedCameraMetadata()
-                    if observed == nil then
-                        log("Production session cancelled: " .. tostring(observedError))
+                local observed, observedError = observedCameraMetadata()
+                if observed == nil then
+                    log("Production session cancelled: " .. tostring(observedError))
+                    environmentSequence.restoreRequested = true
+                elseif not observed.basisValid then
+                    log("Production session cancelled: active camera basis is not orthonormal")
+                    environmentSequence.restoreRequested = true
+                else
+                    productionSession.lastSettleSeconds = environmentSequence.settleElapsed
+                    local pose = productionSession.plan.poses[productionSession.index]
+                    local pitchError = environmentSequence.targetPitch - observed.pitch
+                    local observedYaw = horizontalYaw(observed.forward)
+                    local expectedYaw = environmentSequence.initialCameraYaw + pose.yaw
+                    local yawError = observedYaw and angularDifference(expectedYaw, observedYaw) or nil
+                    if math.abs(pitchError) > CAMERA_PITCH_TOLERANCE_DEGREES then
+                        log(string.format(
+                            "Production session cancelled: pose %d pitch error %.3f exceeds %.3f tolerance.",
+                            productionSession.index, pitchError, CAMERA_PITCH_TOLERANCE_DEGREES))
                         environmentSequence.restoreRequested = true
-                    elseif not observed.basisValid then
-                        log("Production session cancelled: active camera basis is not orthonormal")
+                        environmentSequence.state = "active"
+                    elseif yawError == nil or math.abs(yawError) > CAMERA_YAW_TOLERANCE_DEGREES then
+                        log(string.format(
+                            "Production session cancelled: pose %d yaw error %s exceeds %.3f tolerance.",
+                            productionSession.index,
+                            yawError and string.format("%.3f", yawError) or "unavailable",
+                            CAMERA_YAW_TOLERANCE_DEGREES))
                         environmentSequence.restoreRequested = true
+                        environmentSequence.state = "active"
                     else
-                        productionSession.lastSettleSeconds = environmentSequence.settleElapsed
-                        local pose = productionSession.plan.poses[productionSession.index]
-                        local pitchError = environmentSequence.targetPitch - observed.pitch
-                        if math.abs(pitchError) > captureConfig.pitchToleranceDegrees then
-                            if environmentSequence.pitchCorrections >= captureConfig.maxPitchCorrections then
-                                log(string.format(
-                                    "Production session cancelled: pose %d pitch error %.3f exceeds %.3f tolerance after %d corrections.",
-                                    productionSession.index, pitchError,
-                                    captureConfig.pitchToleranceDegrees,
-                                    environmentSequence.pitchCorrections))
-                                environmentSequence.restoreRequested = true
-                                environmentSequence.state = "active"
+                        productionSession.pendingMetadata = logPoseMetadata(productionSession, pose, observed)
+                        if captureConfig.automatedScreenshots then
+                            if productionSession.screenshotCooldownRemaining > 0 then
+                                environmentSequence.state = "awaiting_screenshot_cooldown"
                             else
-                                environmentSequence.pitchCorrections =
-                                    environmentSequence.pitchCorrections + 1
-                                productionSession.pitchCorrection =
-                                    productionSession.pitchCorrection + pitchError
-                                environmentSequence.pitchCommand = environmentSequence.targetPitch +
-                                    productionSession.pitchCorrection
-                                environmentSequence.pitchCorrectionPending = true
-                                environmentSequence.state = "rotated_pending"
-                                devLog(string.format(
-                                    "Production pose %d pitch correction %d/%d: observed=%.3f target=%.3f command=%.3f.",
-                                    productionSession.index, environmentSequence.pitchCorrections,
-                                    captureConfig.maxPitchCorrections, observed.pitch,
-                                    environmentSequence.targetPitch, environmentSequence.pitchCommand))
+                                requestProductionScreenshot()
                             end
-                        elseif environmentSequence.pitchCorrectionPending then
-                            environmentSequence.pitchCorrectionPending = false
-                            environmentSequence.settleSecondsRequired = productionSession.settleSeconds
-                            environmentSequence.settleElapsed = 0.0
-                            environmentSequence.state = "settling"
                         else
-                            productionSession.pendingMetadata = logPoseMetadata(productionSession, pose, observed)
-                            if captureConfig.automatedScreenshots then
-                                if productionSession.screenshotCooldownRemaining > 0 then
-                                    environmentSequence.state = "awaiting_screenshot_cooldown"
-                                else
-                                    requestProductionScreenshot()
-                                end
-                            else
-                                devLog(string.format(
-                                    "Production pose ready: %d/%d; capture screenshot, then advance.",
-                                    productionSession.index, #productionSession.plan.poses))
-                                environmentSequence.state = "active"
-                            end
+                            devLog(string.format(
+                                "Production pose ready: %d/%d; capture screenshot, then advance.",
+                                productionSession.index, #productionSession.plan.poses))
+                            environmentSequence.state = "active"
                         end
                     end
-                else
-                    devLog(string.format("Environment probe settled: settle_seconds=%.3f",
-                        environmentSequence.settleElapsed))
-                    environmentSequence.state = "active"
                 end
             end
         elseif environmentSequence.state == "awaiting_screenshot_cooldown" then
@@ -1800,11 +1706,10 @@ registerForEvent("onUpdate", function(deltaTime)
                 requestProductionScreenshot()
             end
         elseif environmentSequence.state == "restore_pending" then
-            environmentSequence.camera:SetLocalOrientation(environmentSequence.originalOrientation)
+            destroyStandaloneCamera(environmentSequence)
             environmentSequence.waitFrames = 2
             environmentSequence.state = "restore_correcting"
         elseif environmentSequence.state == "restore_correcting" then
-            local wasProductionSession = productionSession ~= nil
             local completedProductionSession = false
             if productionSession ~= nil then
                 local completed = not productionSession.metadataFailed and
@@ -1828,10 +1733,8 @@ registerForEvent("onUpdate", function(deltaTime)
             productionSession = nil
             if completedProductionSession then
                 log("Production session completed.")
-            elseif wasProductionSession then
-                log("Production session aborted.")
             else
-                devLog("Environment probe: complete.")
+                log("Production session aborted.")
             end
         end
     end
@@ -1839,7 +1742,6 @@ registerForEvent("onUpdate", function(deltaTime)
 end)
 
 registerForEvent("onInit", function()
-    fovControlInstalled = detectFovControl()
     loadPersistentSettings()
     refreshBridgeCaptureRange()
     registerNativeSettings()
@@ -1877,7 +1779,6 @@ end)
 
 registerForEvent("onShutdown", function()
     if environmentSequence ~= nil then
-        restorePoseImmediately(environmentSequence)
         abortEnvironment("CET shutdown/reload")
     end
 end)

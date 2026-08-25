@@ -33,7 +33,7 @@ The CET capture environment must:
 
 - apply a uniquely named time dilation near zero and remove only that dilation on restore;
 - keep CET/camera updates responsive while the world is frozen;
-- apply reversible `NoMovement` and `NoCameraControl` restrictions while capture is active so manual screenshots cannot be invalidated by accidental input; document their non-ownership-aware interaction with FreeFly and similar mods;
+- apply reversible `NoMovement` and `NoCameraControl` restrictions while capture is active so screenshots cannot be invalidated by accidental input; the standalone-camera path is verified to work while FreeFly remains active;
 - snapshot the `inkHUDLayer` widget opacities, hide the layer's children during capture, and restore the exact saved values;
 - reapply HUD hiding at capture transitions so newly created HUD children cannot appear in later frames;
 - snapshot every player and active-weapon mesh component's enabled state, disable both renderers during capture, and restore the exact saved states;
@@ -997,11 +997,9 @@ mod retains its built-in defaults and capture remains usable.
 
 When present, register a `Panorama Capture` tab and `Capture` subcategory with:
 
-- `Capture FoV`: optional 30–120 degree display-FoV override. Until the slider
-  is changed, capture planning uses the active in-game FPP FoV without an
-  override. This requires the separately installed first-party FOV Control
-  RED4ext helper when an override is selected; hide this control entirely when
-  that helper is absent.
+- `Capture FoV`: optional 30–120 degree FoV applied directly to the standalone
+  capture camera. Until the slider is changed, capture planning uses the active
+  in-game FoV without an override; no FOV Control helper is required.
 - `Settling delay`: 0.1–3.0 seconds, step 0.1, default 1.0. It is the time
   after a verified camera move and before a screenshot request, for temporal
   accumulation; it does not delay pitch-correction attempts.
