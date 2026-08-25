@@ -279,6 +279,28 @@ def _linear_to_srgb(value: FloatImage) -> FloatImage:
     ).astype(np.float32)
 
 
+def _rec2020_to_srgb_linear(value: FloatImage) -> FloatImage:
+    matrix = np.array(
+        (
+            (1.660491, -0.587641, -0.072850),
+            (-0.124550, 1.132900, -0.008349),
+            (-0.018151, -0.100579, 1.118730),
+        ),
+        dtype=np.float32,
+    )
+    return np.asarray(value @ matrix.T, dtype=np.float32)
+
+
+def _tone_map_rec2020_to_srgb(linear: FloatImage, reference_white_nits: float) -> FloatImage:
+    relative = np.maximum(linear, 0.0) * np.float32(10000.0 / reference_white_nits)
+    luminance = relative @ np.array((0.2627, 0.6780, 0.0593), dtype=np.float32)
+    mapped_luminance = luminance / (1.0 + luminance)
+    scale = np.zeros_like(luminance, dtype=np.float32)
+    np.divide(mapped_luminance, luminance, out=scale, where=luminance > 0.0)
+    mapped = relative * scale[..., np.newaxis]
+    return _rec2020_to_srgb_linear(mapped)
+
+
 def _png_encoding(path: Path) -> ImageEncoding:
     chunks = _png_chunks(path)
     header = chunks.get(b"IHDR")
@@ -409,8 +431,7 @@ def _write_exr(path: Path, image: FloatImage, _encoding: ImageEncoding) -> None:
 def _to_sdr_srgb(rows: FloatImage, encoding: ImageEncoding) -> FloatImage:
     linear = np.maximum(rows, 0.0)
     if encoding.transfer_function == "pq":
-        linear = linear * np.float32(10000.0 / encoding.reference_white_nits)
-        linear = linear / (1.0 + linear)
+        linear = _tone_map_rec2020_to_srgb(linear, encoding.reference_white_nits)
     return np.clip(_linear_to_srgb(linear), 0.0, 1.0)
 
 

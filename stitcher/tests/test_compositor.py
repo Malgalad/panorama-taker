@@ -20,6 +20,8 @@ from pano_stitch.compositor import (
     _output_dimensions,
     _pq_to_linear,
     _probe_source,
+    _rec2020_to_srgb_linear,
+    _to_sdr_srgb,
     _write_exr,
     estimate_render_resources,
     render_session,
@@ -189,6 +191,27 @@ def test_pq_decoder_preserves_hdr_domain() -> None:
     assert decoded[0] == 0.0
     assert 0.0 < decoded[1] < 1.0
     assert decoded[2] == pytest.approx(1.0, abs=1e-6)
+
+
+def test_rec2020_to_srgb_linear_preserves_neutral_axis() -> None:
+    neutral = np.full((1, 1, 3), 0.25, dtype=np.float32)
+    converted = _rec2020_to_srgb_linear(neutral)
+
+    np.testing.assert_allclose(converted, neutral, atol=2e-6)
+
+
+def test_hdr_sdr_conversion_preserves_saturated_highlight_chroma() -> None:
+    linear_rec2020 = np.array([[[0.02, 0.005, 0.001]]], dtype=np.float32)
+    converted = _to_sdr_srgb(
+        linear_rec2020, ImageEncoding("uint16", "rec2020", "pq", 203.0)
+    )
+    old_relative = linear_rec2020 * np.float32(10000.0 / 203.0)
+    old_converted = compositor._linear_to_srgb(old_relative / (1.0 + old_relative))
+
+    def saturation(rgb: np.ndarray) -> float:
+        return float((rgb.max() - rgb.min()) / rgb.max())
+
+    assert saturation(converted[0, 0]) > saturation(old_converted[0, 0])
 
 
 def test_exposure_solver_recovers_relative_sdr_gain(tmp_path: Path) -> None:
