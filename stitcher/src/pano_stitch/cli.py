@@ -72,10 +72,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     render.add_argument("--blend", choices=("hard", "feather"), default="hard")
     render.add_argument(
-        "--histogram-normalization",
+        "--auto-contrast",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="normalize the final image histogram (default: enabled)",
+        help="apply Photoshop-style final SDR auto contrast (default: enabled)",
     )
     render.add_argument(
         "--jpeg-quality",
@@ -147,7 +147,7 @@ def main() -> None:
                 arguments.debug_coverage,
                 jpeg_quality=arguments.jpeg_quality,
                 workers=arguments.workers or None,
-                histogram_normalization=arguments.histogram_normalization,
+                auto_contrast=arguments.auto_contrast,
             )
             print(file=sys.stderr)
             gains = ", ".join(f"{gain:.3f}" for gain in exposure_report.gains)
@@ -155,8 +155,10 @@ def main() -> None:
                 f"exposure normalization: anchor={exposure_report.anchor_frame + 1}, "
                 f"overlap edges={exposure_report.edge_count}, relative exposure estimates=[{gains}]"
             )
-            histogram_state = "enabled" if arguments.histogram_normalization else "disabled"
-            print(f"histogram normalization: {histogram_state}")
+            state = "enabled" if arguments.auto_contrast else "disabled"
+            if arguments.output.suffix.lower() == ".exr":
+                state = "skipped for EXR"
+            print(f"auto contrast: {state}")
             print(f"wrote {arguments.output}")
         else:
             print(f"valid session: {session.session_id}")

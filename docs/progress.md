@@ -463,14 +463,6 @@ is invariant, and serial/parallel output remains deterministic. Also exercise
 rejection of near-black, clipped, high-gradient, non-finite, and high-MAD
 overlap samples plus the existing disconnected-graph failure.
 
-Final histogram normalization (2026-08-25): implemented as a default-on,
-global log-luminance histogram equalization pass over the finished composite,
-after blending and coverage handling. It streams disk-backed output strips,
-uses a compact 1024-bin histogram/LUT, preserves RGB channel ratios and
-unbounded linear EXR values, and supports `--no-histogram-normalization` plus
-the GUI advanced checkbox. The option is included in render reports and has
-regression coverage for monotonicity and chroma preservation.
-
 Exposure-local compensation implementation (2026-08-25): renders now build a
 disk-backed per-output-pixel exposure field from geometric feather weights and
 apply only `exp(frame_log_gain - local_exposure)` to valid linear samples. The
@@ -479,3 +471,11 @@ therefore retain their original exposure while overlaps transition smoothly.
 The resource estimate includes the additional float map, OpenCV remap limits
 remain handled, and overlap estimation now rejects clipped/high-gradient
 samples and high-MAD edges. Focused stitcher tests and mypy pass (35 tests).
+
+Final Auto contrast implementation (2026-08-25): the rejected default
+histogram equalization has been removed. The stitcher now applies a shared RGB
+levels stretch to finalized SDR output using bounded strip passes, with
+default-on CLI/GUI controls, five phase-local progress stages, cancellation
+cleanup, and regression coverage. EXR remains unchanged because a Photoshop-
+style level-255 white point is undefined for scene-linear HDR. The detailed
+contract and implementation notes are in `docs/auto-contrast.md`.
