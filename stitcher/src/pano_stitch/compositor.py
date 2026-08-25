@@ -32,6 +32,10 @@ _RESERVED_RUNTIME_BYTES = 192 * 1024 * 1024
 _TILE_BYTES_PER_PIXEL = 164
 _MAX_AUTO_WORKERS = 8
 _EXPOSURE_FIELD_SCALE = 4
+_HISTOGRAM_BINS = 1024
+_HISTOGRAM_COARSE_BINS = 16384
+_HISTOGRAM_LOWER_PERCENTILE = 0.001
+_HISTOGRAM_UPPER_PERCENTILE = 0.999
 
 
 @dataclass(frozen=True)
@@ -675,6 +679,142 @@ def _local_exposure_rows(
     return sampled if sampled.ndim == 2 else sampled[..., 0]
 
 
+def _histogram_valid_luminance(color: FloatImage, weight: FloatImage) -> FloatImage:
+    luminance = _exposure_luminance(color)
+    valid = (weight > 0.0) & np.isfinite(luminance) & (luminance > np.float32(1e-5))
+    return np.log2(np.maximum(luminance[valid], np.float32(1e-5)))
+
+
+def _final_histogram(
+    color_scratch: FloatImage,
+    weight_scratch: FloatImage,
+    output_height: int,
+    strip_height: int,
+    cancel_event: Event | None,
+) -> tuple[NDArray[np.float32], float, float] | None:
+    """Collect a bounded final-image log-luminance histogram."""
+
+    minimum = float("inf")
+    maximum = float("-inf")
+    for row_start in range(0, output_height, strip_height):
+        if cancel_event is not None and cancel_event.is_set():
+            raise RenderCancelledError("render cancelled")
+        rows = min(strip_height, output_height - row_start)
+        values = _histogram_valid_luminance(
+            color_scratch[row_start : row_start + rows],
+            weight_scratch[row_start : row_start + rows],
+        )
+        if values.size:
+            minimum = min(minimum, float(np.min(values)))
+            maximum = max(maximum, float(np.max(values)))
+    if not np.isfinite(minimum) or not np.isfinite(maximum):
+        return None
+    if maximum - minimum < 1e-6:
+        minimum -= 1.0
+        maximum += 1.0
+
+    coarse_histogram = np.zeros(_HISTOGRAM_COARSE_BINS, dtype=np.float64)
+    for row_start in range(0, output_height, strip_height):
+        if cancel_event is not None and cancel_event.is_set():
+            raise RenderCancelledError("render cancelled")
+        rows = min(strip_height, output_height - row_start)
+        values = _histogram_valid_luminance(
+            color_scratch[row_start : row_start + rows],
+            weight_scratch[row_start : row_start + rows],
+        )
+        if values.size:
+            counts, _ = np.histogram(
+                values,
+                bins=_HISTOGRAM_COARSE_BINS,
+                range=(minimum, maximum),
+            )
+            coarse_histogram += counts
+
+    cumulative = np.cumsum(coarse_histogram)
+    total = int(cumulative[-1])
+    if total == 0:
+        return None
+    edges = np.linspace(minimum, maximum, _HISTOGRAM_COARSE_BINS + 1, dtype=np.float64)
+    lower_index = int(np.searchsorted(cumulative, total * _HISTOGRAM_LOWER_PERCENTILE))
+    upper_index = int(np.searchsorted(cumulative, total * _HISTOGRAM_UPPER_PERCENTILE))
+    lower_index = min(max(lower_index, 0), _HISTOGRAM_COARSE_BINS - 1)
+    upper_index = min(max(upper_index, 0), _HISTOGRAM_COARSE_BINS - 1)
+    minimum = float(edges[lower_index])
+    maximum = float(edges[upper_index + 1])
+    minimum_span = max(
+        1e-6,
+        float(np.finfo(np.float32).eps) * max(1.0, abs(minimum), abs(maximum)) * _HISTOGRAM_BINS,
+    )
+    if maximum - minimum < minimum_span:
+        midpoint = (minimum + maximum) / 2.0
+        minimum = midpoint - 1.0
+        maximum = midpoint + 1.0
+
+    histogram = np.zeros(_HISTOGRAM_BINS, dtype=np.float32)
+    for row_start in range(0, output_height, strip_height):
+        if cancel_event is not None and cancel_event.is_set():
+            raise RenderCancelledError("render cancelled")
+        rows = min(strip_height, output_height - row_start)
+        values = _histogram_valid_luminance(
+            color_scratch[row_start : row_start + rows],
+            weight_scratch[row_start : row_start + rows],
+        )
+        if values.size:
+            values = values[(values >= minimum) & (values <= maximum)]
+            if values.size:
+                counts, _ = np.histogram(values, bins=_HISTOGRAM_BINS, range=(minimum, maximum))
+                histogram += counts.astype(np.float32)
+    return histogram, minimum, maximum
+
+
+def _normalize_final_histogram(
+    color_scratch: FloatImage,
+    weight_scratch: FloatImage,
+    output_height: int,
+    strip_height: int,
+    histogram: NDArray[np.float32],
+    minimum: float,
+    maximum: float,
+    cancel_event: Event | None,
+) -> None:
+    total = float(np.sum(histogram))
+    if total <= 0.0:
+        return
+    cdf = np.cumsum(histogram, dtype=np.float64) / total
+    cdf = np.maximum.accumulate(cdf)
+    centers = np.linspace(minimum, maximum, histogram.size, dtype=np.float32)
+    target_log_luminance = minimum + cdf * (maximum - minimum)
+    left_slope = float(
+        (target_log_luminance[1] - target_log_luminance[0]) / (centers[1] - centers[0])
+    )
+    right_slope = float(
+        (target_log_luminance[-1] - target_log_luminance[-2]) / (centers[-1] - centers[-2])
+    )
+    for row_start in range(0, output_height, strip_height):
+        if cancel_event is not None and cancel_event.is_set():
+            raise RenderCancelledError("render cancelled")
+        rows = min(strip_height, output_height - row_start)
+        color = color_scratch[row_start : row_start + rows]
+        weight = weight_scratch[row_start : row_start + rows]
+        valid = (weight > 0.0) & np.isfinite(color).all(axis=-1)
+        luminance = _exposure_luminance(color)
+        valid &= np.isfinite(luminance) & (luminance > np.float32(1e-5))
+        if np.any(valid):
+            log_luminance = np.log2(np.maximum(luminance[valid], np.float32(1e-5)))
+            target_log = np.interp(log_luminance, centers, target_log_luminance).astype(np.float32)
+            below = log_luminance < centers[0]
+            above = log_luminance > centers[-1]
+            target_log[below] = target_log_luminance[0] + (
+                log_luminance[below] - centers[0]
+            ) * left_slope
+            target_log[above] = target_log_luminance[-1] + (
+                log_luminance[above] - centers[-1]
+            ) * right_slope
+            target = np.exp2(target_log)
+            scale = target / luminance[valid]
+            color[valid] *= scale[:, np.newaxis]
+
+
 def _close_scratch_memmap(array: Any) -> None:
     """Flush and release a scratch mapping before Windows deletes its backing file."""
 
@@ -781,6 +921,7 @@ def render_session(
     cancel_event: Event | None = None,
     jpeg_quality: int = 95,
     workers: int | None = None,
+    histogram_normalization: bool = True,
 ) -> ExposureReport:
     """Render one session with bounded RAM and disk-backed strip accumulators."""
 
@@ -815,11 +956,13 @@ def render_session(
     exposure_strips = (exposure_height + exposure_strip_height - 1) // exposure_strip_height
     exposure_work = len(session.frames)
     local_exposure_work = (len(session.frames) + 1) * exposure_strips
+    histogram_work = 3 * composite_strips if histogram_normalization else 0
     total_work = (
         exposure_work
         + local_exposure_work
         + len(session.frames) * composite_strips
         + composite_strips
+        + histogram_work
     )
     completed_work = exposure_work
     latitude_span = (
@@ -976,6 +1119,52 @@ def render_session(
                     finally:
                         del source
 
+            for row_start in range(0, output_height, strip_height):
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RenderCancelledError("render cancelled")
+                rows = min(strip_height, output_height - row_start)
+                color_rows = color_scratch[row_start : row_start + rows]
+                weight_rows = weight_scratch[row_start : row_start + rows]
+                covered = weight_rows > 0.0
+                if blend == "feather":
+                    color_rows[covered] /= weight_rows[covered, np.newaxis]
+                uncovered = int(np.count_nonzero(~covered))
+                if uncovered and not allow_incomplete:
+                    raise ValueError(f"capture does not cover {uncovered} output pixels")
+                if uncovered and allow_incomplete:
+                    color_rows[~covered] = np.array((1.0, 0.0, 1.0), dtype=np.float32)
+                if histogram_normalization:
+                    completed_work += 1
+                    if progress_callback is not None:
+                        progress_callback(completed_work, total_work, "histogram normalization")
+
+            if histogram_normalization:
+                histogram_result = _final_histogram(
+                    color_scratch,
+                    weight_scratch,
+                    output_height,
+                    strip_height,
+                    cancel_event,
+                )
+                completed_work += composite_strips
+                if progress_callback is not None:
+                    progress_callback(completed_work, total_work, "histogram normalization")
+                if histogram_result is not None:
+                    histogram, histogram_min, histogram_max = histogram_result
+                    _normalize_final_histogram(
+                        color_scratch,
+                        weight_scratch,
+                        output_height,
+                        strip_height,
+                        histogram,
+                        histogram_min,
+                        histogram_max,
+                        cancel_event,
+                    )
+                completed_work += composite_strips
+                if progress_callback is not None:
+                    progress_callback(completed_work, total_work, "histogram normalization")
+
             temporary_path = _temporary_output_path(output_path)
             temporary_coverage_path = (
                 _temporary_output_path(debug_coverage_path)
@@ -1016,15 +1205,6 @@ def render_session(
                             covered = weight_rows > 0.0
                             if coverage_writer is not None:
                                 coverage_writer.write(covered)
-                            if blend == "feather":
-                                color_rows[covered] /= weight_rows[covered, np.newaxis]
-                            uncovered = int(np.count_nonzero(~covered))
-                            if uncovered and not allow_incomplete:
-                                raise ValueError(
-                                    f"capture does not cover {uncovered} output pixels"
-                                )
-                            if uncovered and allow_incomplete:
-                                color_rows[~covered] = np.array((1.0, 0.0, 1.0), dtype=np.float32)
                             writer.write(color_rows)
                             completed_work += 1
                             if progress_callback is not None:

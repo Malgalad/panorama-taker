@@ -14,8 +14,10 @@ from pano_stitch.compositor import (
     _choose_strip_height,
     _estimate_exposure_gains,
     _exposure_clipped,
+    _final_histogram,
     _local_exposure_multiplier,
     _local_exposure_rows,
+    _normalize_final_histogram,
     _output_dimensions,
     _pq_to_linear,
     _probe_source,
@@ -116,7 +118,9 @@ def test_full_sphere_render_has_coverage_and_expected_directions(tmp_path: Path)
 
     validate_images(session, tmp_path)
     output_path = tmp_path / "panorama.png"
-    render_session(session, tmp_path, output_path, width=64, blend="hard")
+    render_session(
+        session, tmp_path, output_path, width=64, blend="hard", histogram_normalization=False
+    )
 
     with Image.open(output_path) as output_image:
         result = np.asarray(output_image.convert("RGB"))
@@ -243,6 +247,45 @@ def test_local_exposure_rows_use_exact_non_divisible_output_ratio() -> None:
     bottom = _local_exposure_rows(field, 600, 17, output_width, output_height)
 
     assert np.allclose(bottom, expanded[600:617], atol=1e-4)
+
+
+def test_final_histogram_normalization_is_monotonic_and_chroma_preserving() -> None:
+    color = np.zeros((4, 8, 3), dtype=np.float32)
+    values = np.linspace(0.02, 4.0, 32, dtype=np.float32).reshape((4, 8))
+    color[..., 0] = values
+    color[..., 1] = values * 0.5
+    color[..., 2] = values * 0.25
+    weight = np.ones((4, 8), dtype=np.float32)
+    result = _final_histogram(color, weight, 4, 2, None)
+    assert result is not None
+    histogram, minimum, maximum = result
+    _normalize_final_histogram(color, weight, 4, 2, histogram, minimum, maximum, None)
+    luminance = compositor._exposure_luminance(color)
+    assert np.all(np.diff(luminance.ravel()) >= 0.0)
+    assert np.allclose(color[..., 1] / color[..., 0], 0.5, atol=1e-5)
+    assert np.allclose(color[..., 2] / color[..., 0], 0.25, atol=1e-5)
+
+
+def test_final_histogram_uses_robust_hdr_bounds_and_extrapolates() -> None:
+    color = np.ones((8, 128, 3), dtype=np.float32)
+    color[0, 0] = np.float32(1e12)
+    weight = np.ones((8, 128), dtype=np.float32)
+
+    result = _final_histogram(color, weight, 8, 2, None)
+
+    assert result is not None
+    histogram, minimum, maximum = result
+    assert maximum < 2.0
+    _normalize_final_histogram(color, weight, 8, 2, histogram, minimum, maximum, None)
+    assert np.isfinite(color).all()
+    assert float(color[0, 0, 0]) > 1.0
+
+
+def test_final_histogram_skips_all_dark_output() -> None:
+    color = np.zeros((4, 8, 3), dtype=np.float32)
+    weight = np.ones((4, 8), dtype=np.float32)
+
+    assert _final_histogram(color, weight, 4, 2, None) is None
 
 
 def test_4k_source_uses_bounded_output_strips() -> None:

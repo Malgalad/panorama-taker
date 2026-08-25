@@ -72,6 +72,12 @@ def _parser() -> argparse.ArgumentParser:
     )
     render.add_argument("--blend", choices=("hard", "feather"), default="hard")
     render.add_argument(
+        "--histogram-normalization",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="normalize the final image histogram (default: enabled)",
+    )
+    render.add_argument(
         "--jpeg-quality",
         type=int,
         default=95,
@@ -141,6 +147,7 @@ def main() -> None:
                 arguments.debug_coverage,
                 jpeg_quality=arguments.jpeg_quality,
                 workers=arguments.workers or None,
+                histogram_normalization=arguments.histogram_normalization,
             )
             print(file=sys.stderr)
             gains = ", ".join(f"{gain:.3f}" for gain in exposure_report.gains)
@@ -148,6 +155,8 @@ def main() -> None:
                 f"exposure normalization: anchor={exposure_report.anchor_frame + 1}, "
                 f"overlap edges={exposure_report.edge_count}, relative exposure estimates=[{gains}]"
             )
+            histogram_state = "enabled" if arguments.histogram_normalization else "disabled"
+            print(f"histogram normalization: {histogram_state}")
             print(f"wrote {arguments.output}")
         else:
             print(f"valid session: {session.session_id}")

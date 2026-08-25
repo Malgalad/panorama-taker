@@ -68,6 +68,7 @@ class StitcherApp:
             self.session_dir_var.set(self._display_path(settings.get("session_dir", "")))
             self.image_dir_var.set(self._display_path(settings.get("image_dir", "")))
             self.output_dir_var.set(self._display_path(settings.get("output_dir", "")))
+            self.histogram_normalization_var.set(settings.get("histogram_normalization", True))
         except (OSError, ValueError):
             pass
 
@@ -82,6 +83,7 @@ class StitcherApp:
                         "session_dir": self.session_dir_var.get(),
                         "image_dir": self.image_dir_var.get(),
                         "output_dir": self.output_dir_var.get(),
+                        "histogram_normalization": self.histogram_normalization_var.get(),
                     },
                     indent=2,
                 ),
@@ -132,6 +134,7 @@ class StitcherApp:
         self.workers_var = tk.StringVar(value="Auto")
         self.allow_incomplete_var = tk.BooleanVar(value=False)
         self.coverage_var = tk.BooleanVar(value=False)
+        self.histogram_normalization_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="Choose a capture JSON and screenshots directory.")
 
     def _build_widgets(self) -> None:
@@ -241,6 +244,11 @@ class StitcherApp:
         ttk.Checkbutton(
             self.advanced_frame, text="Write coverage diagnostic PNG", variable=self.coverage_var
         ).grid(row=7, column=1, sticky="w", padx=6, pady=3)
+        ttk.Checkbutton(
+            self.advanced_frame,
+            text="Histogram normalization",
+            variable=self.histogram_normalization_var,
+        ).grid(row=8, column=1, sticky="w", padx=6, pady=3)
 
         actions = ttk.Frame(self.root)
         actions.pack(fill="x", padx=12, pady=8)
@@ -518,12 +526,15 @@ class StitcherApp:
                 self._cancel_event,
                 self.jpeg_quality_var.get(),
                 workers,
+                self.histogram_normalization_var.get(),
             )
             LOGGER.info("render completed: %s", output_path)
             self._events.put(
                 (
                     "success",
-                    f"Wrote {output_path} (exposure edges: {exposure_report.edge_count})",
+                    f"Wrote {output_path} (exposure edges: {exposure_report.edge_count}; "
+                    f"histogram normalization: "
+                    f"{'enabled' if self.histogram_normalization_var.get() else 'disabled'})",
                 )
             )
         except RenderCancelledError:

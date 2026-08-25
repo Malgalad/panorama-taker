@@ -463,6 +463,14 @@ is invariant, and serial/parallel output remains deterministic. Also exercise
 rejection of near-black, clipped, high-gradient, non-finite, and high-MAD
 overlap samples plus the existing disconnected-graph failure.
 
+Final histogram normalization (2026-08-25): implemented as a default-on,
+global log-luminance histogram equalization pass over the finished composite,
+after blending and coverage handling. It streams disk-backed output strips,
+uses a compact 1024-bin histogram/LUT, preserves RGB channel ratios and
+unbounded linear EXR values, and supports `--no-histogram-normalization` plus
+the GUI advanced checkbox. The option is included in render reports and has
+regression coverage for monotonicity and chroma preservation.
+
 Exposure-local compensation implementation (2026-08-25): renders now build a
 disk-backed per-output-pixel exposure field from geometric feather weights and
 apply only `exp(frame_log_gain - local_exposure)` to valid linear samples. The
