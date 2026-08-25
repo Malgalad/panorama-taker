@@ -31,6 +31,7 @@ MAX_MEMORY_BUDGET_BYTES = 8192 * 1024 * 1024
 _RESERVED_RUNTIME_BYTES = 192 * 1024 * 1024
 _TILE_BYTES_PER_PIXEL = 164
 _MAX_AUTO_WORKERS = 8
+_EXPOSURE_FIELD_SCALE = 4
 
 
 @dataclass(frozen=True)
@@ -607,7 +608,10 @@ def _composite_strip(
     sampled = remap_source(source, map_x, map_y)
     if local_exposure is not None:
         correction = _local_exposure_multiplier(
-            log_gain, local_exposure[row_start : row_start + rows]
+            log_gain,
+            _local_exposure_rows(
+                local_exposure, row_start, rows, output_width, output_height
+            ),
         )
         sampled *= correction[..., np.newaxis]
     color = color_scratch[row_start : row_start + rows]
@@ -636,6 +640,39 @@ def _local_exposure_multiplier(log_gain: float, local_exposure: FloatImage) -> F
     """Return overlap-only compensation; a constant exposure gauge cancels."""
 
     return np.exp(np.float32(log_gain) - local_exposure).astype(np.float32)
+
+
+def _exposure_field_dimensions(output_width: int, output_height: int) -> tuple[int, int]:
+    return (
+        max(1, (output_width + _EXPOSURE_FIELD_SCALE - 1) // _EXPOSURE_FIELD_SCALE),
+        max(1, (output_height + _EXPOSURE_FIELD_SCALE - 1) // _EXPOSURE_FIELD_SCALE),
+    )
+
+
+def _local_exposure_rows(
+    field: FloatImage,
+    row_start: int,
+    rows: int,
+    output_width: int,
+    output_height: int,
+) -> FloatImage:
+    """Bilinearly expand a quarter-resolution field for one output strip."""
+
+    if field.shape == (output_height, output_width):
+        return field[row_start : row_start + rows]
+    field_height, field_width = field.shape
+    x = (np.arange(output_width, dtype=np.float32) + 0.5) * field_width / output_width - 0.5
+    y = (
+        (np.arange(row_start, row_start + rows, dtype=np.float32) + 0.5)
+        * field_height
+        / output_height
+        - 0.5
+    )
+    x = np.clip(x, 0.0, field_width - 1)
+    y = np.clip(y, 0.0, field_height - 1)
+    map_x, map_y = np.meshgrid(x, y)
+    sampled = remap_source(field[..., np.newaxis], map_x, map_y)
+    return sampled if sampled.ndim == 2 else sampled[..., 0]
 
 
 def _close_scratch_memmap(array: Any) -> None:
@@ -721,10 +758,13 @@ def estimate_render_resources(
         raise ValueError("session contains no frames")
     source = _source_info_for_session(session, image_root)
     output_width, output_height = _output_dimensions(session, source.width, width)
+    exposure_width, exposure_height = _exposure_field_dimensions(output_width, output_height)
     worker_count, strip_height = _choose_render_plan(
         source, output_width, output_height, memory_budget_bytes, workers
     )
-    scratch_bytes = output_height * output_width * 5 * np.dtype(np.float32).itemsize
+    scratch_bytes = (
+        output_height * output_width * 4 + exposure_height * exposure_width
+    ) * np.dtype(np.float32).itemsize
     return RenderResources(output_width, output_height, strip_height, worker_count, scratch_bytes)
 
 
@@ -768,8 +808,13 @@ def render_session(
     output_height = resources.output_height
     strip_height = resources.strip_height
     composite_strips = (output_height + strip_height - 1) // strip_height
+    exposure_width, exposure_height = _exposure_field_dimensions(output_width, output_height)
+    exposure_strip_height = max(
+        1, (strip_height + _EXPOSURE_FIELD_SCALE - 1) // _EXPOSURE_FIELD_SCALE
+    )
+    exposure_strips = (exposure_height + exposure_strip_height - 1) // exposure_strip_height
     exposure_work = len(session.frames)
-    local_exposure_work = (len(session.frames) + 1) * composite_strips
+    local_exposure_work = (len(session.frames) + 1) * exposure_strips
     total_work = (
         exposure_work
         + local_exposure_work
@@ -810,23 +855,23 @@ def render_session(
                 local_exposure_path,
                 mode="w+",
                 dtype=np.float32,
-                shape=(output_height, output_width),
+                shape=(exposure_height, exposure_width),
             )
             local_weight = np.memmap(
                 local_weight_path,
                 mode="w+",
                 dtype=np.float32,
-                shape=(output_height, output_width),
+                shape=(exposure_height, exposure_width),
             )
             local_exposure[:] = 0.0
             local_weight[:] = 0.0
             for frame_position, frame in enumerate(session.frames):
-                for row_start in range(0, output_height, strip_height):
+                for row_start in range(0, exposure_height, exposure_strip_height):
                     if cancel_event is not None and cancel_event.is_set():
                         raise RenderCancelledError("render cancelled")
-                    rows = min(strip_height, output_height - row_start)
+                    rows = min(exposure_strip_height, exposure_height - row_start)
                     directions = equirectangular_directions(
-                        output_width, rows, latitude_span, row_start, output_height
+                        exposure_width, rows, latitude_span, row_start, exposure_height
                     )
                     _, _, valid, edge_distance = camera_maps(
                         directions,
@@ -844,10 +889,10 @@ def render_session(
                     completed_work += 1
                     if progress_callback is not None:
                         progress_callback(completed_work, total_work, "exposure mapping")
-            for row_start in range(0, output_height, strip_height):
+            for row_start in range(0, exposure_height, exposure_strip_height):
                 if cancel_event is not None and cancel_event.is_set():
                     raise RenderCancelledError("render cancelled")
-                rows = min(strip_height, output_height - row_start)
+                rows = min(exposure_strip_height, exposure_height - row_start)
                 exposure_rows = local_exposure[row_start : row_start + rows]
                 weight_rows = local_weight[row_start : row_start + rows]
                 covered_exposure = weight_rows > 0.0

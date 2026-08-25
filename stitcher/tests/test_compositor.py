@@ -1,6 +1,7 @@
 import math
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 from PIL import Image
@@ -14,6 +15,7 @@ from pano_stitch.compositor import (
     _estimate_exposure_gains,
     _exposure_clipped,
     _local_exposure_multiplier,
+    _local_exposure_rows,
     _output_dimensions,
     _pq_to_linear,
     _probe_source,
@@ -233,6 +235,16 @@ def test_linear_hdr_highlights_are_not_treated_as_clipped() -> None:
     assert np.all(_exposure_clipped(image, ImageEncoding("uint16", "rec2020", "pq")))
 
 
+def test_local_exposure_rows_use_exact_non_divisible_output_ratio() -> None:
+    field = np.arange(155 * 309, dtype=np.float32).reshape((155, 309))
+    output_width = 1234
+    output_height = 617
+    expanded = cv2.resize(field, (output_width, output_height), interpolation=cv2.INTER_LINEAR)
+    bottom = _local_exposure_rows(field, 600, 17, output_width, output_height)
+
+    assert np.allclose(bottom, expanded[600:617], atol=1e-4)
+
+
 def test_4k_source_uses_bounded_output_strips() -> None:
     source = SourceInfo(3840, 2160, ImageEncoding("uint16", "rec2020", "pq", 203.0))
     strip_height = _choose_strip_height(source, 21274, DEFAULT_MEMORY_BUDGET_BYTES)
@@ -323,7 +335,9 @@ def test_render_resource_estimate_uses_color_and_weight_scratch(tmp_path: Path) 
     resources = estimate_render_resources(session, tmp_path, width=64)
 
     assert resources.output_height == 32
-    assert resources.scratch_bytes == 64 * 32 * 5 * np.dtype(np.float32).itemsize
+    assert resources.scratch_bytes == (
+        64 * 32 * 4 + 16 * 8
+    ) * np.dtype(np.float32).itemsize
 
 
 def test_full_sphere_output_dimensions_are_always_two_to_one() -> None:
