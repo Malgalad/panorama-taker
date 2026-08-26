@@ -479,3 +479,14 @@ default-on CLI/GUI controls, five phase-local progress stages, cancellation
 cleanup, and regression coverage. EXR remains unchanged because a Photoshop-
 style level-255 white point is undefined for scene-linear HDR. The detailed
 contract and implementation notes are in `docs/auto-contrast.md`.
+
+Full-GPU stitcher WSL benchmark (2026-08-26): on an NVIDIA GeForce RTX 5090,
+the strict 15-frame, 256×128 shared-scene benchmark at 512px produced a CPU
+median of 0.157 s and a CUDA median of 0.073 s. CUDA recorded 15 source
+uploads (1,474,560 bytes H2D), 393,300 bytes D2H, ten kernel launches, and no
+disk scratch. Its warm cached 1024px preview median was 0.002 s versus 0.296 s
+for CPU (118.63×). A 4096px full render measured 2.014 s CPU versus 0.760 s
+CUDA (2.65×); CPU/CUDA PNGs differed by at most one RGB code. The cache,
+transfer, parity, and simulated 6 GiB admission gates are therefore evidenced
+locally. Clean Windows driver-only packaged-artifact validation remains the
+external release gate.

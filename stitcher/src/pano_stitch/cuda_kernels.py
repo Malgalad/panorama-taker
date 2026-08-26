@@ -135,12 +135,8 @@ extern "C" __global__ void sample_exposure_grid(
   const bool valid = project_output_ray(x, y, sample_width, sample_height, latitude_span,
       rotations + frame * 9, proxy_width, proxy_height, horizontal_fov, vertical_fov, 0, 0.0f,
       &map_x, &map_y, &edge_distance);
-  if (!valid) {
-    luminance[index] = 0.0f;
-    coverage[index] = 0;
-    clipped[index] = 0;
-    return;
-  }
+  // Keep the clamped sample outside a frame for Sobel, matching cv2.remap in
+  // the CPU exposure path. Coverage still excludes it from exposure equations.
   const int x0 = (int)floorf(map_x), y0 = (int)floorf(map_y);
   const int x1 = min(x0 + 1, proxy_width - 1), y1 = min(y0 + 1, proxy_height - 1);
   const float wx = map_x - x0, wy = map_y - y0;
@@ -158,7 +154,7 @@ extern "C" __global__ void sample_exposure_grid(
   const float blue = w00 * proxies[p00 + 2] + w10 * proxies[p10 + 2]
       + w01 * proxies[p01 + 2] + w11 * proxies[p11 + 2];
   luminance[index] = red * 0.2126f + green * 0.7152f + blue * 0.0722f;
-  coverage[index] = 1;
+  coverage[index] = valid ? 1 : 0;
   clipped[index] = red >= 0.995f || green >= 0.995f || blue >= 0.995f;
 }
 
@@ -205,6 +201,50 @@ extern "C" __global__ void classify_exposure_samples(
   const bool accepted = coverage[index] && !clipped[index] && finite
       && (!apply_gradient_limit || gradient <= gradient_limits[frame]);
   valid[index] = accepted ? 1 : 0;
+}
+
+extern "C" __global__ void solve_exposure_system(
+    double* system, double* values, double* solution, int dimension) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+  for (int column = 0; column < dimension; ++column) {
+    int pivot_row = column;
+    double pivot_size = fabs(system[column * dimension + column]);
+    for (int row = column + 1; row < dimension; ++row) {
+      const double candidate = fabs(system[row * dimension + column]);
+      if (candidate > pivot_size) {
+        pivot_size = candidate;
+        pivot_row = row;
+      }
+    }
+    if (pivot_size <= 1e-12) continue;
+    if (pivot_row != column) {
+      for (int entry = column; entry < dimension; ++entry) {
+        const double value = system[column * dimension + entry];
+        system[column * dimension + entry] = system[pivot_row * dimension + entry];
+        system[pivot_row * dimension + entry] = value;
+      }
+      const double value = values[column];
+      values[column] = values[pivot_row];
+      values[pivot_row] = value;
+    }
+    const double pivot = system[column * dimension + column];
+    for (int entry = column; entry < dimension; ++entry) {
+      system[column * dimension + entry] /= pivot;
+    }
+    values[column] /= pivot;
+    for (int row = 0; row < dimension; ++row) {
+      if (row == column) continue;
+      const double factor = system[row * dimension + column];
+      if (factor == 0.0) continue;
+      for (int entry = column; entry < dimension; ++entry) {
+        system[row * dimension + entry] -= factor * system[column * dimension + entry];
+      }
+      values[row] -= factor * values[column];
+    }
+  }
+  for (int row = 0; row < dimension; ++row) {
+    solution[row] = fabs(system[row * dimension + row]) > 1e-12 ? values[row] : 0.0;
+  }
 }
 
 extern "C" __global__ void build_local_exposure(
@@ -418,6 +458,7 @@ CUDA_KERNEL_NAMES = (
     "build_exposure_proxies",
     "sample_exposure_grid",
     "classify_exposure_samples",
+    "solve_exposure_system",
     "build_auto_contrast_histogram",
     "select_auto_contrast_levels",
     "convert_output",

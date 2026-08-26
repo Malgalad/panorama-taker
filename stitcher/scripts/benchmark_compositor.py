@@ -8,7 +8,13 @@ from importlib import import_module
 from pathlib import Path
 from typing import Any
 
-from pano_stitch.compositor import render_session, renderable_session, validate_images
+from pano_stitch.compositor import (
+    CudaSessionCache,
+    render_preview,
+    render_session,
+    renderable_session,
+    validate_images,
+)
 from pano_stitch.gpu import (
     CudaRenderDiagnostics,
     GpuUnavailableError,
@@ -25,6 +31,11 @@ def main() -> None:
     parser.add_argument("--width", type=int)
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--output-dir", type=Path, default=Path("benchmark-output"))
+    parser.add_argument(
+        "--preview-width",
+        type=int,
+        help="also benchmark warm cached CPU and CUDA previews at this width",
+    )
     parser.add_argument("--blend", choices=("hard", "feather"), default="hard")
     parser.add_argument("--disable-auto-contrast", action="store_true")
     args = parser.parse_args()
@@ -106,6 +117,45 @@ def main() -> None:
             )
             print(f"{label}: {phases}")
             print(f"{label}: transfers={diagnostics.transfer_stats}")
+
+    if args.preview_width is None:
+        return
+    if args.preview_width < 1:
+        parser.error("--preview-width must be positive")
+
+    def preview(label: str, *, use_gpu: bool, cache: CudaSessionCache | None = None) -> float:
+        synchronize_cuda()
+        started = time.perf_counter()
+        render_preview(
+            session,
+            image_dir,
+            args.preview_width,
+            ".png",
+            blend=args.blend,
+            auto_contrast=not args.disable_auto_contrast,
+            use_gpu=use_gpu,
+            strict_gpu=use_gpu,
+            cuda_session_cache=cache,
+            cuda_session_path=args.session if cache is not None else None,
+        )
+        synchronize_cuda()
+        return time.perf_counter() - started
+
+    cpu_warm = preview("cpu", use_gpu=False)
+    cpu_samples = [preview("cpu", use_gpu=False) for _ in range(args.runs)]
+    cache = CudaSessionCache()
+    try:
+        cuda_warm = preview("cuda", use_gpu=True, cache=cache)
+        cuda_samples = [preview("cuda", use_gpu=True, cache=cache) for _ in range(args.runs)]
+    finally:
+        cache.close()
+    cpu_median = sorted(cpu_samples)[len(cpu_samples) // 2]
+    cuda_median = sorted(cuda_samples)[len(cuda_samples) // 2]
+    print(f"preview cpu: warm-up={cpu_warm:.3f}s median={cpu_median:.3f}s")
+    print(
+        f"preview cuda cached: warm-up={cuda_warm:.3f}s median={cuda_median:.3f}s "
+        f"speedup={cpu_median / cuda_median:.2f}x"
+    )
 
 
 if __name__ == "__main__":

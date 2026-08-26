@@ -626,15 +626,19 @@ dev = [
     { name = "types-jsonschema" },
 ]
 gpu = [
-    { name = "cupy-cuda12x", extra = ["ctk"] },
+    { name = "cupy-cuda12x" },
+    { name = "nvidia-cuda-nvrtc-cu12" },
+    { name = "nvidia-cuda-runtime-cu12" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "cupy-cuda12x", extras = ["ctk"], marker = "extra == 'gpu'", specifier = ">=14,<15" },
+    { name = "cupy-cuda12x", marker = "extra == 'gpu'", specifier = ">=14,<15" },
     { name = "jsonschema", specifier = ">=4.20" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
     { name = "numpy", specifier = ">=2.0" },
+    { name = "nvidia-cuda-nvrtc-cu12", marker = "extra == 'gpu'", specifier = ">=12,<13" },
+    { name = "nvidia-cuda-runtime-cu12", marker = "extra == 'gpu'", specifier = ">=12,<13" },
     { name = "opencv-python", specifier = ">=4.10" },
     { name = "openexr", specifier = ">=3.4" },
     { name = "pillow", specifier = ">=10.0" },

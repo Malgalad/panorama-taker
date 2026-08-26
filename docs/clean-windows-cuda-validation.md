@@ -19,7 +19,7 @@ CuPy wheel, but not a CUDA Toolkit installation.
 
 1. Verify that `nvcc`, `python`, and the CUDA Toolkit directory are absent.
 2. Install only the NVIDIA display driver, reboot, and record its version with `nvidia-smi`.
-3. Unpack `PanoramaCapture-Stitcher-<version>-win-x64.zip` outside the game directory.
+3. Unpack `PanoramaCapture-Stitcher-<version>-cuda-win-x64.zip` outside the game directory.
 4. Launch `PanoramaCaptureStitcher.exe`; select a known complete PNG and a known complete HDR/PQ
    session.
 5. Render a preview and a full PNG with CUDA enabled. Confirm the GUI reports `CUDA resident` or
@@ -32,3 +32,6 @@ CuPy wheel, but not a CUDA Toolkit installation.
 Record pass/fail, GPU/driver, archive hash, selected CUDA mode, output checksums, and the relevant
 log lines in the release evidence. A failure is a release blocker; WSL validation does not replace
 this gate.
+
+Also verify that `PanoramaCapture-Stitcher-<version>-cpu-win-x64.zip` contains neither CuPy nor
+CUDA runtime DLLs and starts on a non-NVIDIA Windows x64 system, where it must select CPU rendering.

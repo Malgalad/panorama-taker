@@ -25,7 +25,9 @@ Keep each generated `PanoramaCaptureBridge.pano-<session-id>.json` with its scre
 
 ## Stitcher
 
-1. Extract `PanoramaCapture-Stitcher-<version>-win-x64.zip` outside the game directory.
+1. Extract one stitcher archive outside the game directory:
+   - `PanoramaCapture-Stitcher-<version>-cpu-win-x64.zip` for any supported Windows x64 system;
+   - `PanoramaCapture-Stitcher-<version>-cuda-win-x64.zip` only for NVIDIA GPUs with a supported driver.
 2. Run `PanoramaCaptureStitcher.exe`.
 3. Choose the Cyberpunk 2077 game directory.
 4. Select a session from the list. Sessions are read from:

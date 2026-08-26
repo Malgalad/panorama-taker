@@ -24,6 +24,8 @@ from pano_stitch.gpu import (
     cuda_device_info,
 )
 from pano_stitch.metadata import CaptureMode, FrameMetadata, ImageEncoding, SessionMetadata
+from pano_stitch.planner import plan_shots
+from pano_stitch.projection import rectilinear_directions
 
 
 def _cuda_available() -> bool:
@@ -351,6 +353,77 @@ def test_cuda_global_exposure_solves_a_two_frame_overlap(tmp_path: Path) -> None
 
     assert report.edge_count == 1
     assert report.gains == pytest.approx((2.0, 0.5), abs=1e-5)
+
+
+def test_cuda_multi_frame_exposure_matches_cpu_for_shared_scene(tmp_path: Path) -> None:
+    planning_session = SessionMetadata(
+        1,
+        "cuda-shared-scene",
+        CaptureMode.FULL_SPHERE,
+        90.0,
+        90.0,
+        0.08,
+        (),
+        True,
+    )
+    frames = tuple(
+        FrameMetadata(
+            shot.index, f"frame-{shot.index}.png", shot.yaw_deg, shot.pitch_deg, 0.0, "captured"
+        )
+        for shot in plan_shots(planning_session).shots
+    )
+    session = SessionMetadata(
+        1,
+        "cuda-shared-scene",
+        CaptureMode.FULL_SPHERE,
+        90.0,
+        90.0,
+        0.08,
+        frames,
+        True,
+    )
+    for frame in frames:
+        directions = rectilinear_directions(
+            256, 128, 90.0, 90.0, frame.yaw_deg, frame.pitch_deg, frame.roll_deg
+        )
+        x, y, z = (directions[..., index] for index in range(3))
+        pixels = np.clip(
+            np.stack(
+                (
+                    0.5 + 0.22 * x + 0.11 * np.sin(5.0 * z) + 0.06 * np.cos(7.0 * y),
+                    0.5 + 0.20 * y + 0.10 * np.sin(6.0 * x - 2.0 * z),
+                    0.5 + 0.18 * z + 0.09 * np.cos(4.0 * x + 3.0 * y),
+                ),
+                axis=-1,
+            ),
+            0.04,
+            0.96,
+        )
+        Image.fromarray(np.rint(pixels * 255.0).astype(np.uint8), mode="RGB").save(
+            tmp_path / frame.filename
+        )
+
+    cpu_report = render_session(
+        session, tmp_path, tmp_path / "cpu.png", width=128, auto_contrast=False, use_gpu=False
+    )
+    selected: list[tuple[str, str]] = []
+    cuda_report = render_session(
+        session,
+        tmp_path,
+        tmp_path / "cuda.png",
+        width=128,
+        auto_contrast=False,
+        use_gpu=True,
+        strict_gpu=True,
+        backend_callback=lambda backend, detail: selected.append((backend, detail)),
+    )
+
+    assert selected and selected[0][0] == "cuda resident"
+    assert cuda_report.edge_count == cpu_report.edge_count
+    assert cuda_report.gains == pytest.approx(cpu_report.gains, abs=5e-5)
+    with Image.open(tmp_path / "cpu.png") as cpu, Image.open(tmp_path / "cuda.png") as cuda:
+        difference = np.abs(np.asarray(cpu, dtype=np.int16) - np.asarray(cuda, dtype=np.int16))
+    assert int(difference.max()) <= 1
 
 
 def test_prepare_cuda_session_retains_uploaded_sources_for_reuse(tmp_path: Path) -> None:

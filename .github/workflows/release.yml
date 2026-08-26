@@ -64,21 +64,24 @@ jobs:
       - name: Verify release CUDA dependency
         shell: pwsh
         run: |
-          & .\.venv-release\Scripts\python.exe -c "import cupy; print(cupy.__version__)"
+          & .\.venv-release-cuda\Scripts\python.exe -c "import cupy; print(cupy.__version__)"
       - name: Verify archive contents and generate checksums
         shell: pwsh
         run: |
           $version = $env:RELEASE_VERSION.TrimStart("v")
           $verify = Join-Path $env:RUNNER_TEMP "panorama-release-verify"
           Expand-Archive "dist\PanoramaCapture-Mod-$version.zip" (Join-Path $verify "mod")
-          Expand-Archive "dist\PanoramaCapture-Stitcher-$version-win-x64.zip" (Join-Path $verify "stitcher")
+          Expand-Archive "dist\PanoramaCapture-Stitcher-$version-cpu-win-x64.zip" (Join-Path $verify "cpu")
+          Expand-Archive "dist\PanoramaCapture-Stitcher-$version-cuda-win-x64.zip" (Join-Path $verify "cuda")
           $cet = Join-Path $verify "mod\bin\x64\plugins\cyber_engine_tweaks\mods\PanoramaCaptureProbe\init.lua"
           $addon = Join-Path $verify "mod\bin\x64\PanoramaCaptureReShade.addon64"
-          $stitcher = Join-Path $verify "stitcher\PanoramaCaptureStitcher\PanoramaCaptureStitcher.exe"
+          $cpuStitcher = Join-Path $verify "cpu\PanoramaCaptureStitcher\PanoramaCaptureStitcher.exe"
+          $cudaStitcher = Join-Path $verify "cuda\PanoramaCaptureStitcher\PanoramaCaptureStitcher.exe"
           $required = [ordered]@{
             cet = $cet
             reshade_addon = $addon
-            stitcher = $stitcher
+            cpu_stitcher = $cpuStitcher
+            cuda_stitcher = $cudaStitcher
           }
           $missing = @($required.GetEnumerator() | Where-Object {
             -not (Test-Path -LiteralPath $_.Value)
@@ -105,7 +108,12 @@ jobs:
             ""
             "pip_freeze:"
           ) | Set-Content dist\BUILD-INFO.txt
-          & .\.venv-release\Scripts\python.exe -m pip freeze | Add-Content dist\BUILD-INFO.txt
+          "" | Add-Content dist\BUILD-INFO.txt
+          "cpu_pip_freeze:" | Add-Content dist\BUILD-INFO.txt
+          & .\.venv-release-cpu\Scripts\python.exe -m pip freeze | Add-Content dist\BUILD-INFO.txt
+          "" | Add-Content dist\BUILD-INFO.txt
+          "cuda_pip_freeze:" | Add-Content dist\BUILD-INFO.txt
+          & .\.venv-release-cuda\Scripts\python.exe -m pip freeze | Add-Content dist\BUILD-INFO.txt
       - name: Upload dry-run artifacts
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0

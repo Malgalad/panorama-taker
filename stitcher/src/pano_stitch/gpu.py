@@ -164,7 +164,7 @@ def compile_cuda_module() -> None:
     try:
         cp: Any = import_module("cupy")
     except ImportError as exc:
-        raise GpuUnavailableError("CuPy is not installed") from exc
+        raise GpuUnavailableError(f"CuPy import failed: {exc}") from exc
     CudaKernelModule(cp)
 
 
@@ -194,7 +194,7 @@ class CudaSession:
         try:
             cp: Any = import_module("cupy")
         except ImportError as exc:
-            raise GpuUnavailableError("CuPy is not installed") from exc
+            raise GpuUnavailableError(f"CuPy import failed: {exc}") from exc
 
         self._cp = cp
         self._closed = False
@@ -417,9 +417,10 @@ class CudaSession:
                     self._cp.int32(0),
                 ),
             )
-            base_valid = (coverage != 0) & (clipped == 0) & self._cp.isfinite(luminance)
             gradient_limits = self._masked_quantile(
-                gradients.reshape((frame_count, -1)), base_valid.reshape((frame_count, -1)), 0.9
+                gradients.reshape((frame_count, -1)),
+                self._cp.isfinite(gradients).reshape((frame_count, -1)),
+                0.9,
             )
             self.module["classify_exposure_samples"](
                 ((sample_pixels + 255) // 256,),
@@ -462,8 +463,7 @@ class CudaSession:
         valid_counts = cp.sum(pair_valid, axis=1)
         geometric_counts = cp.sum(pair_coverage, axis=1)
         ratios = log_luminance[left] - log_luminance[right]
-        low = self._masked_quantile(ratios, pair_valid, 0.1)
-        high = self._masked_quantile(ratios, pair_valid, 0.9)
+        low, high = self._masked_quantiles(ratios, pair_valid, (0.1, 0.9))
         inliers = pair_valid & (ratios >= low[:, None]) & (ratios <= high[:, None])
         median = self._masked_quantile(ratios, inliers, 0.5)
         mad = self._masked_quantile(cp.abs(ratios - median[:, None]), inliers, 0.5)
@@ -490,7 +490,11 @@ class CudaSession:
         system = cp.diag(diagonal) - edge_weights
         values = -cp.sum(edge_weights * edge_ratios, axis=1)
         system[0, 0] += 1.0
-        solution = cp.linalg.lstsq(system, values, rcond=None)[0]
+        solution = cp.empty_like(values)
+        self.module["solve_exposure_system"](
+            (1,), (1,), (system, values, solution, cp.int32(frame_count))
+        )
+        self.record_kernel_launch()
         centered = solution - cp.median(solution)
         clipped = cp.clip(centered, -cp.log(2.0), cp.log(2.0)).astype(cp.float32)
         gains = clipped
@@ -503,20 +507,33 @@ class CudaSession:
     def _masked_quantile(self, values: Any, valid: Any, quantile: float) -> Any:
         """Compute one quantile per row entirely on CUDA, excluding invalid samples."""
 
+        return self._masked_quantiles(values, valid, (quantile,))[0]
+
+    def _masked_quantiles(
+        self, values: Any, valid: Any, quantiles: tuple[float, ...]
+    ) -> tuple[Any, ...]:
+        """Compute several row-wise quantiles from one device-side sort."""
+
         cp = self._cp
         if values.ndim != 2 or valid.shape != values.shape:
             raise ValueError("CUDA masked quantiles require matching two-dimensional arrays")
+        if not quantiles or any(not 0.0 <= quantile <= 1.0 for quantile in quantiles):
+            raise ValueError("CUDA masked quantiles must lie between zero and one")
         sorted_values = cp.sort(cp.where(valid, values, cp.inf), axis=1)
         counts = cp.sum(valid, axis=1)
-        positions = cp.maximum(counts - 1, 0).astype(cp.float64) * quantile
-        lower = cp.floor(positions).astype(cp.int64)
-        upper = cp.ceil(positions).astype(cp.int64)
-        fractions = (positions - lower).astype(values.dtype)
         rows = cp.arange(values.shape[0])
-        interpolated = (
-            sorted_values[rows, lower] * (1.0 - fractions) + sorted_values[rows, upper] * fractions
-        )
-        return cp.where(counts > 0, interpolated, cp.nan).astype(cp.float32)
+        results = []
+        for quantile in quantiles:
+            positions = cp.maximum(counts - 1, 0).astype(cp.float64) * quantile
+            lower = cp.floor(positions).astype(cp.int64)
+            upper = cp.ceil(positions).astype(cp.int64)
+            fractions = (positions - lower).astype(values.dtype)
+            interpolated = (
+                sorted_values[rows, lower] * (1.0 - fractions)
+                + sorted_values[rows, upper] * fractions
+            )
+            results.append(cp.where(counts > 0, interpolated, cp.nan).astype(cp.float32))
+        return tuple(results)
 
     def _neutral_bridge_weights(self, measured: Any, left: Any, right: Any, geometric: Any) -> Any:
         """Add neutral constraints only where geometric overlaps connect components."""
@@ -532,9 +549,8 @@ class CudaSession:
         for _ in range(frame_count):
             reachability = adjacency
             for _ in range(frame_count):
-                reachability = reachability | (
-                    (reachability.astype(cp.int16) @ reachability.astype(cp.int16)) != 0
-                )
+                two_hop = cp.any(reachability[:, :, None] & reachability[None, :, :], axis=1)
+                reachability = reachability | two_hop
             candidates = geometric_matrix & ~reachability
             rows = cp.arange(frame_count)
             first = cp.argmax(candidates, axis=1)
@@ -924,7 +940,7 @@ def cuda_device_info() -> GpuDeviceInfo:
     try:
         cp: Any = import_module("cupy")
     except ImportError as exc:
-        raise GpuUnavailableError("CuPy is not installed") from exc
+        raise GpuUnavailableError(f"CuPy import failed: {exc}") from exc
     try:
         device_count = int(cp.cuda.runtime.getDeviceCount())
         if device_count < 1:
