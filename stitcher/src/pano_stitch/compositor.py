@@ -74,6 +74,14 @@ class ExposureReport:
         return tuple(float(np.log(max(gain, 1e-6))) for gain in self.gains)
 
 
+@dataclass(frozen=True)
+class PreviewResult:
+    """Displayable SDR preview pixels and the exposure solve used to create them."""
+
+    pixels: NDArray[np.uint8]
+    exposure_report: ExposureReport
+
+
 class RenderCancelledError(RuntimeError):
     """Raised when a cooperative render cancellation is requested."""
 
@@ -1108,6 +1116,7 @@ def render_session(
     workers: int | None = None,
     auto_contrast: bool = True,
     session_thumbnail: bool = False,
+    exposure_report: ExposureReport | None = None,
 ) -> ExposureReport:
     """Render one session with bounded RAM and disk-backed strip accumulators."""
 
@@ -1162,21 +1171,26 @@ def render_session(
     with tempfile.TemporaryDirectory(
         prefix="pano-stitch-", dir=output_path.parent
     ) as scratch_directory:
-        exposure_report = _estimate_exposure_gains(
-            session,
-            image_root,
-            first_source,
-            cancel_event,
-            (
+        if exposure_report is None:
+            exposure_report = _estimate_exposure_gains(
+                session,
+                image_root,
+                first_source,
+                cancel_event,
                 (
-                    lambda completed: progress_callback(
-                        completed, exposure_work, phase_labels["exposure"]
+                    (
+                        lambda completed: progress_callback(
+                            completed, exposure_work, phase_labels["exposure"]
+                        )
                     )
-                )
-                if progress_callback is not None
-                else None
-            ),
-        )
+                    if progress_callback is not None
+                    else None
+                ),
+            )
+        elif len(exposure_report.gains) != len(session.frames):
+            raise ValueError("cached exposure report does not match the renderable session")
+        elif progress_callback is not None:
+            progress_callback(exposure_work, exposure_work, f"{phase_labels['exposure']} (cached)")
         scratch_root = Path(scratch_directory)
         local_exposure_path = scratch_root / "local-exposure.f32"
         local_weight_path = scratch_root / "local-exposure-weight.f32"
@@ -1502,3 +1516,43 @@ def validate_images(
             _probe_source(path)
         except Exception as error:
             raise ValueError(f"cannot decode source image {filename}: {error}") from error
+
+
+def render_preview(
+    session: SessionMetadata,
+    image_root: Path,
+    width: int,
+    output_suffix: str,
+    blend: str = "hard",
+    allow_incomplete: bool = False,
+    memory_budget_bytes: int = DEFAULT_MEMORY_BUDGET_BYTES,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    cancel_event: Event | None = None,
+    workers: int | None = None,
+    auto_contrast: bool = True,
+) -> PreviewResult:
+    """Render an ephemeral, displayable SDR preview and return its exposure solve."""
+
+    if width < 1:
+        raise ValueError("preview width must be positive")
+    if output_suffix.lower() not in {".exr", ".jpg", ".jpeg", ".png"}:
+        raise ValueError("output extension must be .exr, .jpg, .jpeg, or .png")
+    image_root = image_root.resolve()
+    with tempfile.TemporaryDirectory(prefix="pano-preview-") as directory:
+        preview_path = Path(directory) / "preview.png"
+        report = render_session(
+            session,
+            image_root,
+            preview_path,
+            width=width,
+            blend=blend,
+            allow_incomplete=allow_incomplete,
+            memory_budget_bytes=memory_budget_bytes,
+            progress_callback=progress_callback,
+            cancel_event=cancel_event,
+            workers=workers,
+            auto_contrast=auto_contrast and output_suffix.lower() != ".exr",
+        )
+        with Image.open(preview_path) as image:
+            pixels = np.array(image.convert("RGB"), dtype=np.uint8, copy=True)
+        return PreviewResult(pixels, report)

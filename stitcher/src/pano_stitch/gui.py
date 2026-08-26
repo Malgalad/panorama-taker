@@ -13,9 +13,13 @@ from pathlib import Path
 from tkinter import filedialog, font, messagebox, ttk
 from typing import Any
 
+from PIL import Image, ImageTk
+
 from pano_stitch.compositor import (
+    ExposureReport,
     RenderCancelledError,
     estimate_render_resources,
+    render_preview,
     render_session,
     renderable_session,
     thumbnail_output_path,
@@ -47,6 +51,9 @@ class StitcherApp:
         self._validated = False
         self._history: dict[str, Any] = {}
         self._sessions: tuple[SessionRecord, ...] = ()
+        self._preview_report: ExposureReport | None = None
+        self._preview_photo: Any | None = None
+        self._preview_width = 1
         self._build_variables()
         self._load_settings()
         self._build_widgets()
@@ -56,6 +63,20 @@ class StitcherApp:
         self.image_dir_var.trace_add("write", self._input_changed)
         self.output_name_var.trace_add("write", self._output_name_changed)
         self.format_var.trace_add("write", self._format_changed)
+        for variable in (
+            self.output_dir_var,
+            self.width_var,
+            self.resolution_percent_var,
+            self.session_thumbnail_var,
+            self.blend_var,
+            self.memory_var,
+            self.workers_var,
+            self.allow_incomplete_var,
+            self.coverage_var,
+            self.auto_contrast_var,
+            self.jpeg_quality_var,
+        ):
+            variable.trace_add("write", self._input_changed)
         self._update_resolution_label()
         self._update_jpeg_quality_label()
         self._format_changed()
@@ -117,6 +138,7 @@ class StitcherApp:
             self.cancel()
             self.status_var.set("Render is still stopping; close again when idle.")
             return
+        self.discard_preview()
         self._save_settings()
         self.root.destroy()
 
@@ -154,7 +176,15 @@ class StitcherApp:
         self.status_var = tk.StringVar(value="Choose a game directory and session.")
 
     def _build_widgets(self) -> None:
-        paths = ttk.LabelFrame(self.root, text="Capture")
+        self.main_content = ttk.Frame(self.root)
+        self.main_content.pack(fill="both", expand=True)
+        self.main_content.columnconfigure(1, weight=1)
+        self.left_column = ttk.Frame(self.main_content)
+        self.left_column.grid(row=0, column=0, sticky="ns")
+        self.preview_frame = ttk.LabelFrame(self.main_content, text="Preview")
+        self.preview_label = ttk.Label(self.preview_frame, text="Preview will appear here")
+        self.preview_label.pack(expand=True, padx=12, pady=12)
+        paths = ttk.LabelFrame(self.left_column, text="Capture")
         paths.pack(fill="x", padx=12, pady=8)
         self._path_row(paths, 0, "Game directory", self.game_dir_var, self._pick_game_dir)
         self.sessions_tree = ttk.Treeview(
@@ -190,7 +220,7 @@ class StitcherApp:
         self._path_row(paths, 4, "Output directory", self.output_dir_var, self._pick_output_dir)
         self._path_row(paths, 5, "Output filename", self.output_name_var, None)
 
-        options = ttk.LabelFrame(self.root, text="Render options")
+        options = ttk.LabelFrame(self.left_column, text="Render options")
         options.pack(fill="x", padx=12, pady=8)
         self._option_row(
             options,
@@ -296,20 +326,23 @@ class StitcherApp:
             self.advanced_frame, text="Auto contrast (SDR outputs)", variable=self.auto_contrast_var
         ).grid(row=8, column=1, sticky="w", padx=6, pady=3)
 
-        actions = ttk.Frame(self.root)
+        actions = ttk.Frame(self.left_column)
         actions.pack(fill="x", padx=12, pady=8)
         self.render_button = ttk.Button(
-            actions, text="Render", command=self.render, state="disabled"
+            actions, text="Preview", command=self.render, state="disabled"
         )
         self.render_button.pack(side="left", padx=8)
+        self.discard_button = ttk.Button(
+            actions, text="Discard preview", command=self.discard_preview
+        )
         self.cancel_button = ttk.Button(
             actions, text="Cancel", command=self.cancel, state="disabled"
         )
         self.cancel_button.pack(side="left")
 
-        self.progress = ttk.Progressbar(self.root, mode="determinate", maximum=100)
+        self.progress = ttk.Progressbar(self.left_column, mode="determinate", maximum=100)
         self.progress.pack(fill="x", padx=12, pady=4)
-        ttk.Label(self.root, textvariable=self.status_var, wraplength=640).pack(
+        ttk.Label(self.left_column, textvariable=self.status_var, wraplength=640).pack(
             fill="x", padx=12, pady=8
         )
 
@@ -464,9 +497,13 @@ class StitcherApp:
             self.advanced_button.configure(text="Advanced options ▸")
 
     def _output_name_changed(self, *_args: object) -> None:
+        if self._preview_report is not None:
+            self.discard_preview()
         self._output_name_dirty = True
 
     def _format_changed(self, *_args: object) -> None:
+        if self._preview_report is not None:
+            self.discard_preview()
         if self.format_var.get() == "JPEG":
             self.jpeg_quality_label.grid(row=1, column=0, sticky="w", padx=6, pady=3)
             self.jpeg_quality_row.grid(row=1, column=1, sticky="w", padx=6, pady=3)
@@ -510,6 +547,8 @@ class StitcherApp:
         return output_path.with_suffix(suffix)
 
     def _input_changed(self, *_args: object) -> None:
+        if self._preview_report is not None:
+            self.discard_preview()
         self._validated = False
         self.render_button.configure(state="disabled")
         if self._validation_after is not None:
@@ -534,6 +573,12 @@ class StitcherApp:
 
     def render(self) -> None:
         if not self._validated:
+            return
+        if self._preview_report is None:
+            self.root.update_idletasks()
+            self._preview_width = max(1, self.root.winfo_width() - 24)
+            self.preview_frame.grid(row=0, column=1, sticky="nsew", padx=12, pady=8)
+            self._start_worker("preview")
             return
         output_path = self._output_path_preview()
         coverage_path = (
@@ -560,6 +605,15 @@ class StitcherApp:
             ):
                 return
         self._start_worker("render")
+
+    def discard_preview(self) -> None:
+        self._preview_report = None
+        self._preview_photo = None
+        if hasattr(self, "preview_label"):
+            self.preview_label.configure(image="", text="Preview will appear here")
+            self.preview_frame.grid_remove()
+        self.render_button.configure(text="Preview")
+        self.discard_button.pack_forget()
 
     def cancel(self) -> None:
         if self._cancel_event is not None:
@@ -604,6 +658,24 @@ class StitcherApp:
                 else None
             )
             resources = estimate_render_resources(session, image_dir, render_width, memory, workers)
+            if operation == "preview":
+                preview = render_preview(
+                    session,
+                    image_dir,
+                    self._preview_width,
+                    suffix,
+                    blend=self.blend_var.get(),
+                    allow_incomplete=allow_incomplete,
+                    memory_budget_bytes=memory,
+                    progress_callback=lambda completed, total, phase: self._progress(
+                        completed, total, f"Preview: {phase}"
+                    ),
+                    cancel_event=self._cancel_event,
+                    workers=workers,
+                    auto_contrast=self.auto_contrast_var.get(),
+                )
+                self._events.put(("preview", preview))
+                return
             self._events.put(
                 (
                     "status",
@@ -626,6 +698,7 @@ class StitcherApp:
                 workers,
                 self.auto_contrast_var.get(),
                 session_thumbnail=self.session_thumbnail_var.get(),
+                exposure_report=self._preview_report,
             )
             LOGGER.info("render completed: %s", output_path)
             self._events.put(("stitched", (session.session_id, output_path.name)))
@@ -668,11 +741,21 @@ class StitcherApp:
                     self.status_var.set(f"{phase}: {completed}/{total}")
                 elif kind == "status":
                     self.status_var.set(payload)
+                elif kind == "preview":
+                    preview = payload
+                    image = Image.fromarray(preview.pixels, mode="RGB")
+                    self._preview_photo = ImageTk.PhotoImage(image)
+                    self.preview_label.configure(image=self._preview_photo, text="")
+                    self._preview_report = preview.exposure_report
+                    self.render_button.configure(text="Render full size")
+                    self.discard_button.pack(side="left", padx=8)
+                    self.status_var.set("Preview ready. Render full size or discard it.")
                 elif kind == "validated":
                     self._validated = True
                     self.render_button.configure(state="normal")
                     self.status_var.set(payload)
                 elif kind == "success":
+                    self.discard_preview()
                     self.status_var.set(payload)
                     self._refresh_sessions()
                     messagebox.showinfo("Panorama stitcher", payload)
@@ -684,9 +767,11 @@ class StitcherApp:
                     self._save_settings()
                     self._refresh_sessions()
                 elif kind == "error":
+                    self.discard_preview()
                     self.status_var.set(f"Error: {payload}")
                     messagebox.showerror("Panorama stitcher", payload)
                 elif kind == "cancelled":
+                    self.discard_preview()
                     self.status_var.set(payload)
                 elif kind == "idle":
                     self._set_busy(False)

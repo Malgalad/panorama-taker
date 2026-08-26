@@ -24,6 +24,7 @@ from pano_stitch.compositor import (
     _to_sdr_srgb,
     _write_exr,
     estimate_render_resources,
+    render_preview,
     render_session,
     validate_images,
 )
@@ -181,6 +182,47 @@ def test_full_sphere_render_has_coverage_and_expected_directions(tmp_path: Path)
         exr_result = np.asarray(image.channels()["RGB"].pixels, dtype=np.float32)
     assert exr_result.shape == (32, 64, 3)
     assert np.all(exr_result > 0.0)
+
+
+def test_render_preview_returns_sdr_pixels_and_exposure_report(tmp_path: Path) -> None:
+    frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
+    session = SessionMetadata(
+        1, "preview", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (frame,), True
+    )
+    Image.new("RGB", (32, 16), (128, 64, 32)).save(tmp_path / frame.filename)
+
+    result = render_preview(
+        session, tmp_path, 24, ".exr", allow_incomplete=True, auto_contrast=True
+    )
+
+    assert result.pixels.shape == (4, 24, 3)
+    assert result.pixels.dtype == np.uint8
+    assert result.exposure_report.gains == (1.0,)
+    assert not any(tmp_path.glob("pano-preview-*"))
+
+
+def test_cached_exposure_reports_completed_progress_before_mapping(tmp_path: Path) -> None:
+    frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
+    session = SessionMetadata(
+        1, "cached-progress", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (frame,), True
+    )
+    Image.new("RGB", (32, 16), (128, 64, 32)).save(tmp_path / frame.filename)
+    preview = render_preview(session, tmp_path, 24, ".png", allow_incomplete=True)
+    progress: list[tuple[int, int, str]] = []
+
+    render_session(
+        session,
+        tmp_path,
+        tmp_path / "cached.png",
+        width=24,
+        allow_incomplete=True,
+        exposure_report=preview.exposure_report,
+        progress_callback=lambda completed, total, phase: progress.append(
+            (completed, total, phase)
+        ),
+    )
+
+    assert progress[0] == (1, 1, "[1/5] exposure (cached)")
 
 
 def test_jpeg_sources_are_supported(tmp_path: Path) -> None:
