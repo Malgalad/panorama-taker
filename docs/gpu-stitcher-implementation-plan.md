@@ -1,5 +1,10 @@
 # GPU stitcher implementation plan
 
+> **Status:** The first implementation following this document became a hybrid CPU/GPU path and
+> does not provide resident GPU acceleration. Use
+> [`full-gpu-stitcher-implementation-plan.md`](full-gpu-stitcher-implementation-plan.md) for the
+> corrective implementation. Do not treat the current map-input CUDA kernel as completion.
+
 ## Goal and constraints
 
 Add an optional NVIDIA CUDA compositor that accelerates projection, bilinear sampling, local

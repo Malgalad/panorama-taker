@@ -3,7 +3,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from importlib import import_module
 from typing import Any
+
+from pano_stitch.cuda_kernels import (
+    ACCUMULATE_EXPOSURE,
+    COMPOSITE_FRAME,
+    COMPOSITE_PROJECTED,
+    NORMALIZE_EXPOSURE,
+)
 
 MiB = 1024 * 1024
 GPU_RESERVE_BYTES = 384 * MiB
@@ -36,46 +44,11 @@ class GpuUnavailableError(RuntimeError):
     """Raised when CUDA cannot be used by an explicitly requested probe."""
 
 
-_COMPOSITE_KERNEL = r"""
-extern "C" __global__ void composite_frame(
-    const float* source, const float* map_x, const float* map_y,
-    const unsigned char* valid, const float* candidate, const float* correction,
-    float* color, float* weight, int source_width, int source_height,
-    int pixels, int hard_blend) {
-  int index = blockDim.x * blockIdx.x + threadIdx.x;
-  if (index >= pixels || !valid[index]) return;
-  float x = map_x[index], y = map_y[index];
-  int x0 = (int)floorf(x), y0 = (int)floorf(y);
-  int x1 = min(x0 + 1, source_width - 1), y1 = min(y0 + 1, source_height - 1);
-  float wx = x - (float)x0, wy = y - (float)y0;
-  int p00 = (y0 * source_width + x0) * 3;
-  int p10 = (y0 * source_width + x1) * 3;
-  int p01 = (y1 * source_width + x0) * 3;
-  int p11 = (y1 * source_width + x1) * 3;
-  float w00 = (1.0f - wx) * (1.0f - wy), w10 = wx * (1.0f - wy);
-  float w01 = (1.0f - wx) * wy, w11 = wx * wy;
-  float c = candidate[index];
-  if (hard_blend) {
-    if (c <= weight[index]) return;
-    for (int channel = 0; channel < 3; ++channel)
-      color[index * 3 + channel] = (source[p00 + channel] * w00 + source[p10 + channel] * w10 +
-        source[p01 + channel] * w01 + source[p11 + channel] * w11) * correction[index];
-    weight[index] = c;
-  } else {
-    for (int channel = 0; channel < 3; ++channel)
-      color[index * 3 + channel] += (source[p00 + channel] * w00 + source[p10 + channel] * w10 +
-        source[p01 + channel] * w01 + source[p11 + channel] * w11) * correction[index] * c;
-    weight[index] += c;
-  }
-}
-"""
-
-
 def cuda_device_info() -> GpuDeviceInfo:
     """Return device capacity without importing CuPy for CPU-only installations."""
 
     try:
-        import cupy as cp  # type: ignore[import-untyped]
+        cp: Any = import_module("cupy")
     except ImportError as exc:
         raise GpuUnavailableError("CuPy is not installed") from exc
     try:
@@ -156,8 +129,8 @@ def cuda_remap_source(source: Any, map_x: Any, map_y: Any) -> Any:
     """
 
     try:
-        import cupy as cp
-        from cupyx.scipy import ndimage  # type: ignore[import-untyped]
+        cp: Any = import_module("cupy")
+        ndimage: Any = import_module("cupyx.scipy.ndimage")
     except ImportError as exc:
         raise GpuUnavailableError("CuPy is not installed") from exc
     device_source = cp.asarray(source, dtype=cp.float32)
@@ -178,12 +151,12 @@ class CudaFrameCompositor:
 
     def __init__(self) -> None:
         try:
-            import cupy as cp
+            cp: Any = import_module("cupy")
         except ImportError as exc:
             raise GpuUnavailableError("CuPy is not installed") from exc
         self._cp = cp
         try:
-            self._kernel = cp.RawKernel(_COMPOSITE_KERNEL, "composite_frame")
+            self._kernel = cp.RawKernel(COMPOSITE_FRAME, "composite_frame")
             self._kernel.compile()
         except Exception as exc:
             raise GpuUnavailableError(f"CUDA kernel compilation failed: {exc}") from exc
@@ -238,3 +211,261 @@ class CudaFrameCompositor:
             np_weight = cp.asnumpy(device_weight).reshape(weight.shape)
             color[...] = np_color
             weight[...] = np_weight
+
+
+class CudaResidentCompositor:
+    """Resident source/accumulator storage for full-frame CUDA rendering."""
+
+    def __init__(
+        self,
+        frame_count: int,
+        source_height: int,
+        source_width: int,
+        output_height: int,
+        output_width: int,
+    ) -> None:
+        try:
+            self._cp: Any = import_module("cupy")
+        except ImportError as exc:
+            raise GpuUnavailableError("CuPy is not installed") from exc
+        cp = self._cp
+        self.sources: Any = None
+        self.color: Any = None
+        self.weight: Any = None
+        self.exposure_sum: Any = None
+        self.exposure_weight: Any = None
+        self._output_exposure: Any = None
+        self.source_uploads = 0
+        self.row_downloads = 0
+        self.source_upload_bytes = 0
+        self.exposure_upload_bytes = 0
+        self.row_download_bytes = 0
+        try:
+            self._normalize_kernel = cp.RawKernel(NORMALIZE_EXPOSURE, "normalize_exposure")
+            self._accumulate_kernel = cp.RawKernel(ACCUMULATE_EXPOSURE, "accumulate_exposure")
+            self._composite_kernel = cp.RawKernel(COMPOSITE_FRAME, "composite_frame")
+            self._projected_kernel = cp.RawKernel(COMPOSITE_PROJECTED, "composite_projected")
+            for kernel in (
+                self._normalize_kernel,
+                self._accumulate_kernel,
+                self._composite_kernel,
+                self._projected_kernel,
+            ):
+                kernel.compile()
+            self.sources = cp.empty((frame_count, source_height, source_width, 3), dtype=cp.float32)
+            self.color = cp.zeros((output_height, output_width, 3), dtype=cp.float32)
+            self.weight = cp.zeros((output_height, output_width), dtype=cp.float32)
+        except Exception as exc:
+            self.sources = None
+            self.color = None
+            self.weight = None
+            cp.get_default_memory_pool().free_all_blocks()
+            message = f"CUDA resident backend initialization failed: {exc}"
+            raise GpuUnavailableError(message) from exc
+
+    def allocate_exposure(self, height: int, width: int) -> None:
+        """Allocate quarter-resolution exposure accumulators on the device."""
+
+        if height < 1 or width < 1:
+            raise ValueError("exposure dimensions must be positive")
+        cp = self._cp
+        self.exposure_sum = cp.zeros((height, width), dtype=cp.float32)
+        self.exposure_weight = cp.zeros((height, width), dtype=cp.float32)
+
+    def normalize_exposure(self) -> None:
+        """Normalize the resident exposure field without a host round trip."""
+
+        if self.exposure_sum is None or self.exposure_weight is None:
+            raise RuntimeError("exposure buffers have not been allocated")
+        pixels = int(self.exposure_sum.size)
+        self._normalize_kernel(
+            ((pixels + 255) // 256,),
+            (256,),
+            (self.exposure_sum, self.exposure_weight, self._cp.int32(pixels)),
+        )
+
+    def accumulate_exposure(
+        self,
+        rotation: Any,
+        latitude_span: float,
+        horizontal_fov: float,
+        vertical_fov: float,
+        log_gain: float,
+    ) -> None:
+        """Accumulate one frame's exposure field entirely on the device."""
+
+        if self.exposure_sum is None or self.exposure_weight is None:
+            raise RuntimeError("exposure buffers have not been allocated")
+        cp = self._cp
+        height, width = self.exposure_sum.shape
+        pixels = int(width * height)
+        device_rotation = cp.asarray(rotation, dtype=cp.float32).reshape(9)
+        self._accumulate_kernel(
+            ((pixels + 255) // 256,),
+            (256,),
+            (
+                self.exposure_sum,
+                self.exposure_weight,
+                self._cp.int32(width),
+                self._cp.int32(height),
+                self._cp.float32(latitude_span),
+                device_rotation,
+                self._cp.int32(self.sources.shape[2]),
+                self._cp.int32(self.sources.shape[1]),
+                self._cp.float32(horizontal_fov),
+                self._cp.float32(vertical_fov),
+                self._cp.float32(log_gain),
+            ),
+        )
+
+    def upload_source(self, frame_position: int, source: Any) -> None:
+        """Upload one decoded source into its permanent device slot."""
+
+        self.sources[frame_position] = self._cp.asarray(source, dtype=self._cp.float32)
+        self.source_uploads += 1
+        self.source_upload_bytes += int(source.nbytes)
+
+    def composite_maps(
+        self,
+        frame_position: int,
+        map_x: Any,
+        map_y: Any,
+        valid: Any,
+        candidate: Any,
+        correction: Any,
+        source_width: int,
+        source_height: int,
+        hard_blend: bool,
+    ) -> None:
+        """Accumulate one frame into resident output buffers without downloading them."""
+
+        cp = self._cp
+        device_map_x = cp.asarray(map_x, dtype=cp.float32).ravel()
+        device_map_y = cp.asarray(map_y, dtype=cp.float32).ravel()
+        device_valid = cp.asarray(valid, dtype=cp.uint8).ravel()
+        device_candidate = cp.asarray(candidate, dtype=cp.float32).ravel()
+        device_correction = cp.asarray(correction, dtype=cp.float32).ravel()
+        pixels = int(device_map_x.size)
+        if pixels != int(self.color.shape[0] * self.color.shape[1]):
+            raise ValueError("resident composite maps must cover the complete output")
+        self._composite_kernel(
+            ((pixels + 255) // 256,),
+            (256,),
+            (
+                self.sources[frame_position],
+                device_map_x,
+                device_map_y,
+                device_valid,
+                device_candidate,
+                device_correction,
+                self.color,
+                self.weight,
+                self._cp.int32(source_width),
+                self._cp.int32(source_height),
+                self._cp.int32(pixels),
+                self._cp.int32(hard_blend),
+            ),
+        )
+
+    def composite_projected(
+        self,
+        frame_position: int,
+        exposure: Any,
+        rotation: Any,
+        latitude_span: float,
+        horizontal_fov: float,
+        vertical_fov: float,
+        hard_blend: bool,
+        log_gain: float = 0.0,
+    ) -> None:
+        """Project and blend a resident source without host-side map arrays."""
+
+        cp = self._cp
+        pixels = int(self.color.shape[0] * self.color.shape[1])
+        device_exposure = cp.asarray(exposure, dtype=cp.float32)
+        if device_exposure.ndim != 2:
+            raise ValueError("resident exposure must be a two-dimensional field")
+        device_rotation = cp.asarray(rotation, dtype=cp.float32).reshape(9)
+        exposure_height, exposure_width = map(int, device_exposure.shape)
+        self._projected_kernel(
+            ((pixels + 255) // 256,),
+            (256,),
+            (
+                self.sources[frame_position],
+                device_exposure,
+                self.color,
+                self.weight,
+                self._cp.int32(self.sources.shape[2]),
+                self._cp.int32(self.sources.shape[1]),
+                self._cp.int32(self.color.shape[1]),
+                self._cp.int32(self.color.shape[0]),
+                self._cp.float32(latitude_span),
+                self._cp.float32(horizontal_fov),
+                self._cp.float32(vertical_fov),
+                device_rotation,
+                self._cp.int32(hard_blend),
+                self._cp.int32(exposure_width),
+                self._cp.int32(exposure_height),
+                self._cp.float32(log_gain),
+            ),
+        )
+
+    def set_output_exposure(self, exposure: Any) -> None:
+        """Keep the exposure field resident without expanding it on the host."""
+
+        device_exposure = self._cp.asarray(exposure, dtype=self._cp.float32)
+        if device_exposure.ndim != 2:
+            raise ValueError("resident exposure must be a two-dimensional field")
+        self.exposure_upload_bytes += int(exposure.nbytes)
+        self._output_exposure = device_exposure
+
+    def composite_projected_with_gain(
+        self,
+        frame_position: int,
+        log_gain: float,
+        rotation: Any,
+        latitude_span: float,
+        horizontal_fov: float,
+        vertical_fov: float,
+        hard_blend: bool,
+    ) -> None:
+        """Composite using a resident exposure field and device-side gain correction."""
+
+        if self._output_exposure is None:
+            raise RuntimeError("output exposure has not been uploaded")
+        self.composite_projected(
+            frame_position,
+            self._output_exposure,
+            rotation,
+            latitude_span,
+            horizontal_fov,
+            vertical_fov,
+            hard_blend,
+            log_gain,
+        )
+
+    def download_rows(self, row_start: int, row_end: int) -> tuple[Any, Any]:
+        """Copy only finished rows to host memory."""
+
+        self._cp.cuda.runtime.deviceSynchronize()
+        self.row_downloads += 1
+        color = self._cp.asnumpy(self.color[row_start:row_end])
+        weight = self._cp.asnumpy(self.weight[row_start:row_end])
+        self.row_download_bytes += int(color.nbytes + weight.nbytes)
+        return color, weight
+
+    def close(self) -> None:
+        """Release resident allocations after stream synchronization."""
+
+        try:
+            self._cp.cuda.runtime.deviceSynchronize()
+        except Exception:
+            pass
+        finally:
+            self.sources = None
+            self.color = None
+            self.weight = None
+            self.exposure_sum = None
+            self.exposure_weight = None
+            self._output_exposure = None
+            self._cp.get_default_memory_pool().free_all_blocks()

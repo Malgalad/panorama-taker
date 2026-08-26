@@ -24,12 +24,14 @@ from PIL import Image
 
 from pano_stitch.gpu import (
     CudaFrameCompositor,
+    CudaResidentCompositor,
     GpuUnavailableError,
     cuda_device_info,
     resident_gpu_plan,
 )
 from pano_stitch.metadata import FrameMetadata, ImageEncoding, SessionMetadata
 from pano_stitch.projection import (
+    _frame_rotation,
     camera_maps,
     equirectangular_directions,
     rectilinear_directions,
@@ -754,9 +756,7 @@ def _composite_strip(
         correction = (
             _local_exposure_multiplier(
                 log_gain,
-                _local_exposure_rows(
-                    local_exposure, row_start, rows, output_width, output_height
-                ),
+                _local_exposure_rows(local_exposure, row_start, rows, output_width, output_height),
             )
             if local_exposure is not None
             else np.ones((rows, output_width), dtype=np.float32)
@@ -1231,7 +1231,7 @@ def render_session(
         elif progress_callback is not None:
             progress_callback(exposure_work, exposure_work, f"{phase_labels['exposure']} (cached)")
         scratch_root = Path(scratch_directory)
-        cuda_compositor: CudaFrameCompositor | None = None
+        cuda_compositor: CudaFrameCompositor | CudaResidentCompositor | None = None
         if use_gpu is not False:
             try:
                 device = cuda_device_info()
@@ -1249,7 +1249,13 @@ def render_session(
                     gpu_budget_bytes=gpu_memory_budget_bytes,
                 )
                 if resident_plan is not None:
-                    cuda_compositor = CudaFrameCompositor()
+                    cuda_compositor = CudaResidentCompositor(
+                        len(session.frames),
+                        first_source.height,
+                        first_source.width,
+                        output_height,
+                        output_width,
+                    )
             except (GpuUnavailableError, MemoryError):
                 cuda_compositor = None
         local_exposure_path = scratch_root / "local-exposure.f32"
@@ -1271,8 +1277,27 @@ def render_session(
             )
             local_exposure[:] = 0.0
             local_weight[:] = 0.0
+            if isinstance(cuda_compositor, CudaResidentCompositor):
+                try:
+                    cuda_compositor.allocate_exposure(exposure_height, exposure_width)
+                    for frame_position, frame in enumerate(session.frames):
+                        cuda_compositor.accumulate_exposure(
+                            _frame_rotation(frame),
+                            latitude_span,
+                            session.horizontal_fov_deg,
+                            session.vertical_fov_deg,
+                            exposure_report.log_gains[frame_position],
+                        )
+                    cuda_compositor.normalize_exposure()
+                    cuda_compositor._cp.cuda.runtime.deviceSynchronize()
+                except Exception:
+                    cuda_compositor.close()
+                    cuda_compositor = None
             mapping_completed = 0
-            for frame_position, frame in enumerate(session.frames):
+            cpu_exposure_frames = (
+                () if isinstance(cuda_compositor, CudaResidentCompositor) else session.frames
+            )
+            for frame_position, frame in enumerate(cpu_exposure_frames):
                 for row_start in range(0, exposure_height, exposure_strip_height):
                     if cancel_event is not None and cancel_event.is_set():
                         raise RenderCancelledError("render cancelled")
@@ -1298,7 +1323,12 @@ def render_session(
                         progress_callback(
                             mapping_completed, local_exposure_work, phase_labels["exposure mapping"]
                         )
-            for row_start in range(0, exposure_height, exposure_strip_height):
+            cpu_exposure_rows = (
+                ()
+                if isinstance(cuda_compositor, CudaResidentCompositor)
+                else range(0, exposure_height, exposure_strip_height)
+            )
+            for row_start in cpu_exposure_rows:
                 if cancel_event is not None and cancel_event.is_set():
                     raise RenderCancelledError("render cancelled")
                 rows = min(exposure_strip_height, exposure_height - row_start)
@@ -1315,6 +1345,9 @@ def render_session(
                     )
             local_exposure.flush()
         except Exception:
+            if isinstance(cuda_compositor, CudaResidentCompositor):
+                cuda_compositor.close()
+                cuda_compositor = None
             if local_weight is not None:
                 _close_scratch_memmap(local_weight)
             if local_exposure is not None:
@@ -1345,6 +1378,9 @@ def render_session(
                 _close_scratch_memmap(color_scratch)
             if weight_scratch is not None:
                 _close_scratch_memmap(weight_scratch)
+            if isinstance(cuda_compositor, CudaResidentCompositor):
+                cuda_compositor.close()
+                cuda_compositor = None
             _close_scratch_memmap(local_exposure)
             raise
         assert color_scratch is not None
@@ -1360,6 +1396,29 @@ def render_session(
                         _image_path(image_root, frame.filename), first_source.encoding
                     )
                     try:
+                        if isinstance(cuda_compositor, CudaResidentCompositor):
+                            cuda_compositor.upload_source(frame_position, source)
+                            if frame_position == 0:
+                                if cuda_compositor.exposure_sum is None:
+                                    raise RuntimeError("GPU exposure field was not initialized")
+                                cuda_compositor.set_output_exposure(cuda_compositor.exposure_sum)
+                            cuda_compositor.composite_projected_with_gain(
+                                frame_position,
+                                exposure_report.log_gains[frame_position],
+                                _frame_rotation(frame),
+                                latitude_span,
+                                session.horizontal_fov_deg,
+                                session.vertical_fov_deg,
+                                blend == "hard",
+                            )
+                            compositing_completed += composite_strips
+                            if progress_callback is not None:
+                                progress_callback(
+                                    compositing_completed,
+                                    compositing_work,
+                                    phase_labels["compositing"],
+                                )
+                            continue
                         with ThreadPoolExecutor(max_workers=compositor_workers) as executor:
                             futures = [
                                 executor.submit(
@@ -1395,6 +1454,15 @@ def render_session(
                                     )
                     finally:
                         del source
+
+                if isinstance(cuda_compositor, CudaResidentCompositor):
+                    for row_start in range(0, output_height, strip_height):
+                        rows = min(strip_height, output_height - row_start)
+                        color_rows, weight_rows = cuda_compositor.download_rows(
+                            row_start, row_start + rows
+                        )
+                        color_scratch[row_start : row_start + rows] = color_rows
+                        weight_scratch[row_start : row_start + rows] = weight_rows
 
             auto_levels: tuple[float, float] | None = None
             if auto_contrast_active:
@@ -1542,6 +1610,8 @@ def render_session(
                 raise
             return exposure_report
         finally:
+            if isinstance(cuda_compositor, CudaResidentCompositor):
+                cuda_compositor.close()
             _close_scratch_memmap(color_scratch)
             _close_scratch_memmap(weight_scratch)
             _close_scratch_memmap(local_exposure)

@@ -5,8 +5,10 @@ from types import SimpleNamespace
 
 import pytest
 
+import pano_stitch.gpu as gpu
 from pano_stitch.gpu import (
     GPU_OVERHEAD_BYTES,
+    CudaResidentCompositor,
     GpuUnavailableError,
     MiB,
     cuda_device_info,
@@ -76,3 +78,64 @@ def test_cuda_device_info_wraps_driver_failure(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setitem(sys.modules, "cupy", SimpleNamespace(cuda=SimpleNamespace(runtime=runtime)))
     with pytest.raises(GpuUnavailableError, match="probe failed: insufficient driver"):
         cuda_device_info()
+
+
+def test_resident_backend_compiles_before_allocating(monkeypatch: pytest.MonkeyPatch) -> None:
+    compiled: list[str] = []
+
+    class Kernel:
+        def __init__(self, _source: str, name: str) -> None:
+            self.name = name
+
+        def compile(self) -> None:
+            compiled.append(self.name)
+            if self.name == "composite_projected":
+                raise RuntimeError("NVRTC unavailable")
+
+    memory_pool = SimpleNamespace(free_all_blocks=lambda: None)
+    cp = SimpleNamespace(
+        RawKernel=Kernel,
+        float32=object(),
+        empty=lambda *_args, **_kwargs: pytest.fail("allocation must not be attempted"),
+        get_default_memory_pool=lambda: memory_pool,
+    )
+    monkeypatch.setattr(gpu, "import_module", lambda _name: cp)
+
+    with pytest.raises(GpuUnavailableError, match="NVRTC unavailable"):
+        CudaResidentCompositor(1, 1, 1, 1, 1)
+    assert compiled == [
+        "normalize_exposure",
+        "accumulate_exposure",
+        "composite_frame",
+        "composite_projected",
+    ]
+
+
+def test_resident_backend_frees_partial_allocation_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    freed = False
+
+    class Kernel:
+        def __init__(self, _source: str, _name: str) -> None:
+            pass
+
+        def compile(self) -> None:
+            pass
+
+    def free_all_blocks() -> None:
+        nonlocal freed
+        freed = True
+
+    cp = SimpleNamespace(
+        RawKernel=Kernel,
+        float32=object(),
+        empty=lambda *_args, **_kwargs: object(),
+        zeros=lambda *_args, **_kwargs: (_ for _ in ()).throw(MemoryError("out of memory")),
+        get_default_memory_pool=lambda: SimpleNamespace(free_all_blocks=free_all_blocks),
+    )
+    monkeypatch.setattr(gpu, "import_module", lambda _name: cp)
+
+    with pytest.raises(GpuUnavailableError, match="out of memory"):
+        CudaResidentCompositor(1, 1, 1, 1, 1)
+    assert freed
