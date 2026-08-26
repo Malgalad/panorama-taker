@@ -112,6 +112,11 @@ def _parser() -> argparse.ArgumentParser:
         type=int,
         help="maximum VRAM budget; default is available VRAM minus safety reserve",
     )
+    render.add_argument(
+        "--gpu-strict",
+        action="store_true",
+        help="fail instead of falling back to CPU when CUDA cannot be selected",
+    )
     render.add_argument("--allow-incomplete", action="store_true")
     return parser
 
@@ -172,6 +177,7 @@ def main() -> None:
                     if arguments.gpu_memory_budget_mib is not None
                     else None
                 ),
+                strict_gpu=arguments.gpu_strict,
             )
             print(file=sys.stderr)
             gains = ", ".join(f"{gain:.3f}" for gain in exposure_report.gains)

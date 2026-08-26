@@ -1,422 +1,491 @@
-# Full-GPU stitcher corrective implementation plan
+# Full GPU stitcher implementation plan
 
-## Objective
+## Goal
 
-Maintain two complete rendering paths: the existing CPU renderer and a genuinely GPU-resident CUDA
-renderer. CUDA is preferred when enabled, available, and large enough for the current panorama;
-otherwise the application uses the CPU renderer. During CUDA geometry and compositing, decoded
-source pixels, exposure fields, color accumulators, and weight accumulators must stay in VRAM.
-Projection, validity, edge weighting, bilinear sampling, local exposure correction, and blending
-must execute inside CUDA kernels.
+Build two independent renderers:
 
-The CPU renderer remains supported, tested, and independently selectable. Do not replace it with
-CuPy operations, make CuPy a base dependency, or weaken its memory-bounded strip/memmap behavior.
-Users without a supported NVIDIA GPU must retain all existing stitcher functionality.
+- the existing memory-bounded CPU renderer;
+- a CUDA renderer that keeps source pixels and numerical image processing on the GPU.
 
-CPU work may remain for image decode, the small robust exposure solve, metadata validation,
-auto-contrast, color/output conversion, and file encoding. Those operations must not run once per
-source/output strip except for the final bounded row download used by the existing writers.
+The CUDA renderer must be practical on a normal Cyberpunk-capable NVIDIA card, using a 6 GiB card
+as the baseline rather than assuming a 32 GiB development GPU. AMD and Intel devices require a
+different backend and are outside this CUDA implementation.
 
-GPU mode is successful only if profiling shows no full-size `directions`, `map_x`, `map_y`,
-`valid`, `edge_distance`, `candidate`, or `correction` NumPy arrays during compositing and no
-source/output round trip per strip.
+CUDA mode may use the CPU only for validation, file decode, asynchronous upload, orchestration,
+UI/logging, final result download, and file encoding. Projection, exposure analysis and solving,
+local exposure, sampling, blending, coverage, auto contrast, tone/color conversion, and output
+quantization execute on the GPU.
 
-## Current state and code to remove
+The GPU path must not call CPU projection/compositing helpers, create compositor memmaps, or write
+disk scratch while numerical work is in progress.
 
-The current implementation is a parity prototype, not acceleration:
+## Feasibility
 
-- `compositor._composite_strip()` computes directions, camera maps, validity, weights, and local
-  correction on CPU.
-- `CudaFrameCompositor.composite()` calls `cp.asarray()` for the source and every per-pixel input on
-  every strip.
-- It calls `deviceSynchronize()` and `cp.asnumpy()` for color and weights after every strip.
-- Color and weight remain disk-backed NumPy memmaps, so every frame repeatedly crosses PCIe.
-- The current CUDA kernel receives precomputed maps and therefore cannot fuse projection.
-- The VRAM planner reserves space for resident sources/accumulators, but those allocations are not
-  actually made. Admission success does not prove the intended execution mode.
-- CUDA failure and VRAM rejection silently select CPU, so tests and benchmarks can accidentally
-  claim GPU success.
+This is feasible with CuPy, NVRTC, custom CUDA kernels, pinned host buffers, streams, and events.
+CUDA work is asynchronous; pinned memory and non-default streams permit decode/upload overlap.
+CuPy supports resident device and pinned memory pools and custom raw CUDA modules.
 
-After the resident CUDA path passes parity tests, delete only the obsolete hybrid CUDA pieces:
+The constraint "all data in VRAM" applies to all source pixels and active GPU workspaces. A complete
+full-resolution output is also resident when it fits. On smaller cards, the output is computed in
+GPU row bands and copied into one final host-RAM output array; sources remain resident and no image
+math moves to CPU. This avoids disk backing and makes 6 GiB cards viable.
 
-- `cuda_remap_source()` except as a test-only reference if still useful;
-- the current map-input `_COMPOSITE_KERNEL`;
-- `CudaFrameCompositor.composite()` and its per-strip upload/download contract;
-- the `cuda_compositor` parameter and branch in `_composite_strip()`.
+If even native-precision sources plus the minimum workspaces cannot fit, the requirement is
+physically impossible for that capture. Report the required/available memory and select the CPU
+renderer before source upload.
 
-Do not delete `_composite_strip()` or modify its CPU algorithm beyond removing the hybrid CUDA
-branch. It remains the production CPU fallback.
+## Required behavior
 
-## Required architecture
+- GPU enabled by default; explicit CPU mode remains available.
+- Automatic fallback occurs only before the first numerical CUDA kernel.
+- A CUDA error after computation starts fails the render and cleans up; it never resumes halfway
+  on CPU.
+- CPU mode never imports CuPy and retains its strips, workers, memmaps, and output behavior.
+- CUDA mode never calls `_composite_strip()`, `_estimate_exposure_gains()`, CPU camera-map helpers,
+  CPU auto contrast, or CPU color conversion.
+- Preserve projection formulas, capture order, hard-blend ties, feather behavior, schema, filenames,
+  defaults, HDR/Rec.2020/PQ/EXR behavior, and incomplete-output magenta.
+- Do not enable CUDA fast math.
+- Do not launch exposure/compositing once per frame from Python.
+- Preview and full render use the same CUDA pipeline.
+
+## Architecture
 
 ```text
-validated render request
-        |
-        +--> GPU disabled/unavailable/too small/allocation failure
-        |        -> existing memory-bounded CPU renderer
-        |
-        `--> CUDA admitted
-                 -> decode each source on CPU
-                 -> one upload per source into device_sources[frame, y, x, rgb]
-                 -> device exposure mapping and normalization
-                 -> device projection, sampling, correction, and blending
-                 -> finish kernel
-                 -> bounded D2H row copies
-                 -> existing CPU writer
+render request
+    |
+    +-- validate/probe/decode metadata
+    +-- select backend and memory mode
+    |
+    +-- CPU ---------------------------> existing CPU pipeline
+    |
+    `-- CUDA
+          +-- allocate session buffers transactionally
+          +-- decode sources into two pinned host slots
+          +-- upload every source once
+          +-- solve global exposure on GPU
+          +-- build local exposure on GPU
+          +-- compose full frame or output bands on GPU
+          +-- auto contrast + color conversion on GPU
+          +-- download completed output to host RAM
+          +-- encode staged output file
+          `-- atomic rename
 ```
 
-All frame launches use one CUDA stream and retain frame order. No atomics are required because one
-thread owns one output pixel and frames are processed sequentially.
-
-## Backend selection and fallback contract
-
-Expose one user-facing preference with GPU enabled by default. Internally distinguish automatic,
-forced CPU, and strict CUDA behavior:
-
-| Mode | Selection behavior | Failure behavior |
-| --- | --- | --- |
-| Automatic/default | Try CUDA admission first | Report reason and use CPU |
-| GPU disabled | Select CPU without probing CUDA | Render on CPU |
-| Strict CUDA (tests/benchmark only) | Require CUDA | Raise; never run CPU |
-
-Automatic fallback is allowed only before CUDA output writing begins. If CUDA import, device probe,
-kernel compilation, VRAM admission, or initial allocation fails, release CUDA resources and invoke
-the CPU renderer from the beginning. A CUDA failure after rendering or staged output writing starts
-is a render failure; do not silently mix CPU and CUDA output or resume halfway on CPU.
-
-Both renderers must accept the same session geometry, output format, width, blend, incomplete-mode,
-auto-contrast, coverage, cancellation, preview, thumbnail, and progress options. Backend selection
-must not change schemas, filenames, defaults unrelated to acceleration, or color behavior.
-
-## Phase 1: make backend selection observable
-
-Before changing numerical code, prevent silent false positives.
-
-1. Add these immutable types to `gpu.py`:
-
-   ```python
-   @dataclass(frozen=True)
-   class GpuSelection:
-       requested: bool
-       selected_backend: Literal["cpu", "cuda"]
-       device_name: str | None
-       required_bytes: int | None
-       available_bytes: int | None
-       fallback_reason: str | None
-   ```
-
-2. Extend `RenderResources` with `backend`, `device_name`, `gpu_required_bytes`,
-   `gpu_available_bytes`, and `fallback_reason`. Prefer an existing named type if the code already
-   has gained one.
-3. Make one shared selector perform import, device probe, VRAM calculation, and kernel warm-up.
-4. Automatic mode may fall back. Add an internal `strict_gpu=True` option for tests and the
-   benchmark; it must raise instead of falling back.
-5. CLI and GUI must report `CUDA: <device>` or `CPU fallback: <reason>` before rendering.
-6. The benchmark must assert that `selected_backend == "cuda"` before starting its GPU timing.
-
-Tests:
-
-- fake missing CuPy, driver error, no device, compile error, insufficient VRAM, and allocation OOM;
-- automatic mode returns a structured CPU selection for each;
-- strict mode raises for each;
-- a CUDA benchmark cannot complete while using CPU.
-
-## Phase 2: separate CUDA source and backend ownership
-
-Create `stitcher/src/pano_stitch/cuda_kernels.py` containing only the CUDA source string and a lazy
-`RawModule` factory. Keep device ownership in `gpu.py`.
-
-Create `CudaCompositor` as a context manager with this lifecycle:
+Split orchestration explicitly:
 
 ```python
-with CudaCompositor(plan, geometry, blend) as compositor:
-    compositor.upload_sources(decoded_sources)
-    compositor.build_exposure(log_gains)
-    compositor.composite(log_gains)
-    compositor.download_rows(writer, coverage_writer)
+def render_session(...):
+    request = _validate_request(...)
+    selection = select_backend(request)
+    if selection.backend == "cuda":
+        return _render_cuda(request, selection)
+    return _render_cpu(request)
+
+
+def _render_cpu(request):
+    # Existing implementation, mechanically moved and behavior-preserving.
+
+
+def _render_cuda(request, selection):
+    # CUDA session only; no CPU image-processing helpers or memmaps.
 ```
 
-The class owns and preallocates:
+## Named types
 
-- `sources`: `(frame_count, source_height, source_width, 3)`, float32;
-- `rotations`: `(frame_count, 9)`, float32;
-- `log_gains`: `(frame_count,)`, float32;
-- `exposure_sum`, `exposure_weight`: quarter-resolution float32;
-- `local_exposure`: quarter-resolution float32; reuse `exposure_sum` after normalization;
-- `color`: `(output_height, output_width, 3)`, float32;
-- `weight`: `(output_height, output_width)`, float32;
-- one device output staging region only if the finish kernel cannot reuse accumulator rows;
-- one pinned host row staging buffer sized from the existing CPU writer strip height;
-- coverage staging buffer when requested;
-- an uncovered counter and cancellation/error state.
-
-Allocate every buffer in `__enter__` before rendering begins. If allocation fails, close the CUDA
-context state and restart the untouched CPU renderer from phase one. Never fall back after a staged
-output has begun.
-
-`close()` must synchronize, drop owned arrays, and release free blocks held by CuPy's pool. It must
-run after success, cancellation, or error.
-
-## Phase 3: fused geometry helper in CUDA
-
-Write one inline CUDA device function used by both exposure and compositing kernels:
-
-```text
-project_pixel(global_x, global_y, output_width, output_height, latitude_span,
-              rotation[9], source_width, source_height)
-    -> valid, map_x, map_y, edge_distance
-```
-
-It must reproduce these CPU formulas exactly:
-
-1. Pixel centers use `x + 0.5` and `y + 0.5`.
-2. Longitude is `(x / width - 0.5) * 2*pi`.
-3. Latitude is `(0.5 - y / height) * radians(latitude_span)`.
-4. World direction is `(cos(lat)*sin(lon), sin(lat), cos(lat)*cos(lon))`.
-5. Multiply by the row-major world-to-camera rotation produced by `_frame_rotation()` on CPU.
-6. Use source-width/source-height focal lengths and centers exactly as `camera_maps()` does.
-7. Validity uses `z > 0` and half-pixel source bounds.
-8. Clamp maps to `[0, dimension - 1]` before sampling/edge distance.
-9. Edge distance is the minimum of all four clamped edge distances.
-
-Do not pass direction/map/mask arrays to CUDA. Pass only scalar geometry and the 3x3 rotation.
-Do not enable CUDA fast math.
-
-Direct tests must cover seam columns, poles, cardinal directions, behind-camera directions,
-half-pixel bounds, Euler rotations, and recorded basis matrices. Compare kernel diagnostics against
-`equirectangular_directions()` and `camera_maps()` with maximum map error `<= 2e-4` source pixels.
-
-## Phase 4: GPU exposure field
-
-Implement these kernels:
-
-### `clear_buffers`
-
-Zero the exposure and compositor buffers. `cp.zeros()` is acceptable only if it allocates the final
-resident arrays once; do not create per-frame arrays.
-
-### `accumulate_exposure`
-
-One thread owns one quarter-resolution exposure pixel. It calls `project_pixel`, computes:
-
-```text
-feather_width = max(1, min(source_width, source_height) * 0.08)
-weight = valid ? max(edge_distance / feather_width, 1e-6) : 0
-exposure_sum[p] += weight * log_gain[frame]
-exposure_weight[p] += weight
-```
-
-Launch once per frame in capture order.
-
-### `normalize_exposure`
-
-Divide the sum by weight where weight is positive. Leave uncovered values zero, matching the CPU
-memmap initialization.
-
-After this phase there must be no host copy of the full local exposure field. For a debug test only,
-allow an explicit download and compare against the CPU field.
-
-## Phase 5: fully fused frame compositing
-
-Replace the existing map-input kernel with a kernel whose thread inputs are only the output pixel,
-frame index, scalar geometry, resident sources/rotations/log gains/exposure, and resident
-accumulators.
-
-For each pixel:
-
-1. Call `project_pixel`; return immediately when invalid.
-2. Bilinearly sample interleaved resident source RGB using float32 and clamped neighbors.
-3. Bilinearly sample the quarter-resolution local-exposure field using exactly
-   `_local_exposure_rows()` pixel-center mapping and clamping.
-4. Apply `expf(log_gain[frame] - local_exposure)`.
-5. Compute hard or feather candidate exactly like CPU.
-6. Hard: replace only when `candidate > old_weight`; preserve strict frame-order ties.
-7. Feather: add corrected RGB times candidate and add candidate to weight.
-
-Launch once per frame, sequentially on one stream. Check cancellation between launches. Do not call
-`deviceSynchronize()` inside the frame loop; stream ordering is sufficient. Synchronize only for a
-host-visible progress/cancellation checkpoint, finish, download, error reporting, or teardown.
-
-Tests:
-
-- integer, half-pixel, and four-border bilinear samples;
-- hard selection ties and frame order;
-- feather accumulation;
-- local-exposure interpolation and correction;
-- two-frame and complete synthetic panorama parity before encoding;
-- HDR values above one and negative finite values where the CPU preserves them.
-
-## Phase 6: finish and bounded download
-
-Implement `finish_rows` over a requested row range:
-
-- compute coverage from `weight > 0`;
-- divide feather color by weight once;
-- leave hard color unchanged;
-- write magenta for uncovered pixels only when incomplete output is allowed;
-- count uncovered pixels in a uint64 counter;
-- optionally write coverage bytes;
-- do not perform SDR transfer functions or tone mapping in CUDA in this change.
-
-For each writer strip:
-
-1. Launch `finish_rows` for that row range.
-2. Copy RGB and optional coverage into reusable pinned host staging buffers.
-3. Synchronize the copy.
-4. Call the existing PNG/JPEG/EXR and coverage writers.
-
-This is the only full-resolution device-to-host traffic in normal rendering. No color or weight
-array is copied back after an individual frame.
-
-If auto contrast needs two passes, finish/normalize once on device, stream rows to the existing
-histogram pass, then stream the same finished device rows again to the writer. Do not download a
-full panorama merely for auto contrast.
-
-## Phase 7: compositor integration
-
-In `compositor.py`, split orchestration cleanly:
+Add immutable types instead of returning ambiguous tuples:
 
 ```python
-def _render_cpu(...): ...       # existing implementation
-def _render_cuda(...): ...      # new resident backend
-def render_session(...):        # validation, selection, staging, dispatch
+@dataclass(frozen=True)
+class BackendSelection:
+    backend: Literal["cpu", "cuda"]
+    device_name: str | None
+    memory_mode: Literal["cpu", "resident", "banded"]
+    required_bytes: int | None
+    available_bytes: int | None
+    reason: str
+
+
+@dataclass(frozen=True)
+class CudaMemoryPlan:
+    source_bytes: int
+    session_workspace_bytes: int
+    output_workspace_bytes: int
+    host_output_bytes: int
+    reserve_bytes: int
+    output_band_rows: int | None
+    required_bytes: int
+    available_bytes: int
+
+
+@dataclass(frozen=True)
+class CudaTransferStats:
+    source_uploads: int
+    host_to_device_bytes: int
+    device_to_host_bytes: int
+    kernel_launches: int
+    synchronizations: int
+    peak_device_bytes: int
+    disk_scratch_bytes: int
 ```
 
-Do not send `CudaCompositor` through `_composite_strip()` or `ThreadPoolExecutor`. CUDA mode must
-not allocate CPU color/weight/local-exposure memmaps. It may use the existing temporary directory
-only for staged output formats and writers.
+Create two ownership classes in `gpu.py`:
 
-`render_session()` owns common validation and backend selection, then calls exactly one renderer.
-The CPU renderer must not import CuPy or probe CUDA. The CUDA renderer must not call
-`_composite_strip()` or allocate the CPU accumulator memmaps. Keep their resource lifetimes and
-cleanup independent so fallback cannot leave mixed state.
+- `CudaSession`: device, streams/events, source pixels, rotations, exposure-solve buffers, gains;
+- `CudaOutputJob`: preview/panorama/thumbnail geometry, local exposure, output buffers, conversion.
 
-Keep these shared:
+Both are context managers. Allocation is transactional and `close()` is idempotent after success,
+cancellation, or failure. CUDA C source remains in `cuda_kernels.py`.
 
-- source probing and decode functions;
-- robust 256x128 exposure gain solve;
-- metadata/session validation;
-- output dimension calculation;
-- temporary output replacement and failure cleanup;
-- writer classes and color/output conversions;
-- progress callback vocabulary;
-- cancellation exception;
-- thumbnail and preview public behavior.
+## Memory model for ordinary GPUs
 
-Implement preview and thumbnail through the same CUDA backend with their own output geometry. Do
-not retain the current separate CPU-only thumbnail compositor when GPU is selected.
+### Store sources in native precision
 
-## Phase 8: accurate VRAM admission
+Do not blindly expand every source to float32 RGB in VRAM:
 
-Update the planner to match the actual allocations, including alignment and both temporary staging
-buffers. Add a test that compares the plan with the sum of `array.nbytes` for a tiny real CUDA
-allocation.
+- JPEG and 8-bit PNG: interleaved uint8;
+- 16-bit PNG: interleaved uint16;
+- float/EXR: float32 unless the file is explicitly half and half precision is proven lossless for
+  the current contract;
+- keep one source encoding descriptor used by device sampling/conversion.
 
-Admission sequence:
+Convert to working float32 inside sampling kernels. This reduces ordinary SDR source VRAM by 4x
+without changing source values.
 
-1. Probe current free/total VRAM.
-2. Reserve `max(384 MiB, 15% of total)`.
-3. Apply the optional user GPU budget.
-4. Calculate the exact resident plan.
-5. Reject before decoding all sources if it cannot fit.
-6. Allocate all device buffers.
-7. On the first allocation OOM, free owned/cached blocks and fall back to CPU from the beginning.
-8. Do not retry with the current hybrid/per-strip CUDA path.
+### Two output modes
 
-The 3 GiB minimum is not a promise that every panorama uses CUDA. If the complete resident working
-set does not fit, report the required and available MiB and use CPU.
+`resident` mode allocates the full linear output, coverage, local exposure, histogram, and optional
+uint8 output in VRAM.
 
-## Phase 9: tests and proof that work is on GPU
+`banded` mode keeps all sources and session data resident but allocates only:
 
-CPU-only CI tests:
+- full quarter-resolution local exposure;
+- one linear output band;
+- one coverage band;
+- one converted uint8 band when needed;
+- one pinned host band and one complete final host output array.
 
-- all selection/fallback cases with a fake adapter;
-- no import of CuPy at application import time;
-- no device allocation after admission rejection;
-- CLI/GUI propagate GPU preference and budget;
-- cancellation and staged-file cleanup for CUDA adapter failures;
-- CPU output/default behavior remains unchanged.
-- explicit GPU-disabled mode never imports/probes CuPy;
-- automatic fallback invokes the complete CPU renderer from its beginning exactly once;
-- every public render option is passed identically to both backend entry points.
+Each completed band is copied into its final location in host RAM. It is never used for additional
+CPU image math and is not written to disk until all bands finish. Auto-contrast histogram is built
+on the first GPU pass; conversion/download is a second GPU band pass only when auto contrast is
+enabled.
 
-Real CUDA tests, marked and skipped without a device:
+Choose the largest band that fits after reserving `max(384 MiB, 15% of total VRAM)`. The minimum
+band is 32 rows. If sources plus session buffers plus a 32-row band do not fit, use CPU.
 
-- all direct geometry/exposure/composite/finish kernel tests;
-- CPU/CUDA end-to-end parity for hard and feather;
-- full-sphere and horizontal output;
-- PNG 8/16, JPEG, PQ/Rec.2020, and EXR sources;
-- auto contrast on/off, preview, thumbnail, incomplete output, and coverage diagnostic;
-- an intentionally insufficient GPU budget uses CPU in automatic mode and raises in strict mode.
+The plan must use exact array sizes and verify planned versus actual CuPy pool usage in tests.
 
-Add a transfer-audit adapter used by tests. For a render with `N` sources and `S` writer strips,
-assert:
+## Decode and upload
+
+1. Allocate the complete device source tensor/buffer and session metadata first.
+2. Allocate two reusable pinned host source slots.
+3. Decode with at most two producer workers into a free slot.
+4. Enqueue `cudaMemcpyAsync` into a non-default upload stream.
+5. Protect slot reuse with a CUDA event.
+6. Release ordinary decoded arrays as soon as their pinned copy is queued.
+7. Synchronize once after all source uploads.
+8. Do not start numerical kernels until every source is resident.
+
+Upload rotations, frame encoding metadata, and indices in one small transfer. Assert exactly one
+pixel upload per frame and zero source reuploads for one render.
+
+## CUDA module
+
+Replace separate `RawKernel` construction with one eagerly compiled `cupy.RawModule`. Compile and
+resolve every function during selection so NVRTC failures can fall back before decode/upload.
+
+Shared device helpers must implement:
+
+- equirectangular and rectilinear pixel-center rays;
+- row-major world-to-camera rotation;
+- exact focal lengths, centers, `z > 0`, half-pixel validity, and clamping;
+- native-source conversion and bilinear RGB sampling;
+- bilinear scalar-field sampling;
+- luminance, clipping, PQ/Rec.2020/sRGB, and quantization formulas.
+
+Initial required kernels:
+
+1. `build_exposure_proxies`
+2. `sample_exposure_grid`
+3. `classify_exposure_samples`
+4. `reduce_overlap_pairs`
+5. `solve_exposure_graph`
+6. `build_local_exposure`
+7. `compose_output`
+8. `build_auto_contrast_histogram`
+9. `select_auto_contrast_levels`
+10. `convert_output`
+
+## Global exposure solve on GPU
+
+The CUDA branch must replace `_estimate_exposure_gains()` while preserving its current algorithm:
+
+1. Downsample every resident source to its maximum-256-pixel-wide exposure proxy with area
+   filtering matching OpenCV `INTER_AREA`.
+2. Launch over `(frame, y, x)` for all frames on the 256x128 exposure grid. Generate projection and
+   sample proxy RGB in one kernel.
+3. Compute coverage, luminance, clipping, finite/positive validity, log luminance, Sobel gradients,
+   and each frame's 90th gradient quantile on-device.
+4. Generate all frame pairs on-device. Launch over `(pair, sample)` and compute geometric overlap
+   and valid log ratios.
+5. Use segmented partition/reduction for the 10th/90th trimmed range, median, MAD, inlier count,
+   and equation weight. Do not loop pairs in Python.
+6. Build connectivity and neutral bridges on-device.
+7. Solve the anchored weighted system in float64 on-device, center by median, clamp to one stop, and
+   exponentiate to float32 gains.
+8. Download only final `ExposureReport` scalars; all sample and equation arrays remain on-device.
+
+The graph is tiny. A single-block control/solve kernel is acceptable for connectivity and the
+small linear system; transferring it to CPU is not. Large exposure sampling and pair statistics
+must be parallel.
+
+## Local exposure in one phase
+
+`build_local_exposure` launches one thread per quarter-resolution output pixel. Each thread creates
+its ray once, loops through every frame in capture order, computes projection/edge weight, and
+accumulates weighted log gain in registers. It writes one normalized value or zero.
+
+This removes the current Python loop that launches `accumulate_exposure` once per frame and removes
+the separate sum/weight resident arrays.
+
+## Compositing in one phase
+
+`compose_output` launches one thread per output pixel in the full frame or current output band.
+Each thread:
+
+1. creates its ray once;
+2. samples local exposure once;
+3. loops all frames in capture order;
+4. projects and skips invalid frames;
+5. samples native resident source RGB as float32;
+6. applies `expf(log_gain - local_exposure)`;
+7. updates register-local hard or feather state;
+8. normalizes feather once;
+9. writes final linear RGB and coverage once.
+
+Hard blend updates only for `candidate > best_weight`, preserving first-frame ties. Feather sums in
+frame order. Do not use frame atomics, per-frame contribution tensors, or Python frame launches.
+The output-pixel grid supplies abundant parallelism without nondeterministic reductions.
+
+Start with `(16, 16)` blocks. Profile before adding textures or changing launch geometry.
+
+## Bands, responsiveness, and Windows watchdog
+
+Even resident mode should accept `row_start`/`row_count`. On Windows, choose bands targeting less
+than 250 ms per kernel to avoid WDDM timeout and provide cancellation/progress checkpoints. Start at
+256 rows and adapt from measured event timing between 64 and 1024 rows.
+
+Bands are not CPU strips: they create no maps/memmaps, perform no CPU image math, and do not split
+the frame dimension. All pixels within a band execute concurrently on GPU.
+
+Synchronize only after all uploads, between long band checkpoints, for final scalar/result copies,
+and during teardown. CUDA Graph capture is optional after profiling proves launch overhead matters.
+
+## Auto contrast and output conversion
+
+For SDR output:
+
+1. Run GPU linear/PQ/Rec.2020-to-sRGB conversion for histogram input.
+2. Build the existing 4096-bin luminance histogram with block-local histograms and a global merge.
+3. Select the same 0.5% black/white percentiles on-device.
+4. Apply levels, clamp, round, and write uint8 RGB on-device.
+
+For banded auto contrast, the first band pass builds one global histogram without downloads. The
+second pass converts and downloads bands. With auto contrast disabled, compose, convert, and copy
+each band once.
+
+EXR skips SDR conversion and downloads float32 linear RGB, preserving above-one and permitted
+negative finite values.
+
+## Preview, full render, and thumbnail
+
+CUDA preview must render directly into a device uint8 result and copy it into `PreviewResult`.
+Delete its temporary-PNG write/read round trip.
+
+Add `CudaSessionCache` to the GUI after one-shot rendering is correct:
+
+- key by device, canonical session path, source sizes/mtimes, encoding, and frame geometry;
+- retain sources, rotations, exposure proxies, and solved gains after preview;
+- full render allocates only its output job and reuses the resident session;
+- thumbnail reuses the same session and gains;
+- invalidate on input/session/source/GPU-option change, failure, discard, or GUI shutdown;
+- log cache hits, misses, bytes, and cleanup.
+
+Thus pressing full render after preview must not decode, upload, or solve exposure again.
+
+## Final download and file output
+
+Do not create output files before all GPU computation succeeds.
+
+- Resident PNG/JPEG: one full pinned uint8 D2H copy.
+- Banded PNG/JPEG: copy each completed band into a complete host uint8 array, then encode once.
+- Resident EXR: one full pinned float32 D2H copy.
+- Banded EXR: copy bands into a complete host float32 array, then encode once.
+- Coverage: copy the completed uint8 mask only when requested.
+
+Encode directly from host arrays. CUDA mode must not create `color.f32`, `weight.f32`, exposure
+memmaps, preview PNG scratch, or JPEG `.rgb` spool files. Only after computation completes may it
+create the normal staged final output and atomically rename it.
+
+This intentionally uses host RAM for the completed result on smaller GPUs. If host allocation
+fails, report it; do not silently introduce disk backing into CUDA mode.
+
+## Selection, fallback, and diagnostics
+
+Automatic mode may fall back for missing CuPy, missing/incompatible driver, no device, compilation
+failure, insufficient minimum plan, initial allocation OOM, or upload failure before computation.
+Close the CUDA session and clear owned pool blocks before invoking CPU once from the beginning.
+
+Strict mode for tests/benchmarks raises on all fallback. Backend selection must report:
+
+- device and compute capability;
+- native source format and bytes;
+- resident or banded mode and band rows;
+- planned/actual/free/total VRAM;
+- decode, upload, exposure solve, local exposure, compositing, conversion, download, and encode
+  times;
+- H2D/D2H bytes, launches, synchronizations, and disk scratch bytes;
+- session-cache hit/miss.
+
+The GUI indicator must show `CUDA resident`, `CUDA banded`, or `CPU`, plus the reason/memory plan.
+
+## Tests
+
+### CPU-only CI
+
+- fake all selection/fallback causes;
+- strict mode never returns CPU;
+- CPU mode never imports CuPy;
+- CPU fallback invokes the complete CPU renderer exactly once;
+- CPU extraction remains byte-identical;
+- CUDA dispatcher never calls CPU geometry, exposure, compositing, auto-contrast, or memmap helpers;
+- GUI/CLI propagate all options and display/log structured selection;
+- failure/cancellation cleanup closes mocks and removes staged outputs.
+
+### Real CUDA
+
+- native uint8/uint16/float source conversion;
+- area proxy resize parity;
+- projection at seams, poles, cardinal rays, half-pixel bounds, behind-camera rays, Euler rotations,
+  and recorded basis matrices;
+- RGB/scalar bilinear sampling;
+- exposure RGB, masks, Sobel, quantiles, pair ratios, median/MAD, graph bridges, solve, and gains;
+- local exposure parity;
+- hard/first-frame ties, feather order, coverage, and incomplete magenta;
+- SDR, PQ, Rec.2020, histogram/levels/quantization, and EXR values;
+- resident and forced-banded outputs are equivalent;
+- preview/full/thumbnail/coverage end-to-end parity;
+- cache reuse performs no second decode/upload/exposure solve;
+- 6 GiB simulated admission selects a viable mode for representative SDR captures;
+- insufficient source-only memory falls back before upload;
+- repeated jobs do not leak device or pinned memory.
+
+### Transfer and scratch audit
+
+For `N` sources:
 
 ```text
-host-to-device source uploads == N
-host-to-device full-size map/mask/correction uploads == 0
-device-to-host color downloads == S (or 2*S with auto contrast)
-device-to-host weight downloads == 0
-device synchronizations inside frame loop == 0
+source uploads                  == N
+map/mask/correction uploads     == 0
+intermediate image D2H copies   == 0
+resident final image D2H copies == 1
+banded final image D2H bytes    == final image bytes
+per-frame exposure launches     == 0
+per-frame compositor launches   == 0
+CUDA memmaps                    == 0
+CUDA disk scratch before encode == 0
 ```
 
-The CUDA end-to-end test must also assert `selected_backend == "cuda"`; image parity alone is not
-proof because automatic fallback can produce the same image.
+Every CUDA parity test must assert `backend == "cuda"`; matching CPU output alone may be fallback.
 
-## Phase 10: benchmark and acceptance gates
+## Benchmark gates
 
-Correct `scripts/benchmark_compositor.py` before using it:
+Rewrite `scripts/benchmark_compositor.py` to require strict CUDA, warm kernels separately,
+synchronize with CUDA events, use identical options, run one warm-up plus at least three measured
+iterations, and report every phase and transfer counter.
 
-- strict CUDA selection; abort on fallback;
-- synchronize before and after each timed CUDA region;
-- report kernel warm-up separately;
-- report decode, exposure solve, exposure mapping, compositing, download, encoding, and total time;
-- report planned and actual peak VRAM;
-- report H2D/D2H byte totals and launch/synchronization counts;
-- compare output metrics after every measured pair;
-- use at least three measured iterations after warm-up.
+Profile with Nsight Systems/NVTX. Acceptance requires:
 
-Acceptance gates:
+1. no Python per-frame exposure/compositing loop;
+2. no CPU image math in the CUDA branch;
+3. no intermediate D2H or disk scratch;
+4. GPU numerical work at least 5x faster than CPU numerical work;
+5. warm preview at least 3x faster end-to-end;
+6. warm full render at least 2x faster end-to-end;
+7. preview-to-full cache reuse skips source load and exposure solve;
+8. resident and banded modes meet parity and cleanup requirements;
+9. a representative capture succeeds under a simulated 6 GiB budget;
+10. the packaged Windows application works on a clean NVIDIA driver-only machine.
 
-1. Ruff, format, mypy, and all CPU tests pass.
-2. All real CUDA parity tests pass on the Windows target and WSL development GPU.
-3. Transfer-audit counts match the resident contract above.
-4. Profiler evidence shows projection, exposure mapping, sampling, correction, and blend kernels on
-   GPU, with no per-frame output downloads.
-5. CUDA geometry/compositing is at least 3x faster than CPU.
-6. Total warm render is at least 1.5x faster on a representative capture.
-7. An admitted render completes without OOM; a rejected render reports the reason and uses CPU.
-8. Cancellation and failure leave no partial output.
-9. The packaged Windows executable works on a clean NVIDIA-driver-only machine.
+Do not call implementation complete when a gate is unmeasured or failing.
 
 ## Ordered implementation checklist for a lower-cost model
 
-Complete one numbered item and its named tests before starting the next. Do not skip ahead to UI or
-packaging, and do not declare success from the current map-input kernel.
+Complete one item and its tests before starting the next.
 
-1. Add structured backend selection and strict mode; test all fake fallback causes.
-2. Add `cuda_kernels.py` and move kernel source out of `gpu.py`; keep behavior unchanged.
-3. Implement/test `project_pixel` diagnostics against CPU geometry.
-4. Implement persistent buffer allocation and exact `nbytes` accounting in `CudaCompositor`.
-5. Upload each decoded source once; add transfer counters and assert exactly `frame_count` uploads.
-6. Implement/test exposure accumulation and normalization entirely on device.
-7. Implement/test fused projection, source sampling, exposure sampling/correction, and hard blend.
-8. Add/test feather blend and strict frame ordering.
-9. Implement/test finish, uncovered count, magenta marking, and bounded pinned downloads.
-10. Extract `_render_cpu()` without changing it, then add `_render_cuda()` with no strip executor or
-    CPU accumulator memmaps.
-11. Integrate writers, auto contrast, coverage, cancellation, and cleanup; add tests after each.
-12. Route preview and thumbnail through the resident backend and add parity tests.
-13. Make VRAM admission use actual allocations and test admission/OOM fallback.
-14. Add CLI/GUI backend reporting and ensure strict benchmarks cannot fall back.
-15. Fix the benchmark, run transfer audit, profile, and meet both speed gates.
-16. Validate the PyInstaller release on clean Windows and record the tested driver/GPU/runtime.
-17. Delete the hybrid kernel path and any tests that only prove map-input remap parity.
-18. Run the complete verification commands and inspect generated artifacts before handoff.
+1. Add `BackendSelection`, `CudaMemoryPlan`, `CudaTransferStats`, automatic/strict selection, and
+   fake fallback tests.
+2. Mechanically extract `_render_cpu()` and prove byte-identical CPU output.
+3. Add `_render_cuda()` as an empty dispatcher boundary and tests forbidding CPU image helpers.
+4. Implement native-precision source size planning plus resident/banded plans for a 6 GiB budget.
+5. Replace kernels with one eagerly compiled `RawModule` and transactional session/output owners.
+6. Implement two-slot pinned decode/upload and exact upload/byte counters.
+7. Implement/test shared projection, native-source conversion, and bilinear helpers.
+8. Implement/test GPU proxy construction and all-frame 256x128 exposure sampling.
+9. Implement/test GPU luminance, clipping, Sobel, quantiles, and valid masks.
+10. Implement/test all-pair robust statistics without Python pair loops.
+11. Implement/test device connectivity, bridges, weighted solve, centering, clipping, and gains.
+12. Implement/test local exposure with the frame loop inside each pixel thread.
+13. Implement/test hard compositing with the frame loop inside each pixel thread.
+14. Add deterministic feather, coverage, incomplete output, and cancellation.
+15. Add GPU auto contrast and SDR/PQ/Rec.2020/EXR output conversion.
+16. Implement resident output download and direct host-array encoding without scratch files.
+17. Implement banded output and prove equality with resident output.
+18. Route preview directly through CUDA without temporary PNG.
+19. Reuse the session for thumbnail.
+20. Add adaptive watchdog-safe bands and progress timings.
+21. Refactor session reuse through these independently testable checkpoints; keep one-shot rendering
+    working after every checkpoint:
+    1. Add `PreparedCudaSession` and a transactional preparation function that performs source
+       decode/upload and the global exposure solve exactly once. Test retained sources, counters,
+       report values, and idempotent cleanup on real CUDA.
+    2. Extract output-job orchestration from `_render_cuda()` into a function accepting a caller-owned
+       `PreparedCudaSession`. Route the existing one-shot renderer through prepare → render → close
+       without changing output, progress, fallback, or cleanup behavior.
+    3. Add an immutable `CudaSessionCacheKey` containing device identity, canonical session path,
+       source size/mtime tuples, encoding, frame geometry, and GPU-affecting options. Add CPU-only
+       key equality/invalidation tests.
+    4. Add a single-entry `CudaSessionCache` owner with `get`, `store`, `invalidate`, and idempotent
+       `close`. Replacement and failed preparation must close the prior/partial session exactly once;
+       log hits, misses, resident bytes, and cleanup.
+    5. Add optional prepared-session/cache parameters to preview and full-render orchestration.
+       A cache miss prepares and stores once; a hit allocates only `CudaOutputJob`. One-shot CLI
+       callers retain the current prepare/render/close lifecycle.
+    6. Give `StitcherApp` one cache instance. Invalidate it on session/image/source/GPU-affecting
+       option changes, render failure, cancellation, discard, and shutdown, but not when moving from
+       a successful preview to its matching full render.
+    7. Add a real-CUDA preview → full → optional-thumbnail test asserting the second operation adds
+       zero source decodes/uploads and zero exposure solves. Add GUI lifecycle tests with fake owners
+       proving every invalidation path closes exactly once.
+22. Delete `CudaFrameCompositor`, per-frame resident launch methods, map-input kernels, and hybrid
+    tests only after replacements pass.
+23. Rewrite benchmark and add automated transfer/scratch audits. Record WSL profiling and benchmark
+    results before moving to packaging.
+24. Package only required CUDA libraries. Treat clean-Windows driver-only validation as a named
+    external release gate: prepare the artifact and exact validation procedure locally, then record
+    the result when the Windows machine is available. Do not mark the implementation complete while
+    this evidence is absent, but continue all work that does not depend on that machine.
+25. Run Ruff, format, Mypy, CPU tests, CUDA tests, leak tests, benchmarks, profiler gates, and
+    packaged-artifact verification. Classify a failure as blocked only when the next concrete action
+    requires unavailable hardware, credentials, or a user decision; otherwise fix it and continue.
 
-Never delete the CPU renderer, its resource planner, strip worker controls, memmap cleanup, or CPU
-tests. “Delete the hybrid path” means delete only the CUDA-inside-`_composite_strip()` prototype.
+At handoff report changed files, exact checks, selected mode, per-phase timings, plan/peak VRAM,
+transfer and launch counts, disk scratch bytes, cache behavior, parity metrics, profiler bottleneck,
+and Windows validation. Any missing acceptance item means the CUDA renderer is incomplete.
 
-At handoff, report changed files, exact checks run, profiler/benchmark results, selected backend,
-peak VRAM, transfer counts, and any remaining manual Windows validation. If any acceptance gate is
-unmet, call the implementation incomplete.
+## Primary references
+
+- [CuPy custom kernels](https://docs.cupy.dev/en/stable/reference/kernel.html)
+- [CuPy device and pinned memory pools](https://docs.cupy.dev/en/stable/user_guide/memory.html)
+- [NVIDIA CUDA asynchronous execution](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/asynchronous-execution.html)
+- [NVIDIA CUDA Best Practices Guide](https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/index.html)

@@ -55,8 +55,17 @@ $pyInstallerDist = Join-Path $buildRoot "pyinstaller-dist"
     --collect-all Imath `
     --collect-all cupy `
     --collect-all cupyx `
+    --collect-all cuda_pathfinder `
+    --collect-all nvidia.cuda_runtime `
+    --collect-all nvidia.cuda_nvrtc `
     --add-data "$projectRoot\contracts\session.schema.json;contracts" `
     "$projectRoot\stitcher\scripts\pano_stitch_gui.py"
+
+$stitcherBundle = Join-Path $pyInstallerDist "PanoramaCaptureStitcher"
+$nvrtc = Get-ChildItem -LiteralPath $stitcherBundle -Recurse -File -Filter "nvrtc64*.dll"
+if ($nvrtc.Count -eq 0) {
+    throw "PyInstaller did not collect the CUDA NVRTC runtime required for GPU stitching"
+}
 
 $modStage = Join-Path $buildRoot "PanoramaCapture-Mod-$Version"
 $cetDestination = Join-Path $modStage "bin\x64\plugins\cyber_engine_tweaks\mods\PanoramaCaptureProbe"

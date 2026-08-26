@@ -6,61 +6,174 @@ from types import SimpleNamespace
 import pytest
 
 import pano_stitch.gpu as gpu
+from pano_stitch.cuda_kernels import CUDA_KERNEL_NAMES, CUDA_MODULE_SOURCE
 from pano_stitch.gpu import (
-    GPU_OVERHEAD_BYTES,
-    CudaResidentCompositor,
+    CudaBandScheduler,
+    GpuDeviceInfo,
     GpuUnavailableError,
     MiB,
     cuda_device_info,
-    resident_gpu_plan,
+    cuda_memory_plan,
+    native_source_bytes,
+    select_cuda_backend,
 )
 
 
-def _kwargs() -> dict[str, int]:
-    return {
-        "frame_count": 1,
-        "source_width": 2,
-        "source_height": 2,
-        "output_width": 2,
-        "output_height": 1,
-        "exposure_width": 1,
-        "exposure_height": 1,
-        "writer_strip_pixels": 2,
-    }
+def test_cuda_band_scheduler_starts_at_256_and_targets_watchdog_time() -> None:
+    scheduler = CudaBandScheduler(2048)
+
+    assert scheduler.rows == 256
+    assert scheduler.next_rows(100) == 100
+
+    scheduler.record_elapsed(0.5)
+    assert scheduler.rows == 128
+    scheduler.record_elapsed(0.125)
+    assert scheduler.rows == 256
 
 
-def test_resident_plan_accepts_exact_available_capacity() -> None:
-    base = resident_gpu_plan(**_kwargs(), free_bytes=2 * 1024 * MiB, total_bytes=4 * 1024 * MiB)
-    assert base is not None
-    plan = resident_gpu_plan(
-        **_kwargs(),
-        free_bytes=base.required_bytes + 2 * 1024 * MiB - base.available_bytes,
-        total_bytes=4 * 1024 * MiB,
+def test_cuda_band_scheduler_respects_workspace_and_row_bounds() -> None:
+    constrained = CudaBandScheduler(32)
+    assert constrained.rows == 32
+    constrained.record_elapsed(10.0)
+    assert constrained.rows == 32
+
+    scheduler = CudaBandScheduler(4096)
+    scheduler.record_elapsed(0.001)
+    scheduler.record_elapsed(0.001)
+    assert scheduler.rows == 1024
+    scheduler.record_elapsed(10.0)
+    scheduler.record_elapsed(10.0)
+    scheduler.record_elapsed(10.0)
+    scheduler.record_elapsed(10.0)
+    assert scheduler.rows == 64
+
+
+@pytest.mark.parametrize(
+    ("sample_type", "expected"),
+    (("uint8", 12), ("uint16", 24), ("float32", 48)),
+)
+def test_native_source_bytes_preserves_source_precision(sample_type: str, expected: int) -> None:
+    assert native_source_bytes(1, 2, 2, sample_type) == expected
+
+
+def test_cuda_memory_plan_chooses_banded_output_when_full_frame_does_not_fit() -> None:
+    plan = cuda_memory_plan(
+        frame_count=2,
+        source_width=512,
+        source_height=512,
+        output_width=16384,
+        output_height=8192,
+        sample_type="uint8",
+        output_sample_bytes=1,
+        needs_sdr_conversion=True,
+        free_bytes=1024 * MiB,
+        total_bytes=2 * 1024 * MiB,
     )
     assert plan is not None
-    assert plan.required_bytes == plan.available_bytes
+    assert plan.output_band_rows is not None
+    assert plan.output_band_rows >= 32
+    assert plan.required_bytes <= plan.available_bytes
 
 
-def test_resident_plan_rejects_when_budget_is_too_small() -> None:
-    plan = resident_gpu_plan(
-        **_kwargs(),
-        free_bytes=2 * 1024 * MiB,
-        total_bytes=4 * 1024 * MiB,
-        gpu_budget_bytes=GPU_OVERHEAD_BYTES,
+def test_cuda_memory_plan_rejects_when_sources_and_minimum_band_do_not_fit() -> None:
+    assert (
+        cuda_memory_plan(
+            frame_count=32,
+            source_width=4096,
+            source_height=2048,
+            output_width=2048,
+            output_height=1024,
+            sample_type="float32",
+            output_sample_bytes=1,
+            needs_sdr_conversion=True,
+            free_bytes=2 * 1024 * MiB,
+            total_bytes=6 * 1024 * MiB,
+        )
+        is None
     )
+
+
+def test_cuda_memory_plan_admits_a_large_capture_on_a_simulated_six_gib_card() -> None:
+    plan = cuda_memory_plan(
+        frame_count=60,
+        source_width=3840,
+        source_height=2160,
+        output_width=24000,
+        output_height=12000,
+        sample_type="uint8",
+        output_sample_bytes=1,
+        needs_sdr_conversion=True,
+        free_bytes=6 * 1024 * MiB,
+        total_bytes=6 * 1024 * MiB,
+    )
+
+    assert plan is not None
+    assert plan.output_band_rows is not None
+    assert plan.required_bytes <= plan.available_bytes
+
+
+def test_select_cuda_backend_reports_pre_kernel_memory_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(gpu, "cuda_device_info", lambda: GpuDeviceInfo("test", 1024, 512))
+    selection, plan = select_cuda_backend(
+        frame_count=32,
+        source_width=4096,
+        source_height=2048,
+        output_width=2048,
+        output_height=1024,
+        sample_type="float32",
+        output_sample_bytes=1,
+        needs_sdr_conversion=True,
+    )
+    assert selection.backend == "cpu"
+    assert selection.memory_mode == "cpu"
+    assert "insufficient CUDA memory" in selection.reason
     assert plan is None
 
 
-def test_resident_plan_rejects_when_free_memory_is_insufficient() -> None:
-    assert resident_gpu_plan(**_kwargs(), free_bytes=1, total_bytes=4 * 1024 * MiB) is None
+def test_select_cuda_backend_strict_mode_raises_for_pre_kernel_memory_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(gpu, "cuda_device_info", lambda: GpuDeviceInfo("test", 1024, 512))
+    with pytest.raises(GpuUnavailableError, match="insufficient CUDA memory"):
+        select_cuda_backend(
+            frame_count=32,
+            source_width=4096,
+            source_height=2048,
+            output_width=2048,
+            output_height=1024,
+            sample_type="float32",
+            output_sample_bytes=1,
+            needs_sdr_conversion=True,
+            strict=True,
+        )
 
 
-@pytest.mark.parametrize("field", ("frame_count", "source_width", "output_height"))
-def test_resident_plan_rejects_nonpositive_dimensions(field: str) -> None:
-    kwargs = _kwargs()
-    kwargs[field] = 0
-    with pytest.raises(ValueError, match="dimensions"):
-        resident_gpu_plan(**kwargs, free_bytes=2 * 1024 * MiB, total_bytes=4 * 1024 * MiB)
+@pytest.mark.parametrize(
+    "kernel_name",
+    (
+        "build_exposure_proxies",
+        "sample_exposure_grid",
+        "classify_exposure_samples",
+        "build_local_exposure",
+        "compose_output",
+    ),
+)
+def test_cuda_module_contains_full_gpu_pipeline_kernels(kernel_name: str) -> None:
+    assert kernel_name in CUDA_KERNEL_NAMES
+    assert f'extern "C" __global__ void {kernel_name}' in CUDA_MODULE_SOURCE
+
+
+def test_cuda_module_excludes_retired_map_input_kernels() -> None:
+    for kernel_name in (
+        "normalize_exposure",
+        "accumulate_exposure",
+        "composite_frame",
+        "composite_projected",
+    ):
+        assert kernel_name not in CUDA_KERNEL_NAMES
+        assert f'extern "C" __global__ void {kernel_name}' not in CUDA_MODULE_SOURCE
 
 
 def test_cuda_device_info_rejects_zero_devices(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -78,64 +191,3 @@ def test_cuda_device_info_wraps_driver_failure(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setitem(sys.modules, "cupy", SimpleNamespace(cuda=SimpleNamespace(runtime=runtime)))
     with pytest.raises(GpuUnavailableError, match="probe failed: insufficient driver"):
         cuda_device_info()
-
-
-def test_resident_backend_compiles_before_allocating(monkeypatch: pytest.MonkeyPatch) -> None:
-    compiled: list[str] = []
-
-    class Kernel:
-        def __init__(self, _source: str, name: str) -> None:
-            self.name = name
-
-        def compile(self) -> None:
-            compiled.append(self.name)
-            if self.name == "composite_projected":
-                raise RuntimeError("NVRTC unavailable")
-
-    memory_pool = SimpleNamespace(free_all_blocks=lambda: None)
-    cp = SimpleNamespace(
-        RawKernel=Kernel,
-        float32=object(),
-        empty=lambda *_args, **_kwargs: pytest.fail("allocation must not be attempted"),
-        get_default_memory_pool=lambda: memory_pool,
-    )
-    monkeypatch.setattr(gpu, "import_module", lambda _name: cp)
-
-    with pytest.raises(GpuUnavailableError, match="NVRTC unavailable"):
-        CudaResidentCompositor(1, 1, 1, 1, 1)
-    assert compiled == [
-        "normalize_exposure",
-        "accumulate_exposure",
-        "composite_frame",
-        "composite_projected",
-    ]
-
-
-def test_resident_backend_frees_partial_allocation_on_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    freed = False
-
-    class Kernel:
-        def __init__(self, _source: str, _name: str) -> None:
-            pass
-
-        def compile(self) -> None:
-            pass
-
-    def free_all_blocks() -> None:
-        nonlocal freed
-        freed = True
-
-    cp = SimpleNamespace(
-        RawKernel=Kernel,
-        float32=object(),
-        empty=lambda *_args, **_kwargs: object(),
-        zeros=lambda *_args, **_kwargs: (_ for _ in ()).throw(MemoryError("out of memory")),
-        get_default_memory_pool=lambda: SimpleNamespace(free_all_blocks=free_all_blocks),
-    )
-    monkeypatch.setattr(gpu, "import_module", lambda _name: cp)
-
-    with pytest.raises(GpuUnavailableError, match="out of memory"):
-        CudaResidentCompositor(1, 1, 1, 1, 1)
-    assert freed

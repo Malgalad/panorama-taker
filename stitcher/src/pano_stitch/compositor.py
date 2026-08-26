@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import binascii
+import logging
 import mmap
 import os
 import struct
 import tempfile
+import time
 import zlib
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -23,11 +25,16 @@ from numpy.typing import NDArray
 from PIL import Image
 
 from pano_stitch.gpu import (
-    CudaFrameCompositor,
-    CudaResidentCompositor,
+    CudaBandScheduler,
+    CudaMemoryPlan,
+    CudaOutputJob,
+    CudaPreflightError,
+    CudaRenderDiagnostics,
+    CudaSession,
     GpuUnavailableError,
+    compile_cuda_module,
     cuda_device_info,
-    resident_gpu_plan,
+    select_cuda_backend,
 )
 from pano_stitch.metadata import FrameMetadata, ImageEncoding, SessionMetadata
 from pano_stitch.projection import (
@@ -39,6 +46,7 @@ from pano_stitch.projection import (
 )
 
 FloatImage = NDArray[np.float32]
+LOGGER = logging.getLogger(__name__)
 DEFAULT_MEMORY_BUDGET_BYTES = 1024 * 1024 * 1024
 MAX_MEMORY_BUDGET_BYTES = 8192 * 1024 * 1024
 _RESERVED_RUNTIME_BYTES = 192 * 1024 * 1024
@@ -88,6 +96,103 @@ class PreviewResult:
 
     pixels: NDArray[np.uint8]
     exposure_report: ExposureReport
+
+
+@dataclass
+class PreparedCudaSession:
+    """Reusable resident CUDA inputs and their one-time exposure solve."""
+
+    cuda_session: CudaSession
+    exposure_report: ExposureReport
+    upload_seconds: float
+    exposure_seconds: float
+
+    def close(self) -> None:
+        self.cuda_session.close()
+
+
+@dataclass(frozen=True)
+class CudaSessionCacheKey:
+    """Every immutable input that permits safe resident-session reuse."""
+
+    device_name: str
+    compute_capability: tuple[int, int] | None
+    session_path: str
+    source_fingerprints: tuple[tuple[str, int, int], ...]
+    encoding: ImageEncoding
+    capture_mode: str
+    horizontal_fov_deg: float
+    vertical_fov_deg: float
+    overlap_fraction: float
+    frames: tuple[FrameMetadata, ...]
+    gpu_memory_budget_bytes: int | None
+
+
+def cuda_session_cache_key(
+    *,
+    device_name: str,
+    compute_capability: tuple[int, int] | None,
+    session_path: Path,
+    session: SessionMetadata,
+    image_root: Path,
+    gpu_memory_budget_bytes: int | None,
+) -> CudaSessionCacheKey:
+    """Fingerprint a validated CUDA session without decoding its source pixels."""
+
+    fingerprints = []
+    for frame in session.frames:
+        source_path = _image_path(image_root, frame.filename).resolve()
+        stat = source_path.stat()
+        fingerprints.append((str(source_path), stat.st_size, stat.st_mtime_ns))
+    return CudaSessionCacheKey(
+        device_name,
+        compute_capability,
+        str(session_path.resolve()),
+        tuple(fingerprints),
+        session.image_encoding,
+        session.capture_mode.value,
+        session.horizontal_fov_deg,
+        session.vertical_fov_deg,
+        session.overlap_fraction,
+        session.frames,
+        gpu_memory_budget_bytes,
+    )
+
+
+class CudaSessionCache:
+    """Single-entry owner for GUI reuse of one resident CUDA session."""
+
+    def __init__(self) -> None:
+        self._key: CudaSessionCacheKey | None = None
+        self._prepared: PreparedCudaSession | None = None
+
+    def get(self, key: CudaSessionCacheKey) -> PreparedCudaSession | None:
+        if self._key == key and self._prepared is not None:
+            stats = self._prepared.cuda_session.transfer_stats
+            LOGGER.info("CUDA session cache hit: %d resident bytes", stats.peak_device_bytes)
+            return self._prepared
+        LOGGER.info("CUDA session cache miss")
+        return None
+
+    def store(self, key: CudaSessionCacheKey, prepared: PreparedCudaSession) -> None:
+        if self._key == key and self._prepared is prepared:
+            return
+        self.invalidate("replaced")
+        self._key = key
+        self._prepared = prepared
+        stats = prepared.cuda_session.transfer_stats
+        LOGGER.info("CUDA session cache stored: %d resident bytes", stats.peak_device_bytes)
+
+    def invalidate(self, reason: str = "invalidated") -> None:
+        prepared = self._prepared
+        self._key = None
+        self._prepared = None
+        if prepared is not None:
+            LOGGER.info("CUDA session cache cleanup: %s", reason)
+            prepared.close()
+
+    def close(self) -> None:
+        self.invalidate("shutdown")
 
 
 class RenderCancelledError(RuntimeError):
@@ -429,6 +534,26 @@ def _read_source(path: Path, encoding: ImageEncoding) -> FloatImage:
     raise ValueError(f"unsupported source image format: {path.suffix}")
 
 
+def _read_native_source(path: Path, encoding: ImageEncoding) -> NDArray[Any]:
+    """Decode RGB source samples without CPU-side transfer conversion for CUDA."""
+
+    suffix = path.suffix.lower()
+    if suffix == ".png":
+        raw = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if raw is None or raw.ndim != 3 or raw.shape[2] < 3:
+            raise ValueError(f"cannot decode RGB PNG: {path}")
+        expected_dtype = np.uint16 if encoding.sample_type == "uint16" else np.uint8
+        if raw.dtype != expected_dtype:
+            raise ValueError(f"PNG sample type {raw.dtype} does not match session encoding: {path}")
+        return np.ascontiguousarray(raw[..., :3][..., ::-1])
+    if suffix in {".jpg", ".jpeg"}:
+        with Image.open(path) as image:
+            return np.asarray(image.convert("RGB"), dtype=np.uint8)
+    if suffix == ".exr":
+        return _read_exr(path)
+    raise ValueError(f"unsupported source image format: {path.suffix}")
+
+
 class _ExrWriter:
     """Incremental float EXR writer backed by OpenEXR's scanline API."""
 
@@ -727,7 +852,6 @@ def _composite_strip(
     cancel_event: Event | None,
     local_exposure: FloatImage | None = None,
     log_gain: float = 0.0,
-    cuda_compositor: CudaFrameCompositor | None = None,
 ) -> None:
     """Composite one row-disjoint strip in disk-backed shared array views."""
 
@@ -747,34 +871,6 @@ def _composite_strip(
     )
     color = color_scratch[row_start : row_start + rows]
     weight = weight_scratch[row_start : row_start + rows]
-    if cuda_compositor is not None:
-        candidate = (
-            np.where(valid, np.maximum(edge_distance, 1e-6), 0.0)
-            if blend == "hard"
-            else _exposure_weight(valid, edge_distance, source_info)
-        )
-        correction = (
-            _local_exposure_multiplier(
-                log_gain,
-                _local_exposure_rows(local_exposure, row_start, rows, output_width, output_height),
-            )
-            if local_exposure is not None
-            else np.ones((rows, output_width), dtype=np.float32)
-        )
-        cuda_compositor.composite(
-            source,
-            map_x,
-            map_y,
-            valid,
-            candidate,
-            correction,
-            color,
-            weight,
-            source_info.width,
-            source_info.height,
-            blend == "hard",
-        )
-        return
     sampled = remap_source(source, map_x, map_y)
     if local_exposure is not None:
         correction = _local_exposure_multiplier(
@@ -1138,7 +1234,7 @@ def estimate_render_resources(
     return RenderResources(output_width, output_height, strip_height, worker_count, scratch_bytes)
 
 
-def render_session(
+def _render_cpu(
     session: SessionMetadata,
     image_root: Path,
     output_path: Path,
@@ -1154,10 +1250,11 @@ def render_session(
     auto_contrast: bool = True,
     session_thumbnail: bool = False,
     exposure_report: ExposureReport | None = None,
-    use_gpu: bool | None = False,
+    use_gpu: bool | None = True,
     gpu_memory_budget_bytes: int | None = None,
+    backend_callback: Callable[[str, str], None] | None = None,
 ) -> ExposureReport:
-    """Render one session with bounded RAM and disk-backed strip accumulators."""
+    """Render one session with the legacy bounded-RAM CPU pipeline."""
 
     if not session.frames:
         raise ValueError("session contains no frames")
@@ -1210,6 +1307,11 @@ def render_session(
     with tempfile.TemporaryDirectory(
         prefix="pano-stitch-", dir=output_path.parent
     ) as scratch_directory:
+        scratch_root = Path(scratch_directory)
+        backend_detail = "GPU acceleration disabled"
+        LOGGER.info("render backend selected: CPU (%s)", backend_detail)
+        if backend_callback is not None:
+            backend_callback("cpu", backend_detail)
         if exposure_report is None:
             exposure_report = _estimate_exposure_gains(
                 session,
@@ -1230,34 +1332,6 @@ def render_session(
             raise ValueError("cached exposure report does not match the renderable session")
         elif progress_callback is not None:
             progress_callback(exposure_work, exposure_work, f"{phase_labels['exposure']} (cached)")
-        scratch_root = Path(scratch_directory)
-        cuda_compositor: CudaFrameCompositor | CudaResidentCompositor | None = None
-        if use_gpu is not False:
-            try:
-                device = cuda_device_info()
-                resident_plan = resident_gpu_plan(
-                    frame_count=len(session.frames),
-                    source_width=first_source.width,
-                    source_height=first_source.height,
-                    output_width=output_width,
-                    output_height=output_height,
-                    exposure_width=exposure_width,
-                    exposure_height=exposure_height,
-                    writer_strip_pixels=strip_height * output_width,
-                    free_bytes=device.free_bytes,
-                    total_bytes=device.total_bytes,
-                    gpu_budget_bytes=gpu_memory_budget_bytes,
-                )
-                if resident_plan is not None:
-                    cuda_compositor = CudaResidentCompositor(
-                        len(session.frames),
-                        first_source.height,
-                        first_source.width,
-                        output_height,
-                        output_width,
-                    )
-            except (GpuUnavailableError, MemoryError):
-                cuda_compositor = None
         local_exposure_path = scratch_root / "local-exposure.f32"
         local_weight_path = scratch_root / "local-exposure-weight.f32"
         local_exposure: Any | None = None
@@ -1277,27 +1351,8 @@ def render_session(
             )
             local_exposure[:] = 0.0
             local_weight[:] = 0.0
-            if isinstance(cuda_compositor, CudaResidentCompositor):
-                try:
-                    cuda_compositor.allocate_exposure(exposure_height, exposure_width)
-                    for frame_position, frame in enumerate(session.frames):
-                        cuda_compositor.accumulate_exposure(
-                            _frame_rotation(frame),
-                            latitude_span,
-                            session.horizontal_fov_deg,
-                            session.vertical_fov_deg,
-                            exposure_report.log_gains[frame_position],
-                        )
-                    cuda_compositor.normalize_exposure()
-                    cuda_compositor._cp.cuda.runtime.deviceSynchronize()
-                except Exception:
-                    cuda_compositor.close()
-                    cuda_compositor = None
             mapping_completed = 0
-            cpu_exposure_frames = (
-                () if isinstance(cuda_compositor, CudaResidentCompositor) else session.frames
-            )
-            for frame_position, frame in enumerate(cpu_exposure_frames):
+            for frame_position, frame in enumerate(session.frames):
                 for row_start in range(0, exposure_height, exposure_strip_height):
                     if cancel_event is not None and cancel_event.is_set():
                         raise RenderCancelledError("render cancelled")
@@ -1323,12 +1378,7 @@ def render_session(
                         progress_callback(
                             mapping_completed, local_exposure_work, phase_labels["exposure mapping"]
                         )
-            cpu_exposure_rows = (
-                ()
-                if isinstance(cuda_compositor, CudaResidentCompositor)
-                else range(0, exposure_height, exposure_strip_height)
-            )
-            for row_start in cpu_exposure_rows:
+            for row_start in range(0, exposure_height, exposure_strip_height):
                 if cancel_event is not None and cancel_event.is_set():
                     raise RenderCancelledError("render cancelled")
                 rows = min(exposure_strip_height, exposure_height - row_start)
@@ -1345,9 +1395,6 @@ def render_session(
                     )
             local_exposure.flush()
         except Exception:
-            if isinstance(cuda_compositor, CudaResidentCompositor):
-                cuda_compositor.close()
-                cuda_compositor = None
             if local_weight is not None:
                 _close_scratch_memmap(local_weight)
             if local_exposure is not None:
@@ -1378,15 +1425,12 @@ def render_session(
                 _close_scratch_memmap(color_scratch)
             if weight_scratch is not None:
                 _close_scratch_memmap(weight_scratch)
-            if isinstance(cuda_compositor, CudaResidentCompositor):
-                cuda_compositor.close()
-                cuda_compositor = None
             _close_scratch_memmap(local_exposure)
             raise
         assert color_scratch is not None
         assert weight_scratch is not None
         try:
-            compositor_workers = 1 if cuda_compositor is not None else resources.worker_count
+            compositor_workers = resources.worker_count
             with _limit_opencv_threads(compositor_workers):
                 compositing_completed = 0
                 for frame_position, frame in enumerate(session.frames):
@@ -1396,29 +1440,6 @@ def render_session(
                         _image_path(image_root, frame.filename), first_source.encoding
                     )
                     try:
-                        if isinstance(cuda_compositor, CudaResidentCompositor):
-                            cuda_compositor.upload_source(frame_position, source)
-                            if frame_position == 0:
-                                if cuda_compositor.exposure_sum is None:
-                                    raise RuntimeError("GPU exposure field was not initialized")
-                                cuda_compositor.set_output_exposure(cuda_compositor.exposure_sum)
-                            cuda_compositor.composite_projected_with_gain(
-                                frame_position,
-                                exposure_report.log_gains[frame_position],
-                                _frame_rotation(frame),
-                                latitude_span,
-                                session.horizontal_fov_deg,
-                                session.vertical_fov_deg,
-                                blend == "hard",
-                            )
-                            compositing_completed += composite_strips
-                            if progress_callback is not None:
-                                progress_callback(
-                                    compositing_completed,
-                                    compositing_work,
-                                    phase_labels["compositing"],
-                                )
-                            continue
                         with ThreadPoolExecutor(max_workers=compositor_workers) as executor:
                             futures = [
                                 executor.submit(
@@ -1439,7 +1460,6 @@ def render_session(
                                     cancel_event,
                                     local_exposure,
                                     exposure_report.log_gains[frame_position],
-                                    cuda_compositor,
                                 )
                                 for row_start in range(0, output_height, strip_height)
                             ]
@@ -1454,15 +1474,6 @@ def render_session(
                                     )
                     finally:
                         del source
-
-                if isinstance(cuda_compositor, CudaResidentCompositor):
-                    for row_start in range(0, output_height, strip_height):
-                        rows = min(strip_height, output_height - row_start)
-                        color_rows, weight_rows = cuda_compositor.download_rows(
-                            row_start, row_start + rows
-                        )
-                        color_scratch[row_start : row_start + rows] = color_rows
-                        weight_scratch[row_start : row_start + rows] = weight_rows
 
             auto_levels: tuple[float, float] | None = None
             if auto_contrast_active:
@@ -1610,14 +1621,656 @@ def render_session(
                 raise
             return exposure_report
         finally:
-            if isinstance(cuda_compositor, CudaResidentCompositor):
-                cuda_compositor.close()
             _close_scratch_memmap(color_scratch)
             _close_scratch_memmap(weight_scratch)
             _close_scratch_memmap(local_exposure)
             del color_scratch
             del weight_scratch
             del local_exposure
+
+
+def _write_cuda_sdr_output(
+    path: Path, pixels: NDArray[np.uint8], suffix: str, jpeg_quality: int
+) -> None:
+    """Encode final CUDA RGB bytes directly, without an intermediate image spool."""
+
+    image = Image.fromarray(pixels, mode="RGB")
+    if suffix == ".png":
+        image.save(path, format="PNG")
+    else:
+        image.save(path, format="JPEG", quality=jpeg_quality, subsampling=0)
+
+
+def _render_cuda_thumbnail(
+    cuda_session: CudaSession,
+    session: SessionMetadata,
+    source: SourceInfo,
+    output_path: Path,
+    blend: str,
+    allow_incomplete: bool,
+    output_suffix: str,
+    jpeg_quality: int,
+    auto_contrast: bool,
+) -> None:
+    """Encode the rectilinear thumbnail from already resident CUDA session data."""
+
+    width, height = source.width, source.height
+    vertical_fov = float(np.degrees(2.0 * np.arctan((height / width) * np.tan(np.pi / 4.0))))
+    needs_sdr = output_suffix in {".png", ".jpg", ".jpeg"}
+    with CudaOutputJob(
+        cuda_session,
+        output_width=width,
+        output_height=height,
+        output_sample_bytes=1 if needs_sdr else np.dtype(np.float32).itemsize,
+        needs_sdr_conversion=needs_sdr,
+        rectilinear_output=True,
+        output_vertical_fov=vertical_fov,
+        plan=cuda_session._plan,
+    ) as job:
+        job.build_local_exposure(
+            latitude_span=180.0,
+            horizontal_fov=session.horizontal_fov_deg,
+            vertical_fov=session.vertical_fov_deg,
+            log_gains=cuda_session.log_gains,
+        )
+        output_dtype = np.dtype(np.uint8 if needs_sdr else np.float32)
+        host_output = cuda_session.pinned_array((height, width, 3), output_dtype)
+        auto_contrast_active = auto_contrast and needs_sdr
+        starts = range(0, height, job.band_rows)
+        if auto_contrast_active:
+            job.reset_auto_contrast_histogram()
+            for row_start in starts:
+                rows = min(job.band_rows, height - row_start)
+                job.compose_band(
+                    row_start=row_start,
+                    rows=rows,
+                    latitude_span=180.0,
+                    horizontal_fov=session.horizontal_fov_deg,
+                    vertical_fov=session.vertical_fov_deg,
+                    transfer_function=source.encoding.transfer_function,
+                    hard_blend=blend == "hard",
+                    incomplete_magenta=allow_incomplete,
+                )
+                if not allow_incomplete and job.uncovered_count(rows):
+                    raise ValueError("capture does not cover every thumbnail pixel")
+                job.build_auto_contrast_histogram(
+                    rows=rows,
+                    transfer_function=source.encoding.transfer_function,
+                    reference_white_nits=source.encoding.reference_white_nits,
+                )
+            job.select_auto_contrast_levels()
+        for row_start in starts:
+            rows = min(job.band_rows, height - row_start)
+            if not auto_contrast_active or job.is_banded:
+                job.compose_band(
+                    row_start=row_start,
+                    rows=rows,
+                    latitude_span=180.0,
+                    horizontal_fov=session.horizontal_fov_deg,
+                    vertical_fov=session.vertical_fov_deg,
+                    transfer_function=source.encoding.transfer_function,
+                    hard_blend=blend == "hard",
+                    incomplete_magenta=allow_incomplete,
+                )
+                if not allow_incomplete and job.uncovered_count(rows):
+                    raise ValueError("capture does not cover every thumbnail pixel")
+            if needs_sdr:
+                job.convert_band(
+                    rows=rows,
+                    transfer_function=source.encoding.transfer_function,
+                    reference_white_nits=source.encoding.reference_white_nits,
+                    apply_auto_contrast=auto_contrast_active,
+                )
+            job.download_band(host_output[row_start : row_start + rows], rows, converted=needs_sdr)
+    temporary_path = _temporary_output_path(output_path)
+    try:
+        if needs_sdr:
+            _write_cuda_sdr_output(temporary_path, host_output, output_suffix, jpeg_quality)
+        else:
+            _write_exr(temporary_path, host_output, source.encoding)
+        os.replace(temporary_path, output_path)
+    except Exception:
+        temporary_path.unlink(missing_ok=True)
+        raise
+
+
+def prepare_cuda_session(
+    session: SessionMetadata,
+    image_root: Path,
+    source: SourceInfo,
+    gpu_plan: CudaMemoryPlan,
+    cancel_event: Event | None = None,
+) -> PreparedCudaSession:
+    """Upload one session and solve its exposure once for reusable CUDA output jobs."""
+
+    latitude_span = (
+        180.0 if session.capture_mode.value == "full_sphere" else session.vertical_fov_deg
+    )
+    rotations = np.stack([_frame_rotation(frame) for frame in session.frames], dtype=np.float32)
+    cuda_session = CudaSession(
+        frame_count=len(session.frames),
+        source_width=source.width,
+        source_height=source.height,
+        sample_type=source.encoding.sample_type,
+        rotations=rotations,
+        plan=gpu_plan,
+    )
+    try:
+        upload_started = time.perf_counter()
+        for frame_position, frame in enumerate(session.frames):
+            if cancel_event is not None and cancel_event.is_set():
+                raise RenderCancelledError("render cancelled")
+            slot_index = frame_position % 2
+            slot = cuda_session.pinned_slot(slot_index).reshape((source.height, source.width, 3))
+            decoded = _read_native_source(_image_path(image_root, frame.filename), source.encoding)
+            try:
+                np.copyto(slot, decoded)
+            finally:
+                del decoded
+            cuda_session.upload_source(frame_position, slot, slot_index)
+        cuda_session.finish_uploads()
+        upload_seconds = time.perf_counter() - upload_started
+        exposure_started = time.perf_counter()
+        exposure = cuda_session.solve_exposure_gains(
+            latitude_span=latitude_span,
+            horizontal_fov=session.horizontal_fov_deg,
+            vertical_fov=session.vertical_fov_deg,
+            transfer_function=source.encoding.transfer_function,
+        )
+        anchor, edge_count, gains = cuda_session.download_exposure_report(exposure)
+        exposure_seconds = time.perf_counter() - exposure_started
+        return PreparedCudaSession(
+            cuda_session,
+            ExposureReport(anchor, edge_count, tuple(float(np.exp(gain)) for gain in gains)),
+            upload_seconds,
+            exposure_seconds,
+        )
+    except Exception:
+        cuda_session.close()
+        raise
+
+
+def _cached_or_prepared_cuda_session(
+    *,
+    cache: CudaSessionCache | None,
+    session_path: Path | None,
+    session: SessionMetadata,
+    image_root: Path,
+    source: SourceInfo,
+    gpu_plan: CudaMemoryPlan,
+    gpu_memory_budget_bytes: int | None,
+    cancel_event: Event | None,
+) -> tuple[PreparedCudaSession, CudaSessionCache | None]:
+    """Return a matching cached session or prepare one for this render."""
+
+    if cache is None or session_path is None:
+        return prepare_cuda_session(session, image_root, source, gpu_plan, cancel_event), None
+    device = cuda_device_info()
+    key = cuda_session_cache_key(
+        device_name=device.name,
+        compute_capability=device.compute_capability,
+        session_path=session_path,
+        session=session,
+        image_root=image_root,
+        gpu_memory_budget_bytes=gpu_memory_budget_bytes,
+    )
+    prepared = cache.get(key)
+    if prepared is not None:
+        return prepared, cache
+    try:
+        prepared = prepare_cuda_session(session, image_root, source, gpu_plan, cancel_event)
+    except Exception:
+        cache.invalidate("preparation failed")
+        raise
+    cache.store(key, prepared)
+    return prepared, cache
+
+
+def _run_adaptive_cuda_bands(
+    cuda_session: CudaSession,
+    output_job: CudaOutputJob,
+    output_height: int,
+    render_band: Callable[[int, int], None],
+) -> tuple[tuple[tuple[int, int], ...], float]:
+    """Run watchdog-safe CUDA bands, adapting only at completed GPU checkpoints."""
+
+    scheduler = CudaBandScheduler(output_job.band_rows)
+    completed_rows = 0
+    elapsed_seconds = 0.0
+    bands: list[tuple[int, int]] = []
+    while completed_rows < output_height:
+        rows = scheduler.next_rows(output_height - completed_rows)
+        started = cuda_session.begin_compute_timing()
+        render_band(completed_rows, rows)
+        elapsed = cuda_session.end_compute_timing(started)
+        scheduler.record_elapsed(elapsed)
+        bands.append((completed_rows, rows))
+        completed_rows += rows
+        elapsed_seconds += elapsed
+    return tuple(bands), elapsed_seconds
+
+
+def _render_prepared_cuda(
+    session: SessionMetadata,
+    image_root: Path,
+    output_path: Path,
+    source: SourceInfo,
+    output_width: int,
+    output_height: int,
+    blend: str,
+    allow_incomplete: bool,
+    output_suffix: str,
+    jpeg_quality: int,
+    auto_contrast: bool,
+    debug_coverage_path: Path | None,
+    cancel_event: Event | None,
+    progress_callback: Callable[[int, int, str], None] | None,
+    gpu_plan: CudaMemoryPlan,
+    prepared: PreparedCudaSession,
+    session_thumbnail: bool = False,
+    return_preview: bool = False,
+    diagnostics_callback: Callable[[CudaRenderDiagnostics], None] | None = None,
+) -> ExposureReport | PreviewResult:
+    """Render a session through the CUDA-only numerical pipeline."""
+
+    latitude_span = (
+        180.0 if session.capture_mode.value == "full_sphere" else session.vertical_fov_deg
+    )
+    needs_sdr_conversion = output_suffix in {".png", ".jpg", ".jpeg"}
+    output_sample_bytes = 1 if needs_sdr_conversion else np.dtype(np.float32).itemsize
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    if debug_coverage_path is not None:
+        debug_coverage_path.parent.mkdir(parents=True, exist_ok=True)
+    phase_count = 5 if auto_contrast and needs_sdr_conversion else 4
+    phases = {
+        "upload": f"[1/{phase_count}] CUDA upload",
+        "exposure": f"[2/{phase_count}] CUDA exposure",
+        "compositing": f"[3/{phase_count}] CUDA compositing",
+        "conversion": f"[4/{phase_count}] CUDA conversion",
+        "writing": f"[{phase_count}/{phase_count}] writing",
+    }
+    if auto_contrast and needs_sdr_conversion:
+        phases["conversion"] = f"[4/{phase_count}] CUDA auto contrast"
+        phases["writing"] = f"[5/{phase_count}] writing"
+
+    phase_seconds: dict[str, float] = {
+        "upload": prepared.upload_seconds,
+        "exposure": prepared.exposure_seconds,
+    }
+    with nullcontext(prepared.cuda_session) as cuda_session:
+        report = prepared.exposure_report
+        if progress_callback is not None:
+            progress_callback(len(session.frames), len(session.frames), phases["upload"])
+            progress_callback(1, 1, phases["exposure"])
+
+        with CudaOutputJob(
+            cuda_session,
+            output_width=output_width,
+            output_height=output_height,
+            output_sample_bytes=output_sample_bytes,
+            needs_sdr_conversion=needs_sdr_conversion,
+            plan=gpu_plan,
+        ) as output_job:
+            phase_started = time.perf_counter()
+            output_job.build_local_exposure(
+                latitude_span=latitude_span,
+                horizontal_fov=session.horizontal_fov_deg,
+                vertical_fov=session.vertical_fov_deg,
+                log_gains=cuda_session.log_gains,
+            )
+            phase_seconds["local_exposure"] = time.perf_counter() - phase_started
+            output_dtype = np.dtype(np.uint8 if needs_sdr_conversion else np.float32)
+            host_output = cuda_session.pinned_array((output_height, output_width, 3), output_dtype)
+            host_coverage = (
+                cuda_session.pinned_array((output_height, output_width), np.dtype(np.uint8))
+                if debug_coverage_path is not None
+                else None
+            )
+            auto_contrast_active = auto_contrast and needs_sdr_conversion
+            if auto_contrast_active:
+                output_job.reset_auto_contrast_histogram()
+
+                def build_histogram_band(row_start: int, rows: int) -> None:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise RenderCancelledError("render cancelled")
+                    output_job.compose_band(
+                        row_start=row_start,
+                        rows=rows,
+                        latitude_span=latitude_span,
+                        horizontal_fov=session.horizontal_fov_deg,
+                        vertical_fov=session.vertical_fov_deg,
+                        transfer_function=source.encoding.transfer_function,
+                        hard_blend=blend == "hard",
+                        incomplete_magenta=allow_incomplete,
+                    )
+                    if not allow_incomplete and output_job.uncovered_count(rows):
+                        raise ValueError("capture does not cover every output pixel")
+                    output_job.build_auto_contrast_histogram(
+                        rows=rows,
+                        transfer_function=source.encoding.transfer_function,
+                        reference_white_nits=source.encoding.reference_white_nits,
+                    )
+                    if progress_callback is not None:
+                        progress_callback(row_start + rows, output_height, phases["compositing"])
+
+                _histogram_bands, compositing_seconds = _run_adaptive_cuda_bands(
+                    cuda_session, output_job, output_height, build_histogram_band
+                )
+                output_job.select_auto_contrast_levels()
+                phase_seconds["compositing"] = compositing_seconds
+            else:
+                phase_seconds["compositing"] = 0.0
+
+            phase_started = time.perf_counter()
+
+            def convert_output_band(row_start: int, rows: int) -> None:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RenderCancelledError("render cancelled")
+                output_job.compose_band(
+                    row_start=row_start,
+                    rows=rows,
+                    latitude_span=latitude_span,
+                    horizontal_fov=session.horizontal_fov_deg,
+                    vertical_fov=session.vertical_fov_deg,
+                    transfer_function=source.encoding.transfer_function,
+                    hard_blend=blend == "hard",
+                    incomplete_magenta=allow_incomplete,
+                )
+                if not allow_incomplete and output_job.uncovered_count(rows):
+                    raise ValueError("capture does not cover every output pixel")
+                if needs_sdr_conversion:
+                    output_job.convert_band(
+                        rows=rows,
+                        transfer_function=source.encoding.transfer_function,
+                        reference_white_nits=source.encoding.reference_white_nits,
+                        apply_auto_contrast=auto_contrast_active,
+                    )
+                output_job.download_band(
+                    host_output[row_start : row_start + rows], rows, converted=needs_sdr_conversion
+                )
+                if host_coverage is not None:
+                    output_job.download_coverage(host_coverage[row_start : row_start + rows], rows)
+                if progress_callback is not None:
+                    progress_callback(row_start + rows, output_height, phases["conversion"])
+
+            _output_bands, output_seconds = _run_adaptive_cuda_bands(
+                cuda_session, output_job, output_height, convert_output_band
+            )
+            if not auto_contrast_active:
+                phase_seconds["compositing"] = output_seconds
+            phase_seconds["conversion_download"] = time.perf_counter() - phase_started
+
+            if return_preview:
+                if not needs_sdr_conversion:
+                    raise RuntimeError("CUDA previews require an SDR conversion buffer")
+                if diagnostics_callback is not None:
+                    diagnostics_callback(
+                        CudaRenderDiagnostics(
+                            cuda_session.transfer_stats, tuple(phase_seconds.items())
+                        )
+                    )
+                return PreviewResult(host_output, report)
+            temporary_path = _temporary_output_path(output_path)
+            temporary_coverage_path = (
+                _temporary_output_path(debug_coverage_path)
+                if debug_coverage_path is not None
+                else None
+            )
+            phase_started = time.perf_counter()
+            try:
+                if needs_sdr_conversion:
+                    _write_cuda_sdr_output(temporary_path, host_output, output_suffix, jpeg_quality)
+                else:
+                    _write_exr(temporary_path, host_output, source.encoding)
+                if temporary_coverage_path is not None and host_coverage is not None:
+                    Image.fromarray(host_coverage, mode="L").save(
+                        temporary_coverage_path, format="PNG"
+                    )
+                os.replace(temporary_path, output_path)
+                if temporary_coverage_path is not None and debug_coverage_path is not None:
+                    os.replace(temporary_coverage_path, debug_coverage_path)
+                if progress_callback is not None:
+                    progress_callback(1, 1, phases["writing"])
+            except Exception:
+                temporary_path.unlink(missing_ok=True)
+                if temporary_coverage_path is not None:
+                    temporary_coverage_path.unlink(missing_ok=True)
+                raise
+            phase_seconds["encode"] = time.perf_counter() - phase_started
+            if session_thumbnail:
+                _render_cuda_thumbnail(
+                    cuda_session,
+                    session,
+                    source,
+                    thumbnail_output_path(output_path),
+                    blend,
+                    allow_incomplete,
+                    output_suffix,
+                    jpeg_quality,
+                    auto_contrast,
+                )
+            if diagnostics_callback is not None:
+                diagnostics_callback(
+                    CudaRenderDiagnostics(cuda_session.transfer_stats, tuple(phase_seconds.items()))
+                )
+        return report
+
+
+def _render_cuda(
+    session: SessionMetadata,
+    image_root: Path,
+    output_path: Path,
+    source: SourceInfo,
+    output_width: int,
+    output_height: int,
+    blend: str,
+    allow_incomplete: bool,
+    output_suffix: str,
+    jpeg_quality: int,
+    auto_contrast: bool,
+    debug_coverage_path: Path | None,
+    cancel_event: Event | None,
+    progress_callback: Callable[[int, int, str], None] | None,
+    gpu_plan: CudaMemoryPlan,
+    session_thumbnail: bool = False,
+    return_preview: bool = False,
+    diagnostics_callback: Callable[[CudaRenderDiagnostics], None] | None = None,
+) -> ExposureReport | PreviewResult:
+    """Prepare one CUDA session, render it once, and release its device ownership."""
+
+    prepared = prepare_cuda_session(session, image_root, source, gpu_plan, cancel_event)
+    try:
+        return _render_prepared_cuda(
+            session,
+            image_root,
+            output_path,
+            source,
+            output_width,
+            output_height,
+            blend,
+            allow_incomplete,
+            output_suffix,
+            jpeg_quality,
+            auto_contrast,
+            debug_coverage_path,
+            cancel_event,
+            progress_callback,
+            gpu_plan,
+            prepared,
+            session_thumbnail,
+            return_preview,
+            diagnostics_callback,
+        )
+    finally:
+        prepared.close()
+
+
+def render_session(
+    session: SessionMetadata,
+    image_root: Path,
+    output_path: Path,
+    width: int | None = None,
+    blend: str = "hard",
+    allow_incomplete: bool = False,
+    memory_budget_bytes: int = DEFAULT_MEMORY_BUDGET_BYTES,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    debug_coverage_path: Path | None = None,
+    cancel_event: Event | None = None,
+    jpeg_quality: int = 95,
+    workers: int | None = None,
+    auto_contrast: bool = True,
+    session_thumbnail: bool = False,
+    exposure_report: ExposureReport | None = None,
+    use_gpu: bool | None = True,
+    gpu_memory_budget_bytes: int | None = None,
+    backend_callback: Callable[[str, str], None] | None = None,
+    strict_gpu: bool = False,
+    gpu_diagnostics_callback: Callable[[CudaRenderDiagnostics], None] | None = None,
+    cuda_session_cache: CudaSessionCache | None = None,
+    cuda_session_path: Path | None = None,
+) -> ExposureReport:
+    """Dispatch one render to the CUDA-only or bounded CPU pipeline."""
+
+    cpu_arguments = (
+        session,
+        image_root,
+        output_path,
+        width,
+        blend,
+        allow_incomplete,
+        memory_budget_bytes,
+        progress_callback,
+        debug_coverage_path,
+        cancel_event,
+        jpeg_quality,
+        workers,
+        auto_contrast,
+        session_thumbnail,
+        exposure_report,
+        False,
+        gpu_memory_budget_bytes,
+    )
+    if use_gpu is False:
+        return _render_cpu(*cpu_arguments, backend_callback)
+    if not session.frames:
+        return _render_cpu(*cpu_arguments, backend_callback)
+    if not allow_incomplete and (
+        not session.completed or any(frame.status != "captured" for frame in session.frames)
+    ):
+        return _render_cpu(*cpu_arguments, backend_callback)
+    renderable = renderable_session(session, image_root, allow_incomplete)
+    try:
+        source = _source_info_for_session(renderable, image_root)
+        output_suffix = output_path.suffix.lower()
+        if output_suffix not in {".exr", ".jpg", ".jpeg", ".png"}:
+            raise ValueError("output extension must be .exr, .jpg, .jpeg, or .png")
+        output_width, output_height = _output_dimensions(renderable, source.width, width)
+        plan_width = max(output_width, source.width) if session_thumbnail else output_width
+        plan_height = max(output_height, source.height) if session_thumbnail else output_height
+        selection, gpu_plan = select_cuda_backend(
+            frame_count=len(renderable.frames),
+            source_width=source.width,
+            source_height=source.height,
+            output_width=plan_width,
+            output_height=plan_height,
+            sample_type=source.encoding.sample_type,
+            output_sample_bytes=1 if output_suffix != ".exr" else np.dtype(np.float32).itemsize,
+            needs_sdr_conversion=output_suffix != ".exr",
+            gpu_budget_bytes=gpu_memory_budget_bytes,
+            strict=strict_gpu,
+        )
+        if selection.backend == "cuda":
+            compile_cuda_module()
+    except GpuUnavailableError as error:
+        if strict_gpu:
+            raise
+        selection = None
+        gpu_plan = None
+        detail = str(error)
+    else:
+        assert selection is not None
+        detail = selection.reason
+    if selection is None or selection.backend == "cpu" or gpu_plan is None:
+        if selection is not None:
+            detail = selection.reason
+        LOGGER.info("render backend selected: CPU (%s)", detail)
+        if backend_callback is not None:
+            backend_callback("cpu", detail)
+        return _render_cpu(*cpu_arguments, None)
+    LOGGER.info("render backend selected: CUDA %s (%s)", selection.memory_mode, detail)
+    if backend_callback is not None:
+        backend_callback(f"cuda {selection.memory_mode}", detail)
+    prepared: PreparedCudaSession | None = None
+    cache_owner: CudaSessionCache | None = None
+    try:
+        if cuda_session_cache is None or cuda_session_path is None:
+            cuda_result = _render_cuda(
+                renderable,
+                image_root,
+                output_path,
+                source,
+                output_width,
+                output_height,
+                blend,
+                allow_incomplete,
+                output_suffix,
+                jpeg_quality,
+                auto_contrast,
+                debug_coverage_path,
+                cancel_event,
+                progress_callback,
+                gpu_plan,
+                session_thumbnail=session_thumbnail,
+                diagnostics_callback=gpu_diagnostics_callback,
+            )
+        else:
+            prepared, cache_owner = _cached_or_prepared_cuda_session(
+                cache=cuda_session_cache,
+                session_path=cuda_session_path,
+                session=renderable,
+                image_root=image_root,
+                source=source,
+                gpu_plan=gpu_plan,
+                gpu_memory_budget_bytes=gpu_memory_budget_bytes,
+                cancel_event=cancel_event,
+            )
+            cuda_result = _render_prepared_cuda(
+                renderable,
+                image_root,
+                output_path,
+                source,
+                output_width,
+                output_height,
+                blend,
+                allow_incomplete,
+                output_suffix,
+                jpeg_quality,
+                auto_contrast,
+                debug_coverage_path,
+                cancel_event,
+                progress_callback,
+                gpu_plan,
+                prepared,
+                session_thumbnail=session_thumbnail,
+                diagnostics_callback=gpu_diagnostics_callback,
+            )
+    except CudaPreflightError as error:
+        if strict_gpu:
+            raise
+        detail = str(error)
+        LOGGER.info("render backend selected: CPU (%s)", detail)
+        if backend_callback is not None:
+            backend_callback("cpu", detail)
+        return _render_cpu(*cpu_arguments, None)
+    except Exception:
+        if cache_owner is not None:
+            cache_owner.invalidate("render failed")
+        raise
+    finally:
+        if prepared is not None and cache_owner is None:
+            prepared.close()
+    assert isinstance(cuda_result, ExposureReport)
+    return cuda_result
 
 
 def validate_images(
@@ -1662,7 +2315,13 @@ def render_preview(
     cancel_event: Event | None = None,
     workers: int | None = None,
     auto_contrast: bool = True,
-    use_gpu: bool | None = False,
+    use_gpu: bool | None = True,
+    backend_callback: Callable[[str, str], None] | None = None,
+    strict_gpu: bool = False,
+    gpu_diagnostics_callback: Callable[[CudaRenderDiagnostics], None] | None = None,
+    cuda_session_cache: CudaSessionCache | None = None,
+    cuda_session_path: Path | None = None,
+    gpu_memory_budget_bytes: int | None = None,
 ) -> PreviewResult:
     """Render an ephemeral, displayable SDR preview and return its exposure solve."""
 
@@ -1671,6 +2330,111 @@ def render_preview(
     if output_suffix.lower() not in {".exr", ".jpg", ".jpeg", ".png"}:
         raise ValueError("output extension must be .exr, .jpg, .jpeg, or .png")
     image_root = image_root.resolve()
+    if (
+        use_gpu is not False
+        and session.frames
+        and (
+            allow_incomplete
+            or (session.completed and all(frame.status == "captured" for frame in session.frames))
+        )
+    ):
+        renderable = renderable_session(session, image_root, allow_incomplete)
+        try:
+            source = _source_info_for_session(renderable, image_root)
+            output_width, output_height = _output_dimensions(renderable, source.width, width)
+            selection, gpu_plan = select_cuda_backend(
+                frame_count=len(renderable.frames),
+                source_width=source.width,
+                source_height=source.height,
+                output_width=output_width,
+                output_height=output_height,
+                sample_type=source.encoding.sample_type,
+                output_sample_bytes=1,
+                needs_sdr_conversion=True,
+                gpu_budget_bytes=gpu_memory_budget_bytes,
+                strict=strict_gpu,
+            )
+            if selection.backend == "cuda":
+                compile_cuda_module()
+        except GpuUnavailableError as error:
+            if strict_gpu:
+                raise
+            selection = None
+            gpu_plan = None
+            detail = str(error)
+        else:
+            assert selection is not None
+            detail = selection.reason
+        if selection is not None and selection.backend == "cuda" and gpu_plan is not None:
+            LOGGER.info("preview backend selected: CUDA %s (%s)", selection.memory_mode, detail)
+            if backend_callback is not None:
+                backend_callback(f"cuda {selection.memory_mode}", detail)
+            try:
+                if cuda_session_cache is None or cuda_session_path is None:
+                    preview = _render_cuda(
+                        renderable,
+                        image_root,
+                        image_root / "preview.png",
+                        source,
+                        output_width,
+                        output_height,
+                        blend,
+                        allow_incomplete,
+                        ".png",
+                        95,
+                        auto_contrast and output_suffix.lower() != ".exr",
+                        None,
+                        cancel_event,
+                        progress_callback,
+                        gpu_plan,
+                        return_preview=True,
+                        diagnostics_callback=gpu_diagnostics_callback,
+                    )
+                else:
+                    prepared, cache_owner = _cached_or_prepared_cuda_session(
+                        cache=cuda_session_cache,
+                        session_path=cuda_session_path,
+                        session=renderable,
+                        image_root=image_root,
+                        source=source,
+                        gpu_plan=gpu_plan,
+                        gpu_memory_budget_bytes=gpu_memory_budget_bytes,
+                        cancel_event=cancel_event,
+                    )
+                    assert cache_owner is not None
+                    try:
+                        preview = _render_prepared_cuda(
+                            renderable,
+                            image_root,
+                            image_root / "preview.png",
+                            source,
+                            output_width,
+                            output_height,
+                            blend,
+                            allow_incomplete,
+                            ".png",
+                            95,
+                            auto_contrast and output_suffix.lower() != ".exr",
+                            None,
+                            cancel_event,
+                            progress_callback,
+                            gpu_plan,
+                            prepared,
+                            return_preview=True,
+                            diagnostics_callback=gpu_diagnostics_callback,
+                        )
+                    except Exception:
+                        cache_owner.invalidate("preview failed")
+                        raise
+            except CudaPreflightError:
+                if strict_gpu:
+                    raise
+                use_gpu = False
+            else:
+                assert isinstance(preview, PreviewResult)
+                return preview
+        if backend_callback is not None:
+            backend_callback("cpu", detail if selection is None else selection.reason)
     with tempfile.TemporaryDirectory(prefix="pano-preview-") as directory:
         preview_path = Path(directory) / "preview.png"
         report = render_session(
@@ -1686,6 +2450,8 @@ def render_preview(
             workers=workers,
             auto_contrast=auto_contrast and output_suffix.lower() != ".exr",
             use_gpu=use_gpu,
+            strict_gpu=strict_gpu,
+            backend_callback=backend_callback,
         )
         with Image.open(preview_path) as image:
             pixels = np.array(image.convert("RGB"), dtype=np.uint8, copy=True)

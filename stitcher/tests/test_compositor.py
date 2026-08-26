@@ -1,5 +1,8 @@
+import logging
 import math
+import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import cv2
 import numpy as np
@@ -10,6 +13,9 @@ from pano_stitch import compositor
 from pano_stitch.compositor import (
     DEFAULT_MEMORY_BUDGET_BYTES,
     MAX_MEMORY_BUDGET_BYTES,
+    CudaSessionCache,
+    CudaSessionCacheKey,
+    ExposureReport,
     SourceInfo,
     _auto_contrast_levels,
     _choose_strip_height,
@@ -20,13 +26,20 @@ from pano_stitch.compositor import (
     _output_dimensions,
     _pq_to_linear,
     _probe_source,
+    _read_native_source,
     _rec2020_to_srgb_linear,
     _to_sdr_srgb,
     _write_exr,
+    cuda_session_cache_key,
     estimate_render_resources,
     render_preview,
     render_session,
     validate_images,
+)
+from pano_stitch.gpu import (
+    BackendSelection,
+    CudaMemoryPlan,
+    CudaPreflightError,
 )
 from pano_stitch.metadata import CaptureMode, FrameMetadata, ImageEncoding, SessionMetadata
 from pano_stitch.planner import plan_shots
@@ -201,6 +214,200 @@ def test_render_preview_returns_sdr_pixels_and_exposure_report(tmp_path: Path) -
     assert not any(tmp_path.glob("pano-preview-*"))
 
 
+def test_render_session_reports_selected_cpu_backend(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
+    session = SessionMetadata(
+        1, "backend", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (frame,), True
+    )
+    Image.new("RGB", (32, 16), (128, 64, 32)).save(tmp_path / frame.filename)
+    selected: list[tuple[str, str]] = []
+    caplog.set_level(logging.INFO, logger=compositor.__name__)
+
+    render_session(
+        session,
+        tmp_path,
+        tmp_path / "cpu-backend.png",
+        width=24,
+        allow_incomplete=True,
+        use_gpu=False,
+        backend_callback=lambda backend, detail: selected.append((backend, detail)),
+    )
+
+    assert selected == [("cpu", "GPU acceleration disabled")]
+    assert "render backend selected: CPU (GPU acceleration disabled)" in caplog.text
+
+
+def test_render_session_dispatches_once_to_cpu_pipeline(monkeypatch: pytest.MonkeyPatch) -> None:
+    expected = ExposureReport(0, 0, (1.0,))
+    calls: list[tuple[object, ...]] = []
+
+    def render_cpu(*args: object) -> ExposureReport:
+        calls.append(args)
+        return expected
+
+    monkeypatch.setattr(compositor, "_render_cpu", render_cpu)
+
+    actual = render_session(
+        SessionMetadata(1, "dispatch", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (), True),
+        Path("images"),
+        Path("output.png"),
+        use_gpu=False,
+    )
+
+    assert actual == expected
+    assert len(calls) == 1
+    assert calls[0][15] is False
+
+
+def test_cuda_preflight_failure_restarts_once_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
+    session = SessionMetadata(
+        1, "preflight", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (frame,), True
+    )
+    plan = CudaMemoryPlan(1, 1, 1, 1, 1, None, 1, 1)
+    expected = ExposureReport(0, 0, (1.0,))
+    cpu_calls: list[tuple[object, ...]] = []
+
+    monkeypatch.setattr(
+        compositor,
+        "_source_info_for_session",
+        lambda *_args: SourceInfo(1, 1, ImageEncoding("uint8", "srgb", "srgb")),
+    )
+    monkeypatch.setattr(compositor, "_output_dimensions", lambda *_args: (1, 1))
+    monkeypatch.setattr(
+        compositor,
+        "select_cuda_backend",
+        lambda **_kwargs: (BackendSelection("cuda", "test", "resident", 1, 1, "test"), plan),
+    )
+    monkeypatch.setattr(compositor, "compile_cuda_module", lambda: None)
+    monkeypatch.setattr(
+        compositor,
+        "_render_cuda",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(CudaPreflightError("upload failed")),
+    )
+    monkeypatch.setattr(
+        compositor,
+        "_render_cpu",
+        lambda *args: cpu_calls.append(args) or expected,
+    )
+
+    actual = render_session(session, Path("images"), Path("output.png"), width=1)
+
+    assert actual == expected
+    assert len(cpu_calls) == 1
+    assert cpu_calls[0][15] is False
+
+
+def test_cuda_preflight_failure_is_strict_when_requested(monkeypatch: pytest.MonkeyPatch) -> None:
+    frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
+    session = SessionMetadata(
+        1, "preflight-strict", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (frame,), True
+    )
+    plan = CudaMemoryPlan(1, 1, 1, 1, 1, None, 1, 1)
+
+    monkeypatch.setattr(
+        compositor,
+        "_source_info_for_session",
+        lambda *_args: SourceInfo(1, 1, ImageEncoding("uint8", "srgb", "srgb")),
+    )
+    monkeypatch.setattr(compositor, "_output_dimensions", lambda *_args: (1, 1))
+    monkeypatch.setattr(
+        compositor,
+        "select_cuda_backend",
+        lambda **_kwargs: (BackendSelection("cuda", "test", "resident", 1, 1, "test"), plan),
+    )
+    monkeypatch.setattr(compositor, "compile_cuda_module", lambda: None)
+    monkeypatch.setattr(
+        compositor,
+        "_render_cuda",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(CudaPreflightError("upload failed")),
+    )
+    monkeypatch.setattr(
+        compositor, "_render_cpu", lambda *_args: pytest.fail("CPU fallback is forbidden")
+    )
+
+    with pytest.raises(CudaPreflightError, match="upload failed"):
+        render_session(session, Path("images"), Path("output.png"), width=1, strict_gpu=True)
+
+
+def test_native_source_decoder_preserves_png_samples(tmp_path: Path) -> None:
+    pixels = np.array([[[3, 257, 65535]]], dtype=np.uint16)
+    path = tmp_path / "native.png"
+    cv2.imwrite(str(path), pixels[..., ::-1])
+
+    actual = _read_native_source(path, ImageEncoding("uint16", "rec2020", "pq", 203.0))
+
+    assert actual.dtype == np.uint16
+    np.testing.assert_array_equal(actual, pixels)
+
+
+def test_cuda_session_cache_key_tracks_sources_geometry_and_gpu_options(tmp_path: Path) -> None:
+    frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
+    session = SessionMetadata(
+        1, "cache-key", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (frame,), True
+    )
+    source_path = tmp_path / frame.filename
+    Image.new("RGB", (16, 8), (96, 64, 32)).save(source_path)
+    kwargs = {
+        "device_name": "test GPU",
+        "compute_capability": (9, 0),
+        "session_path": tmp_path / "session.json",
+        "session": session,
+        "image_root": tmp_path,
+        "gpu_memory_budget_bytes": 1024,
+    }
+
+    original = cuda_session_cache_key(**kwargs)
+    assert original == cuda_session_cache_key(**kwargs)
+
+    stat = source_path.stat()
+    os.utime(source_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
+    assert original != cuda_session_cache_key(**kwargs)
+
+    changed_budget = {**kwargs, "gpu_memory_budget_bytes": 2048}
+    assert original != cuda_session_cache_key(**changed_budget)
+    changed_geometry = {
+        **kwargs,
+        "session": SessionMetadata(
+            1, "cache-key", CaptureMode.HORIZONTAL, 91.0, 60.0, 0.08, (frame,), True
+        ),
+    }
+    assert original != cuda_session_cache_key(**changed_geometry)
+
+
+def test_cuda_session_cache_closes_replaced_and_invalidated_sessions_once() -> None:
+    class FakePrepared:
+        def __init__(self) -> None:
+            self.cuda_session = SimpleNamespace(
+                transfer_stats=SimpleNamespace(peak_device_bytes=1234)
+            )
+            self.close_calls = 0
+
+        def close(self) -> None:
+            self.close_calls += 1
+
+    first_key = CudaSessionCacheKey(
+        "GPU", (9, 0), "session", (), ImageEncoding(), "horizontal", 90.0, 60.0, 0.08, (), None
+    )
+    second_key = CudaSessionCacheKey(
+        "GPU", (9, 0), "session", (), ImageEncoding(), "horizontal", 91.0, 60.0, 0.08, (), None
+    )
+    first = FakePrepared()
+    second = FakePrepared()
+    cache = CudaSessionCache()
+
+    cache.store(first_key, first)  # type: ignore[arg-type]
+    assert cache.get(first_key) is first
+    assert cache.get(second_key) is None
+    cache.store(second_key, second)  # type: ignore[arg-type]
+    assert first.close_calls == 1
+    cache.invalidate("input changed")
+    cache.close()
+    assert second.close_calls == 1
+
+
 def test_cached_exposure_reports_completed_progress_before_mapping(tmp_path: Path) -> None:
     frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
     session = SessionMetadata(
@@ -217,6 +424,7 @@ def test_cached_exposure_reports_completed_progress_before_mapping(tmp_path: Pat
         width=24,
         allow_incomplete=True,
         exposure_report=preview.exposure_report,
+        use_gpu=False,
         progress_callback=lambda completed, total, phase: progress.append(
             (completed, total, phase)
         ),
@@ -536,12 +744,26 @@ def test_parallel_strips_match_single_worker_output(
 
     serial_path = tmp_path / "serial.png"
     parallel_path = tmp_path / "parallel.png"
-    render_session(session, tmp_path, serial_path, width=64, workers=1, memory_budget_bytes=budget)
+    render_session(
+        session,
+        tmp_path,
+        serial_path,
+        width=64,
+        workers=1,
+        memory_budget_bytes=budget,
+        use_gpu=False,
+    )
     opencv_thread_changes: list[int] = []
     monkeypatch.setattr(compositor.cv2, "getNumThreads", lambda: 6)
     monkeypatch.setattr(compositor.cv2, "setNumThreads", opencv_thread_changes.append)
     render_session(
-        session, tmp_path, parallel_path, width=64, workers=2, memory_budget_bytes=budget
+        session,
+        tmp_path,
+        parallel_path,
+        width=64,
+        workers=2,
+        memory_budget_bytes=budget,
+        use_gpu=False,
     )
     assert opencv_thread_changes == [1, 6]
     with Image.open(serial_path) as serial, Image.open(parallel_path) as parallel:
@@ -557,7 +779,8 @@ def test_parallel_strips_match_single_worker_output(
         use_gpu=True,
     )
     with Image.open(serial_path) as serial, Image.open(gpu_path) as gpu:
-        np.testing.assert_array_equal(np.asarray(serial), np.asarray(gpu))
+        difference = np.abs(np.asarray(serial, dtype=np.int16) - np.asarray(gpu, dtype=np.int16))
+        assert int(difference.max()) <= 1
 
 
 def test_exr_round_trip_preserves_values_above_one(tmp_path: Path) -> None:

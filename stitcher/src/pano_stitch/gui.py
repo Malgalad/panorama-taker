@@ -16,6 +16,7 @@ from typing import Any
 from PIL import Image, ImageTk
 
 from pano_stitch.compositor import (
+    CudaSessionCache,
     ExposureReport,
     RenderCancelledError,
     estimate_render_resources,
@@ -54,6 +55,7 @@ class StitcherApp:
         self._preview_report: ExposureReport | None = None
         self._preview_photo: Any | None = None
         self._preview_width = 1
+        self._cuda_session_cache = CudaSessionCache()
         self._build_variables()
         self._load_settings()
         self._build_widgets()
@@ -74,6 +76,7 @@ class StitcherApp:
             self.allow_incomplete_var,
             self.coverage_var,
             self.auto_contrast_var,
+            self.use_gpu_var,
             self.jpeg_quality_var,
         ):
             variable.trace_add("write", self._input_changed)
@@ -139,6 +142,7 @@ class StitcherApp:
             self.status_var.set("Render is still stopping; close again when idle.")
             return
         self.discard_preview()
+        self._cuda_session_cache.close()
         self._save_settings()
         self.root.destroy()
 
@@ -174,6 +178,7 @@ class StitcherApp:
         self.coverage_var = tk.BooleanVar(value=False)
         self.auto_contrast_var = tk.BooleanVar(value=True)
         self.use_gpu_var = tk.BooleanVar(value=True)
+        self.backend_var = tk.StringVar(value="Backend: not selected")
         self.status_var = tk.StringVar(value="Choose a game directory and session.")
 
     def _build_widgets(self) -> None:
@@ -348,6 +353,9 @@ class StitcherApp:
 
         self.progress = ttk.Progressbar(self.left_column, mode="determinate", maximum=100)
         self.progress.pack(fill="x", padx=12, pady=4)
+        ttk.Label(self.left_column, textvariable=self.backend_var).pack(
+            fill="x", padx=12, pady=(4, 0)
+        )
         ttk.Label(self.left_column, textvariable=self.status_var, wraplength=640).pack(
             fill="x", padx=12, pady=8
         )
@@ -553,6 +561,7 @@ class StitcherApp:
         return output_path.with_suffix(suffix)
 
     def _input_changed(self, *_args: object) -> None:
+        self._cuda_session_cache.invalidate("input changed")
         if self._preview_report is not None:
             self.discard_preview()
         self._validated = False
@@ -613,6 +622,7 @@ class StitcherApp:
         self._start_worker("render")
 
     def discard_preview(self) -> None:
+        self._cuda_session_cache.invalidate("preview discarded")
         self._preview_report = None
         self._preview_photo = None
         if hasattr(self, "preview_label"):
@@ -629,6 +639,7 @@ class StitcherApp:
     def _worker_main(self, operation: str) -> None:
         try:
             LOGGER.info("%s started", operation)
+            self._events.put(("backend", ("selecting", "checking GPU availability and VRAM")))
             session_path, image_dir, output_dir = self._paths()
             session = load_session(session_path, image_directory=image_dir)
             allow_incomplete = self.allow_incomplete_var.get()
@@ -680,6 +691,9 @@ class StitcherApp:
                     workers=workers,
                     auto_contrast=self.auto_contrast_var.get(),
                     use_gpu=self.use_gpu_var.get(),
+                    backend_callback=self._backend_selected,
+                    cuda_session_cache=self._cuda_session_cache,
+                    cuda_session_path=session_path,
                 )
                 self._events.put(("preview", preview))
                 return
@@ -707,6 +721,9 @@ class StitcherApp:
                 session_thumbnail=self.session_thumbnail_var.get(),
                 exposure_report=self._preview_report,
                 use_gpu=self.use_gpu_var.get(),
+                backend_callback=self._backend_selected,
+                cuda_session_cache=self._cuda_session_cache,
+                cuda_session_path=session_path,
             )
             LOGGER.info("render completed: %s", output_path)
             self._events.put(("stitched", (session.session_id, output_path.name)))
@@ -728,9 +745,11 @@ class StitcherApp:
                 )
             )
         except RenderCancelledError:
+            self._cuda_session_cache.invalidate("render cancelled")
             LOGGER.info("%s cancelled", operation)
             self._events.put(("cancelled", "Render cancelled; partial files were removed."))
         except Exception as error:
+            self._cuda_session_cache.invalidate("render failed")
             LOGGER.exception("%s failed", operation)
             self._events.put(("error", f"{error}\n\nDetails were written to {self._log_path()}"))
         finally:
@@ -738,6 +757,9 @@ class StitcherApp:
 
     def _progress(self, completed: int, total: int, phase: str) -> None:
         self._events.put(("progress", (completed, total, phase)))
+
+    def _backend_selected(self, backend: str, detail: str) -> None:
+        self._events.put(("backend", (backend, detail)))
 
     def _drain_events(self) -> None:
         try:
@@ -749,6 +771,9 @@ class StitcherApp:
                     self.status_var.set(f"{phase}: {completed}/{total}")
                 elif kind == "status":
                     self.status_var.set(payload)
+                elif kind == "backend":
+                    backend, detail = payload
+                    self.backend_var.set(f"Backend: {backend.upper()} — {detail}")
                 elif kind == "preview":
                     preview = payload
                     image = Image.fromarray(preview.pixels, mode="RGB")
@@ -854,10 +879,11 @@ def _configure_logging() -> None:
             encoding="utf-8",
             level=logging.INFO,
             format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+            force=True,
         )
     except OSError:
-        logging.basicConfig(level=logging.INFO)
-    LOGGER.info("Panorama Stitcher started")
+        logging.basicConfig(level=logging.INFO, force=True)
+    LOGGER.info("Panorama Stitcher started; log_path=%s", log_path)
 
 
 def main() -> None:
