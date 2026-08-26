@@ -1,6 +1,5 @@
 import logging
 import math
-import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -362,8 +361,8 @@ def test_cuda_session_cache_key_tracks_sources_geometry_and_gpu_options(tmp_path
     original = cuda_session_cache_key(**kwargs)
     assert original == cuda_session_cache_key(**kwargs)
 
-    stat = source_path.stat()
-    os.utime(source_path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1))
+    with source_path.open("ab") as source_file:
+        source_file.write(b"\0")
     assert original != cuda_session_cache_key(**kwargs)
 
     changed_budget = {**kwargs, "gpu_memory_budget_bytes": 2048}
