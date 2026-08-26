@@ -832,7 +832,9 @@ def _render_thumbnail(
 ) -> Path:
     width, height = source.width, source.height
     vertical_fov = np.degrees(2.0 * np.arctan((height / width) * np.tan(np.pi / 4.0)))
-    _, strip_height = _choose_render_plan(source, width, height, memory_budget_bytes, workers)
+    worker_count, strip_height = _choose_render_plan(
+        source, width, height, memory_budget_bytes, workers
+    )
     strip_count = (height + strip_height - 1) // strip_height
     with tempfile.TemporaryDirectory(prefix="pano-thumbnail-", dir=output_path.parent) as scratch:
         color = np.memmap(
@@ -858,7 +860,8 @@ def _render_thumbnail(
         try:
             exposure_completed = 0
             for frame_position, frame in enumerate(session.frames):
-                for row_start in range(0, height, strip_height):
+
+                def map_thumbnail_exposure(row_start: int) -> None:
                     if cancel_event is not None and cancel_event.is_set():
                         raise RenderCancelledError("render cancelled")
                     rows = min(strip_height, height - row_start)
@@ -882,13 +885,22 @@ def _render_thumbnail(
                     row_slice = slice(row_start, row_start + rows)
                     exposure[row_slice] += exposure_weight * np.float32(log_gains[frame_position])
                     exposure_weights[row_slice] += exposure_weight
-                    exposure_completed += 1
-                    if progress_callback is not None:
-                        progress_callback(
-                            exposure_completed,
-                            len(session.frames) * strip_count,
-                            "thumbnail exposure",
-                        )
+
+                with _limit_opencv_threads(worker_count):
+                    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                        futures = [
+                            executor.submit(map_thumbnail_exposure, row_start)
+                            for row_start in range(0, height, strip_height)
+                        ]
+                        for future in as_completed(futures):
+                            future.result()
+                            exposure_completed += 1
+                        if progress_callback is not None:
+                            progress_callback(
+                                exposure_completed,
+                                len(session.frames) * strip_count,
+                                "thumbnail exposure",
+                            )
             for row_start in range(0, height, strip_height):
                 rows = min(strip_height, height - row_start)
                 row_slice = slice(row_start, row_start + rows)
@@ -899,7 +911,8 @@ def _render_thumbnail(
             compositing_completed = 0
             for frame_position, frame in enumerate(session.frames):
                 decoded = _read_source(_image_path(image_root, frame.filename), source.encoding)
-                for row_start in range(0, height, strip_height):
+
+                def composite_thumbnail_strip(row_start: int) -> None:
                     if cancel_event is not None and cancel_event.is_set():
                         raise RenderCancelledError("render cancelled")
                     rows = min(strip_height, height - row_start)
@@ -938,13 +951,22 @@ def _render_thumbnail(
                     else:
                         color_rows += sampled * candidate[..., np.newaxis]
                         weight_rows += candidate
-                    compositing_completed += 1
-                    if progress_callback is not None:
-                        progress_callback(
-                            compositing_completed,
-                            len(session.frames) * strip_count,
-                            "thumbnail compositing",
-                        )
+
+                with _limit_opencv_threads(worker_count):
+                    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                        futures = [
+                            executor.submit(composite_thumbnail_strip, row_start)
+                            for row_start in range(0, height, strip_height)
+                        ]
+                        for future in as_completed(futures):
+                            future.result()
+                            compositing_completed += 1
+                        if progress_callback is not None:
+                            progress_callback(
+                                compositing_completed,
+                                len(session.frames) * strip_count,
+                                "thumbnail compositing",
+                            )
 
             for row_start in range(0, height, strip_height):
                 rows = min(strip_height, height - row_start)
