@@ -143,6 +143,7 @@ def _estimate_exposure_gains(
         180.0 if session.capture_mode.value == "full_sphere" else session.vertical_fov_deg
     )
     directions = equirectangular_directions(sample_width, sample_height, latitude_span)
+    coverage_masks: list[NDArray[np.bool_]] = []
     valid_masks: list[NDArray[np.bool_]] = []
     luminances: list[FloatImage] = []
     for position, frame in enumerate(session.frames):
@@ -171,14 +172,18 @@ def _estimate_exposure_gains(
         gradient = np.hypot(gradient_x, gradient_y)
         gradient_limit = float(np.quantile(gradient[np.isfinite(gradient)], 0.9))
         luminances.append(luminance)
+        coverage_masks.append(valid)
         valid_masks.append(valid & finite & ~clipped & (gradient <= gradient_limit))
         if progress_callback is not None:
             progress_callback(position + 1)
 
     equations: list[tuple[int, int, float, float]] = []
     adjacency: list[set[int]] = [set() for _ in session.frames]
+    geometric_overlaps: list[tuple[int, int]] = []
     for left in range(frame_count):
         for right in range(left + 1, frame_count):
+            if int(np.count_nonzero(coverage_masks[left] & coverage_masks[right])) >= 24:
+                geometric_overlaps.append((left, right))
             mask = valid_masks[left] & valid_masks[right]
             if int(np.count_nonzero(mask)) < 24:
                 continue
@@ -200,21 +205,37 @@ def _estimate_exposure_gains(
             adjacency[left].add(right)
             adjacency[right].add(left)
 
-    if not equations:
-        raise ValueError("exposure normalization found no reliable overlapping frame pairs")
-    seen = {0}
-    pending = [0]
-    while pending:
-        current = pending.pop()
-        for neighbor in adjacency[current]:
-            if neighbor not in seen:
-                seen.add(neighbor)
-                pending.append(neighbor)
-    if len(seen) != frame_count:
-        missing = ", ".join(str(index + 1) for index in range(frame_count) if index not in seen)
-        raise ValueError(
-            f"exposure normalization graph is disconnected; frames not linked: {missing}"
+    # A dark or clipped overlap cannot estimate a relative gain, but it must not
+    # make an otherwise valid capture unrenderable. Link such components with a
+    # neutral constraint so their unmeasurable relationship remains unchanged.
+    def reachable() -> set[int]:
+        seen = {0}
+        pending = [0]
+        while pending:
+            current = pending.pop()
+            for neighbor in adjacency[current]:
+                if neighbor not in seen:
+                    seen.add(neighbor)
+                    pending.append(neighbor)
+        return seen
+
+    connected = reachable()
+    while True:
+        bridge = next(
+            (
+                (left, right)
+                for left, right in geometric_overlaps
+                if (left in connected) != (right in connected)
+            ),
+            None,
         )
+        if bridge is None:
+            break
+        left, right = bridge
+        equations.append((left, right, 0.0, 1.0))
+        adjacency[left].add(right)
+        adjacency[right].add(left)
+        connected = reachable()
 
     matrix = np.zeros((len(equations) + 1, frame_count), dtype=np.float64)
     values = np.zeros(len(equations) + 1, dtype=np.float64)

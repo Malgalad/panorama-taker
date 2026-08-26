@@ -254,6 +254,30 @@ def test_exposure_solver_recovers_relative_sdr_gain(tmp_path: Path) -> None:
     assert report.gains[1] / report.gains[0] == pytest.approx(4.0, rel=0.03)
 
 
+def test_exposure_solver_keeps_black_overlaps_renderable(tmp_path: Path) -> None:
+    frames = (
+        FrameMetadata(0, "first.png", 0.0, 0.0, 0.0, "captured"),
+        FrameMetadata(1, "second.png", 30.0, 0.0, 0.0, "captured"),
+    )
+    session = SessionMetadata(
+        schema_version=1,
+        session_id="black-exposure",
+        capture_mode=CaptureMode.FULL_SPHERE,
+        horizontal_fov_deg=120.0,
+        vertical_fov_deg=90.0,
+        overlap_fraction=0.08,
+        frames=frames,
+        completed=True,
+    )
+    Image.new("RGB", (64, 64), (0, 0, 0)).save(tmp_path / "first.png")
+    Image.new("RGB", (64, 64), (0, 0, 0)).save(tmp_path / "second.png")
+
+    report = _estimate_exposure_gains(session, tmp_path, SourceInfo(64, 64, ImageEncoding()))
+
+    assert report.edge_count == 1
+    assert report.gains == pytest.approx((1.0, 1.0))
+
+
 def test_local_exposure_compensation_preserves_single_source_regions() -> None:
     log_gains = (0.0, math.log(4.0))
     single_left = np.asarray([[log_gains[0]]], dtype=np.float32)
