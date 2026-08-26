@@ -18,6 +18,7 @@ from pano_stitch.compositor import (
     estimate_render_resources,
     render_session,
     renderable_session,
+    thumbnail_output_path,
     validate_images,
 )
 from pano_stitch.metadata import load_session
@@ -143,6 +144,7 @@ class StitcherApp:
         self.width_var = tk.StringVar()
         self.resolution_percent_var = tk.IntVar(value=100)
         self.resolution_label_var = tk.StringVar()
+        self.session_thumbnail_var = tk.BooleanVar(value=False)
         self.blend_var = tk.StringVar(value="feather")
         self.memory_var = tk.StringVar(value="1024")
         self.workers_var = tk.StringVar(value="Auto")
@@ -231,10 +233,13 @@ class StitcherApp:
         self.resolution_scale.pack(side="left")
         ttk.Label(resolution, textvariable=self.resolution_label_var, width=6).pack(side="left")
         self._option_row(options, 2, "Resolution", resolution)
+        ttk.Checkbutton(
+            options, text="Generate session thumbnail", variable=self.session_thumbnail_var
+        ).grid(row=3, column=1, sticky="w", padx=6, pady=3)
         self.advanced_button = ttk.Button(
             options, text="Advanced options ▸", command=self._toggle_advanced
         )
-        self.advanced_button.grid(row=3, column=0, columnspan=2, sticky="w", padx=6, pady=4)
+        self.advanced_button.grid(row=4, column=0, columnspan=2, sticky="w", padx=6, pady=4)
         self.advanced_frame = ttk.Frame(options)
         self._option_row(
             self.advanced_frame,
@@ -536,8 +541,15 @@ class StitcherApp:
             if output_path is not None and self.coverage_var.get()
             else None
         )
+        thumbnail_path = (
+            thumbnail_output_path(output_path)
+            if output_path is not None and self.session_thumbnail_var.get()
+            else None
+        )
         existing = [
-            path for path in (output_path, coverage_path) if path is not None and path.exists()
+            path
+            for path in (output_path, coverage_path, thumbnail_path)
+            if path is not None and path.exists()
         ]
         if existing:
             if not messagebox.askyesno(
@@ -613,6 +625,7 @@ class StitcherApp:
                 self.jpeg_quality_var.get(),
                 workers,
                 self.auto_contrast_var.get(),
+                session_thumbnail=self.session_thumbnail_var.get(),
             )
             LOGGER.info("render completed: %s", output_path)
             self._events.put(("stitched", (session.session_id, output_path.name)))
@@ -621,12 +634,16 @@ class StitcherApp:
                 if output_path.suffix.lower() == ".exr"
                 else ("enabled" if self.auto_contrast_var.get() else "disabled")
             )
+            thumbnail_note = (
+                f"; thumbnail: {thumbnail_output_path(output_path)}"
+                if self.session_thumbnail_var.get()
+                else ""
+            )
             self._events.put(
                 (
                     "success",
                     f"Wrote {output_path} (exposure edges: {exposure_report.edge_count}; "
-                    f"auto contrast: {auto_state}"
-                    ")",
+                    f"auto contrast: {auto_state}{thumbnail_note})",
                 )
             )
         except RenderCancelledError:

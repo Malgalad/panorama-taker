@@ -11,6 +11,7 @@ from pano_stitch.compositor import (
     estimate_render_resources,
     render_session,
     renderable_session,
+    thumbnail_output_path,
     validate_images,
 )
 from pano_stitch.metadata import load_session
@@ -76,6 +77,11 @@ def _parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="apply Photoshop-style final SDR auto contrast (default: enabled)",
+    )
+    render.add_argument(
+        "--session-thumbnail",
+        action="store_true",
+        help="also write a 90-degree thumbnail at the session center",
     )
     render.add_argument(
         "--jpeg-quality",
@@ -148,6 +154,7 @@ def main() -> None:
                 jpeg_quality=arguments.jpeg_quality,
                 workers=arguments.workers or None,
                 auto_contrast=arguments.auto_contrast,
+                session_thumbnail=arguments.session_thumbnail,
             )
             print(file=sys.stderr)
             gains = ", ".join(f"{gain:.3f}" for gain in exposure_report.gains)
@@ -160,6 +167,8 @@ def main() -> None:
                 state = "skipped for EXR"
             print(f"auto contrast: {state}")
             print(f"wrote {arguments.output}")
+            if arguments.session_thumbnail:
+                print(f"wrote {thumbnail_output_path(arguments.output)}")
         else:
             print(f"valid session: {session.session_id}")
     except (OSError, ValueError) as error:

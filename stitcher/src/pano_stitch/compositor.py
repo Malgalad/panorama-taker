@@ -23,7 +23,12 @@ from numpy.typing import NDArray
 from PIL import Image
 
 from pano_stitch.metadata import FrameMetadata, ImageEncoding, SessionMetadata
-from pano_stitch.projection import camera_maps, equirectangular_directions, remap_source
+from pano_stitch.projection import (
+    camera_maps,
+    equirectangular_directions,
+    rectilinear_directions,
+    remap_source,
+)
 
 FloatImage = NDArray[np.float32]
 DEFAULT_MEMORY_BUDGET_BYTES = 1024 * 1024 * 1024
@@ -452,9 +457,9 @@ def _auto_contrast_levels(
             raise RenderCancelledError("render cancelled")
         rows = min(strip_height, output_height - row_start)
         color = color_scratch[row_start : row_start + rows]
-        valid = (weight_scratch[row_start : row_start + rows] > 0.0) & np.isfinite(
-            color
-        ).all(axis=-1)
+        valid = (weight_scratch[row_start : row_start + rows] > 0.0) & np.isfinite(color).all(
+            axis=-1
+        )
         if np.any(valid):
             rgb = _to_sdr_srgb(color, encoding)
             luminance = rgb @ np.array((0.2126, 0.7152, 0.0722), dtype=np.float32)
@@ -630,9 +635,7 @@ class _CoverageWriter:
                 self._write_chunk(b"IDAT", compressed)
 
 
-def _available_tile_bytes(
-    source: SourceInfo, output_width: int, memory_budget_bytes: int
-) -> int:
+def _available_tile_bytes(source: SourceInfo, output_width: int, memory_budget_bytes: int) -> int:
     if memory_budget_bytes <= 0 or memory_budget_bytes > MAX_MEMORY_BUDGET_BYTES:
         maximum_mib = MAX_MEMORY_BUDGET_BYTES // (1024 * 1024)
         raise ValueError(f"memory budget must be between 1 and {maximum_mib} MiB")
@@ -708,9 +711,7 @@ def _composite_strip(
     if local_exposure is not None:
         correction = _local_exposure_multiplier(
             log_gain,
-            _local_exposure_rows(
-                local_exposure, row_start, rows, output_width, output_height
-            ),
+            _local_exposure_rows(local_exposure, row_start, rows, output_width, output_height),
         )
         sampled *= correction[..., np.newaxis]
     color = color_scratch[row_start : row_start + rows]
@@ -730,9 +731,7 @@ def _exposure_weight(
     valid: NDArray[np.bool_], edge_distance: FloatImage, source_info: SourceInfo
 ) -> FloatImage:
     feather_width = max(1.0, min(source_info.width, source_info.height) * 0.08)
-    return np.where(valid, np.maximum(edge_distance / feather_width, 1e-6), 0.0).astype(
-        np.float32
-    )
+    return np.where(valid, np.maximum(edge_distance / feather_width, 1e-6), 0.0).astype(np.float32)
 
 
 def _local_exposure_multiplier(log_gain: float, local_exposure: FloatImage) -> FloatImage:
@@ -762,11 +761,8 @@ def _local_exposure_rows(
     field_height, field_width = field.shape
     x = (np.arange(output_width, dtype=np.float32) + 0.5) * field_width / output_width - 0.5
     y = (
-        (np.arange(row_start, row_start + rows, dtype=np.float32) + 0.5)
-        * field_height
-        / output_height
-        - 0.5
-    )
+        np.arange(row_start, row_start + rows, dtype=np.float32) + 0.5
+    ) * field_height / output_height - 0.5
     x = np.clip(x, 0.0, field_width - 1)
     y = np.clip(y, 0.0, field_height - 1)
     map_x, map_y = np.meshgrid(x, y)
@@ -811,6 +807,193 @@ def _temporary_output_path(output_path: Path) -> Path:
     path = Path(temporary)
     path.unlink()
     return path
+
+
+def thumbnail_output_path(output_path: Path) -> Path:
+    """Return the derived session-thumbnail path for a panorama output."""
+
+    return output_path.with_name(f"{output_path.stem}-thumbnail{output_path.suffix}")
+
+
+def _render_thumbnail(
+    session: SessionMetadata,
+    image_root: Path,
+    output_path: Path,
+    source: SourceInfo,
+    blend: str,
+    jpeg_quality: int,
+    cancel_event: Event | None,
+    log_gains: tuple[float, ...],
+    allow_incomplete: bool,
+    auto_contrast: bool,
+    memory_budget_bytes: int,
+    workers: int | None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> Path:
+    width, height = source.width, source.height
+    vertical_fov = np.degrees(2.0 * np.arctan((height / width) * np.tan(np.pi / 4.0)))
+    _, strip_height = _choose_render_plan(source, width, height, memory_budget_bytes, workers)
+    strip_count = (height + strip_height - 1) // strip_height
+    with tempfile.TemporaryDirectory(prefix="pano-thumbnail-", dir=output_path.parent) as scratch:
+        color = np.memmap(
+            Path(scratch) / "color.f32", mode="w+", dtype=np.float32, shape=(height, width, 3)
+        )
+        weights = np.memmap(
+            Path(scratch) / "weights.f32", mode="w+", dtype=np.float32, shape=(height, width)
+        )
+        exposure = np.memmap(
+            Path(scratch) / "exposure.f32", mode="w+", dtype=np.float32, shape=(height, width)
+        )
+        exposure_weights = np.memmap(
+            Path(scratch) / "exposure-weights.f32",
+            mode="w+",
+            dtype=np.float32,
+            shape=(height, width),
+        )
+        color[:] = 0.0
+        weights[:] = 0.0
+        exposure[:] = 0.0
+        exposure_weights[:] = 0.0
+        temporary: Path | None = None
+        try:
+            exposure_completed = 0
+            for frame_position, frame in enumerate(session.frames):
+                for row_start in range(0, height, strip_height):
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise RenderCancelledError("render cancelled")
+                    rows = min(strip_height, height - row_start)
+                    directions = rectilinear_directions(
+                        width,
+                        rows,
+                        90.0,
+                        float(vertical_fov),
+                        row_offset=row_start,
+                        full_height=height,
+                    )
+                    _, _, valid, edge_distance = camera_maps(
+                        directions,
+                        frame,
+                        source.width,
+                        source.height,
+                        session.horizontal_fov_deg,
+                        session.vertical_fov_deg,
+                    )
+                    exposure_weight = _exposure_weight(valid, edge_distance, source)
+                    row_slice = slice(row_start, row_start + rows)
+                    exposure[row_slice] += exposure_weight * np.float32(log_gains[frame_position])
+                    exposure_weights[row_slice] += exposure_weight
+                    exposure_completed += 1
+                    if progress_callback is not None:
+                        progress_callback(
+                            exposure_completed,
+                            len(session.frames) * strip_count,
+                            "thumbnail exposure",
+                        )
+            for row_start in range(0, height, strip_height):
+                rows = min(strip_height, height - row_start)
+                row_slice = slice(row_start, row_start + rows)
+                covered_exposure = exposure_weights[row_slice] > 0.0
+                exposure_rows = exposure[row_slice]
+                exposure_rows[covered_exposure] /= exposure_weights[row_slice][covered_exposure]
+
+            compositing_completed = 0
+            for frame_position, frame in enumerate(session.frames):
+                decoded = _read_source(_image_path(image_root, frame.filename), source.encoding)
+                for row_start in range(0, height, strip_height):
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise RenderCancelledError("render cancelled")
+                    rows = min(strip_height, height - row_start)
+                    row_slice = slice(row_start, row_start + rows)
+                    directions = rectilinear_directions(
+                        width,
+                        rows,
+                        90.0,
+                        float(vertical_fov),
+                        row_offset=row_start,
+                        full_height=height,
+                    )
+                    map_x, map_y, valid, edge_distance = camera_maps(
+                        directions,
+                        frame,
+                        source.width,
+                        source.height,
+                        session.horizontal_fov_deg,
+                        session.vertical_fov_deg,
+                    )
+                    sampled = remap_source(decoded, map_x, map_y)
+                    sampled *= np.exp(np.float32(log_gains[frame_position]) - exposure[row_slice])[
+                        ..., np.newaxis
+                    ]
+                    candidate = (
+                        np.where(valid, np.maximum(edge_distance, 1e-6), 0.0)
+                        if blend == "hard"
+                        else _exposure_weight(valid, edge_distance, source)
+                    )
+                    color_rows = color[row_slice]
+                    weight_rows = weights[row_slice]
+                    if blend == "hard":
+                        selected = candidate > weight_rows
+                        color_rows[selected] = sampled[selected]
+                        weight_rows[selected] = candidate[selected]
+                    else:
+                        color_rows += sampled * candidate[..., np.newaxis]
+                        weight_rows += candidate
+                    compositing_completed += 1
+                    if progress_callback is not None:
+                        progress_callback(
+                            compositing_completed,
+                            len(session.frames) * strip_count,
+                            "thumbnail compositing",
+                        )
+
+            for row_start in range(0, height, strip_height):
+                rows = min(strip_height, height - row_start)
+                row_slice = slice(row_start, row_start + rows)
+                color_rows = color[row_slice]
+                weight_rows = weights[row_slice]
+                covered = weight_rows > 0.0
+                uncovered = int(np.count_nonzero(~covered))
+                if uncovered and not allow_incomplete:
+                    raise ValueError(f"capture does not cover {uncovered} thumbnail pixels")
+                if uncovered:
+                    color_rows[~covered] = np.array((1.0, 0.0, 1.0), dtype=np.float32)
+                if blend == "feather":
+                    color_rows[covered] /= weight_rows[covered, np.newaxis]
+
+            levels = (
+                _auto_contrast_levels(
+                    color,
+                    weights,
+                    height,
+                    strip_height,
+                    source.encoding,
+                    cancel_event,
+                )
+                if auto_contrast and output_path.suffix.lower() in {".png", ".jpg", ".jpeg"}
+                else None
+            )
+            temporary = _temporary_output_path(output_path)
+            suffix = output_path.suffix.lower()
+            if suffix == ".exr":
+                writer: Any = _ExrWriter(temporary, width, height)
+            elif suffix == ".png":
+                writer = _PngWriter(temporary, width, height, source.encoding, levels)
+            else:
+                writer = _JpegWriter(
+                    temporary, width, height, source.encoding, jpeg_quality, levels
+                )
+            with writer:
+                for row_start in range(0, height, strip_height):
+                    rows = min(strip_height, height - row_start)
+                    writer.write(color[row_start : row_start + rows])
+            return temporary
+        except Exception:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            raise
+        finally:
+            for mapping in (color, weights, exposure, exposure_weights):
+                _close_scratch_memmap(mapping)
 
 
 def _source_info_for_session(session: SessionMetadata, image_root: Path) -> SourceInfo:
@@ -881,6 +1064,7 @@ def render_session(
     jpeg_quality: int = 95,
     workers: int | None = None,
     auto_contrast: bool = True,
+    session_thumbnail: bool = False,
 ) -> ExposureReport:
     """Render one session with bounded RAM and disk-backed strip accumulators."""
 
@@ -901,9 +1085,7 @@ def render_session(
     output_suffix = output_path.suffix.lower()
     if output_suffix not in {".exr", ".jpg", ".jpeg", ".png"}:
         raise ValueError("output extension must be .exr, .jpg, .jpeg, or .png")
-    resources = estimate_render_resources(
-        session, image_root, width, memory_budget_bytes, workers
-    )
+    resources = estimate_render_resources(session, image_root, width, memory_budget_bytes, workers)
     output_width = resources.output_width
     output_height = resources.output_height
     strip_height = resources.strip_height
@@ -1127,13 +1309,15 @@ def render_session(
                     first_source.encoding,
                     cancel_event,
                     (
-                        lambda completed: progress_callback(
-                            auto_completed + completed,
-                            2 * composite_strips,
-                            phase_labels["auto contrast"],
+                        lambda completed: (
+                            progress_callback(
+                                auto_completed + completed,
+                                2 * composite_strips,
+                                phase_labels["auto contrast"],
+                            )
+                            if progress_callback is not None
+                            else None
                         )
-                        if progress_callback is not None
-                        else None
                     ),
                 )
                 auto_completed += composite_strips
@@ -1144,6 +1328,7 @@ def render_session(
                 if debug_coverage_path is not None
                 else None
             )
+            temporary_thumbnail_path: Path | None = None
             try:
                 if output_suffix == ".exr":
                     writer: _ExrWriter | _JpegWriter | _PngWriter = _ExrWriter(
@@ -1202,13 +1387,39 @@ def render_session(
                         finally:
                             del color_rows
                             del weight_rows
+                if session_thumbnail:
+                    temporary_thumbnail_path = _render_thumbnail(
+                        session,
+                        image_root,
+                        thumbnail_output_path(output_path),
+                        first_source,
+                        blend,
+                        jpeg_quality,
+                        cancel_event,
+                        exposure_report.log_gains,
+                        allow_incomplete,
+                        auto_contrast,
+                        memory_budget_bytes,
+                        workers,
+                        (
+                            lambda completed, total, phase: (
+                                progress_callback(completed, total, f"[thumbnail] {phase}")
+                                if progress_callback is not None
+                                else None
+                            )
+                        ),
+                    )
                 os.replace(temporary_path, output_path)
                 if temporary_coverage_path is not None and debug_coverage_path is not None:
                     os.replace(temporary_coverage_path, debug_coverage_path)
+                if temporary_thumbnail_path is not None:
+                    os.replace(temporary_thumbnail_path, thumbnail_output_path(output_path))
             except Exception:
                 temporary_path.unlink(missing_ok=True)
                 if temporary_coverage_path is not None:
                     temporary_coverage_path.unlink(missing_ok=True)
+                if temporary_thumbnail_path is not None:
+                    temporary_thumbnail_path.unlink(missing_ok=True)
                 raise
             return exposure_report
         finally:

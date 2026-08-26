@@ -34,6 +34,7 @@ from pano_stitch.projection import (
     _rotation_matrix,
     camera_maps,
     equirectangular_directions,
+    rectilinear_directions,
     remap_source,
 )
 
@@ -65,6 +66,16 @@ def test_observed_basis_rows_are_transposed_for_world_to_camera_rotation() -> No
     local_forward = np.array((1.0, 0.0, 0.0), dtype=np.float32) @ _frame_rotation(frame)
 
     assert local_forward == pytest.approx((0.0, 0.0, 1.0))
+
+
+def test_rectilinear_directions_center_forward_and_strip_matches() -> None:
+    whole = rectilinear_directions(5, 3, 90.0, 60.0)
+    strip = rectilinear_directions(5, 1, 90.0, 60.0, row_offset=1, full_height=3)
+
+    np.testing.assert_allclose(strip, whole[1:2])
+    np.testing.assert_allclose(whole[1, 2], (0.0, 0.0, 1.0), atol=1e-6)
+    assert whole[1, 0, 0] < 0.0
+    assert whole[1, -1, 0] > 0.0
 
 
 def test_remap_source_splits_output_wider_than_opencv_limit() -> None:
@@ -120,13 +131,21 @@ def test_full_sphere_render_has_coverage_and_expected_directions(tmp_path: Path)
     validate_images(session, tmp_path)
     output_path = tmp_path / "panorama.png"
     render_session(
-        session, tmp_path, output_path, width=64, blend="hard", auto_contrast=False
+        session,
+        tmp_path,
+        output_path,
+        width=64,
+        blend="hard",
+        auto_contrast=False,
+        session_thumbnail=True,
     )
 
     with Image.open(output_path) as output_image:
         result = np.asarray(output_image.convert("RGB"))
     assert result.shape == (32, 64, 3)
     assert np.all(result > 0)
+    with Image.open(tmp_path / "panorama-thumbnail.png") as thumbnail:
+        assert thumbnail.size == (64, 64)
 
     jpeg_path = tmp_path / "panorama.jpg"
     render_session(session, tmp_path, jpeg_path, width=64, blend="hard", jpeg_quality=95)
@@ -166,9 +185,7 @@ def test_full_sphere_render_has_coverage_and_expected_directions(tmp_path: Path)
 
 def test_jpeg_sources_are_supported(tmp_path: Path) -> None:
     frame = FrameMetadata(0, "frame.jpg", 0.0, 0.0, 0.0, "captured")
-    session = SessionMetadata(
-        1, "jpeg", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (frame,), True
-    )
+    session = SessionMetadata(1, "jpeg", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (frame,), True)
     Image.new("RGB", (32, 16), (128, 64, 32)).save(tmp_path / frame.filename, quality=95)
     validate_images(session, tmp_path)
     assert _probe_source(tmp_path / frame.filename).encoding.transfer_function == "srgb"
@@ -184,6 +201,7 @@ def test_allow_incomplete_skips_missing_sources(tmp_path: Path) -> None:
     validate_images(session, tmp_path, allow_incomplete=True)
     render_session(session, tmp_path, tmp_path / "partial.png", width=32, allow_incomplete=True)
     assert (tmp_path / "partial.png").is_file()
+
 
 def test_pq_decoder_preserves_hdr_domain() -> None:
     encoded = np.array([0.0, 0.5, 1.0], dtype=np.float32)
@@ -202,9 +220,7 @@ def test_rec2020_to_srgb_linear_preserves_neutral_axis() -> None:
 
 def test_hdr_sdr_conversion_preserves_saturated_highlight_chroma() -> None:
     linear_rec2020 = np.array([[[0.02, 0.005, 0.001]]], dtype=np.float32)
-    converted = _to_sdr_srgb(
-        linear_rec2020, ImageEncoding("uint16", "rec2020", "pq", 203.0)
-    )
+    converted = _to_sdr_srgb(linear_rec2020, ImageEncoding("uint16", "rec2020", "pq", 203.0))
     old_relative = linear_rec2020 * np.float32(10000.0 / 203.0)
     old_converted = compositor._linear_to_srgb(old_relative / (1.0 + old_relative))
 
@@ -291,9 +307,10 @@ def test_auto_contrast_uses_shared_sdr_levels() -> None:
 def test_auto_contrast_skips_empty_or_flat_output() -> None:
     color = np.full((4, 8, 3), 0.25, dtype=np.float32)
     weight = np.ones((4, 8), dtype=np.float32)
-    assert _auto_contrast_levels(
-        color, weight, 4, 2, ImageEncoding("float32", "srgb", "srgb"), None
-    ) is None
+    assert (
+        _auto_contrast_levels(color, weight, 4, 2, ImageEncoding("float32", "srgb", "srgb"), None)
+        is None
+    )
 
 
 def test_4k_source_uses_bounded_output_strips() -> None:
@@ -386,9 +403,7 @@ def test_render_resource_estimate_uses_color_and_weight_scratch(tmp_path: Path) 
     resources = estimate_render_resources(session, tmp_path, width=64)
 
     assert resources.output_height == 32
-    assert resources.scratch_bytes == (
-        64 * 32 * 4 + 16 * 8
-    ) * np.dtype(np.float32).itemsize
+    assert resources.scratch_bytes == (64 * 32 * 4 + 16 * 8) * np.dtype(np.float32).itemsize
 
 
 def test_full_sphere_output_dimensions_are_always_two_to_one() -> None:
@@ -455,9 +470,7 @@ def test_parallel_strips_match_single_worker_output(
 
     serial_path = tmp_path / "serial.png"
     parallel_path = tmp_path / "parallel.png"
-    render_session(
-        session, tmp_path, serial_path, width=64, workers=1, memory_budget_bytes=budget
-    )
+    render_session(session, tmp_path, serial_path, width=64, workers=1, memory_budget_bytes=budget)
     opencv_thread_changes: list[int] = []
     monkeypatch.setattr(compositor.cv2, "getNumThreads", lambda: 6)
     monkeypatch.setattr(compositor.cv2, "setNumThreads", opencv_thread_changes.append)

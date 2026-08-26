@@ -73,6 +73,38 @@ def equirectangular_directions(
     ).astype(np.float32)
 
 
+def rectilinear_directions(
+    width: int,
+    height: int,
+    horizontal_fov_deg: float,
+    vertical_fov_deg: float,
+    yaw_deg: float = 0.0,
+    pitch_deg: float = 0.0,
+    roll_deg: float = 0.0,
+    row_offset: int = 0,
+    full_height: int | None = None,
+) -> FloatArray:
+    """Create canonical world directions for a rectilinear camera strip."""
+
+    if width < 1 or height < 1:
+        raise ValueError("output dimensions must be positive")
+    if not 0 < horizontal_fov_deg < 180 or not 0 < vertical_fov_deg < 180:
+        raise ValueError("camera FoVs must be greater than 0 and less than 180 degrees")
+    if full_height is None:
+        full_height = height
+    if full_height < 1 or row_offset < 0 or row_offset + height > full_height:
+        raise ValueError("strip rows must lie inside the output image")
+    focal_x = width / (2.0 * math.tan(math.radians(horizontal_fov_deg) / 2.0))
+    focal_y = full_height / (2.0 * math.tan(math.radians(vertical_fov_deg) / 2.0))
+    x = (np.arange(width, dtype=np.float32) - (width - 1) / 2.0) / focal_x
+    rows = np.arange(row_offset, row_offset + height, dtype=np.float32)
+    y = ((full_height - 1) / 2.0 - rows) / focal_y
+    local_x, local_y = np.meshgrid(x, y)
+    local = np.stack((local_x, local_y, np.ones_like(local_x)), axis=-1)
+    local /= np.linalg.norm(local, axis=-1, keepdims=True)
+    return np.ascontiguousarray(local @ _rotation_matrix(yaw_deg, pitch_deg, roll_deg).T)
+
+
 def camera_maps(
     directions: FloatArray,
     frame: FrameMetadata,
