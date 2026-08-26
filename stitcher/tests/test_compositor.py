@@ -546,6 +546,18 @@ def test_parallel_strips_match_single_worker_output(
     assert opencv_thread_changes == [1, 6]
     with Image.open(serial_path) as serial, Image.open(parallel_path) as parallel:
         np.testing.assert_array_equal(np.asarray(serial), np.asarray(parallel))
+    gpu_path = tmp_path / "gpu.png"
+    render_session(
+        session,
+        tmp_path,
+        gpu_path,
+        width=64,
+        workers=2,
+        memory_budget_bytes=budget,
+        use_gpu=True,
+    )
+    with Image.open(serial_path) as serial, Image.open(gpu_path) as gpu:
+        np.testing.assert_array_equal(np.asarray(serial), np.asarray(gpu))
 
 
 def test_exr_round_trip_preserves_values_above_one(tmp_path: Path) -> None:

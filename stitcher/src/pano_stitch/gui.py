@@ -173,6 +173,7 @@ class StitcherApp:
         self.allow_incomplete_var = tk.BooleanVar(value=False)
         self.coverage_var = tk.BooleanVar(value=False)
         self.auto_contrast_var = tk.BooleanVar(value=True)
+        self.use_gpu_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="Choose a game directory and session.")
 
     def _build_widgets(self) -> None:
@@ -322,6 +323,11 @@ class StitcherApp:
         ttk.Checkbutton(
             self.advanced_frame, text="Write coverage diagnostic PNG", variable=self.coverage_var
         ).grid(row=7, column=1, sticky="w", padx=6, pady=3)
+        ttk.Checkbutton(
+            self.advanced_frame,
+            text="Use GPU acceleration when available",
+            variable=self.use_gpu_var,
+        ).grid(row=8, column=1, sticky="w", padx=6, pady=3)
         ttk.Checkbutton(
             self.advanced_frame, text="Auto contrast (SDR outputs)", variable=self.auto_contrast_var
         ).grid(row=8, column=1, sticky="w", padx=6, pady=3)
@@ -673,6 +679,7 @@ class StitcherApp:
                     cancel_event=self._cancel_event,
                     workers=workers,
                     auto_contrast=self.auto_contrast_var.get(),
+                    use_gpu=self.use_gpu_var.get(),
                 )
                 self._events.put(("preview", preview))
                 return
@@ -699,6 +706,7 @@ class StitcherApp:
                 self.auto_contrast_var.get(),
                 session_thumbnail=self.session_thumbnail_var.get(),
                 exposure_report=self._preview_report,
+                use_gpu=self.use_gpu_var.get(),
             )
             LOGGER.info("render completed: %s", output_path)
             self._events.put(("stitched", (session.session_id, output_path.name)))

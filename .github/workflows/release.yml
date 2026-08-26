@@ -59,6 +59,10 @@ jobs:
             -AddonPath .\build\reshade-addon\Release\PanoramaCaptureReShade.addon64 `
             -Version $version `
             -PythonCommand python
+      - name: Verify release CUDA dependency
+        shell: pwsh
+        run: |
+          & .\.venv-release\Scripts\python.exe -c "import cupy; print(cupy.__version__)"
       - name: Verify archive contents and generate checksums
         shell: pwsh
         run: |

@@ -22,6 +22,9 @@ dev = [
   "ruff>=0.6",
   "types-jsonschema>=4.24"
 ]
+gpu = [
+  "cupy-cuda12x[ctk]>=14,<15"
+]
 bundle = [
   "pyinstaller>=6.10"
 ]

@@ -101,6 +101,17 @@ def _parser() -> argparse.ArgumentParser:
         default=0,
         help="parallel strip workers; 0 selects Auto (default)",
     )
+    render.add_argument(
+        "--gpu",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="use CUDA when available and the panorama fits VRAM (default: enabled)",
+    )
+    render.add_argument(
+        "--gpu-memory-budget-mib",
+        type=int,
+        help="maximum VRAM budget; default is available VRAM minus safety reserve",
+    )
     render.add_argument("--allow-incomplete", action="store_true")
     return parser
 
@@ -155,6 +166,12 @@ def main() -> None:
                 workers=arguments.workers or None,
                 auto_contrast=arguments.auto_contrast,
                 session_thumbnail=arguments.session_thumbnail,
+                use_gpu=arguments.gpu,
+                gpu_memory_budget_bytes=(
+                    arguments.gpu_memory_budget_mib * 1024 * 1024
+                    if arguments.gpu_memory_budget_mib is not None
+                    else None
+                ),
             )
             print(file=sys.stderr)
             gains = ", ".join(f"{gain:.3f}" for gain in exposure_report.gains)

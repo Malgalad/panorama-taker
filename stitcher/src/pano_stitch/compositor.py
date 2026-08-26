@@ -22,6 +22,12 @@ import numpy as np
 from numpy.typing import NDArray
 from PIL import Image
 
+from pano_stitch.gpu import (
+    CudaFrameCompositor,
+    GpuUnavailableError,
+    cuda_device_info,
+    resident_gpu_plan,
+)
 from pano_stitch.metadata import FrameMetadata, ImageEncoding, SessionMetadata
 from pano_stitch.projection import (
     camera_maps,
@@ -719,6 +725,7 @@ def _composite_strip(
     cancel_event: Event | None,
     local_exposure: FloatImage | None = None,
     log_gain: float = 0.0,
+    cuda_compositor: CudaFrameCompositor | None = None,
 ) -> None:
     """Composite one row-disjoint strip in disk-backed shared array views."""
 
@@ -736,6 +743,38 @@ def _composite_strip(
         horizontal_fov_deg,
         vertical_fov_deg,
     )
+    color = color_scratch[row_start : row_start + rows]
+    weight = weight_scratch[row_start : row_start + rows]
+    if cuda_compositor is not None:
+        candidate = (
+            np.where(valid, np.maximum(edge_distance, 1e-6), 0.0)
+            if blend == "hard"
+            else _exposure_weight(valid, edge_distance, source_info)
+        )
+        correction = (
+            _local_exposure_multiplier(
+                log_gain,
+                _local_exposure_rows(
+                    local_exposure, row_start, rows, output_width, output_height
+                ),
+            )
+            if local_exposure is not None
+            else np.ones((rows, output_width), dtype=np.float32)
+        )
+        cuda_compositor.composite(
+            source,
+            map_x,
+            map_y,
+            valid,
+            candidate,
+            correction,
+            color,
+            weight,
+            source_info.width,
+            source_info.height,
+            blend == "hard",
+        )
+        return
     sampled = remap_source(source, map_x, map_y)
     if local_exposure is not None:
         correction = _local_exposure_multiplier(
@@ -743,8 +782,6 @@ def _composite_strip(
             _local_exposure_rows(local_exposure, row_start, rows, output_width, output_height),
         )
         sampled *= correction[..., np.newaxis]
-    color = color_scratch[row_start : row_start + rows]
-    weight = weight_scratch[row_start : row_start + rows]
     if blend == "hard":
         candidate = np.where(valid, np.maximum(edge_distance, 1e-6), 0.0)
         selected = candidate > weight
@@ -1117,6 +1154,8 @@ def render_session(
     auto_contrast: bool = True,
     session_thumbnail: bool = False,
     exposure_report: ExposureReport | None = None,
+    use_gpu: bool | None = False,
+    gpu_memory_budget_bytes: int | None = None,
 ) -> ExposureReport:
     """Render one session with bounded RAM and disk-backed strip accumulators."""
 
@@ -1192,6 +1231,27 @@ def render_session(
         elif progress_callback is not None:
             progress_callback(exposure_work, exposure_work, f"{phase_labels['exposure']} (cached)")
         scratch_root = Path(scratch_directory)
+        cuda_compositor: CudaFrameCompositor | None = None
+        if use_gpu is not False:
+            try:
+                device = cuda_device_info()
+                resident_plan = resident_gpu_plan(
+                    frame_count=len(session.frames),
+                    source_width=first_source.width,
+                    source_height=first_source.height,
+                    output_width=output_width,
+                    output_height=output_height,
+                    exposure_width=exposure_width,
+                    exposure_height=exposure_height,
+                    writer_strip_pixels=strip_height * output_width,
+                    free_bytes=device.free_bytes,
+                    total_bytes=device.total_bytes,
+                    gpu_budget_bytes=gpu_memory_budget_bytes,
+                )
+                if resident_plan is not None:
+                    cuda_compositor = CudaFrameCompositor()
+            except (GpuUnavailableError, MemoryError):
+                cuda_compositor = None
         local_exposure_path = scratch_root / "local-exposure.f32"
         local_weight_path = scratch_root / "local-exposure-weight.f32"
         local_exposure: Any | None = None
@@ -1290,7 +1350,8 @@ def render_session(
         assert color_scratch is not None
         assert weight_scratch is not None
         try:
-            with _limit_opencv_threads(resources.worker_count):
+            compositor_workers = 1 if cuda_compositor is not None else resources.worker_count
+            with _limit_opencv_threads(compositor_workers):
                 compositing_completed = 0
                 for frame_position, frame in enumerate(session.frames):
                     if cancel_event is not None and cancel_event.is_set():
@@ -1299,7 +1360,7 @@ def render_session(
                         _image_path(image_root, frame.filename), first_source.encoding
                     )
                     try:
-                        with ThreadPoolExecutor(max_workers=resources.worker_count) as executor:
+                        with ThreadPoolExecutor(max_workers=compositor_workers) as executor:
                             futures = [
                                 executor.submit(
                                     _composite_strip,
@@ -1319,6 +1380,7 @@ def render_session(
                                     cancel_event,
                                     local_exposure,
                                     exposure_report.log_gains[frame_position],
+                                    cuda_compositor,
                                 )
                                 for row_start in range(0, output_height, strip_height)
                             ]
@@ -1530,6 +1592,7 @@ def render_preview(
     cancel_event: Event | None = None,
     workers: int | None = None,
     auto_contrast: bool = True,
+    use_gpu: bool | None = False,
 ) -> PreviewResult:
     """Render an ephemeral, displayable SDR preview and return its exposure solve."""
 
@@ -1552,6 +1615,7 @@ def render_preview(
             cancel_event=cancel_event,
             workers=workers,
             auto_contrast=auto_contrast and output_suffix.lower() != ".exr",
+            use_gpu=use_gpu,
         )
         with Image.open(preview_path) as image:
             pixels = np.array(image.convert("RGB"), dtype=np.uint8, copy=True)

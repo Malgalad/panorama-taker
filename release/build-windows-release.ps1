@@ -42,7 +42,7 @@ if (-not (Test-Path $python)) {
     & $PythonCommand -m venv $venvRoot
 }
 & $python -m pip install --upgrade pip
-& $python -m pip install "$projectRoot\stitcher[bundle]"
+& $python -m pip install "$projectRoot\stitcher[bundle,gpu]"
 
 $pyInstallerWork = Join-Path $buildRoot "pyinstaller-work"
 $pyInstallerDist = Join-Path $buildRoot "pyinstaller-dist"
@@ -53,6 +53,8 @@ $pyInstallerDist = Join-Path $buildRoot "pyinstaller-dist"
     --distpath $pyInstallerDist `
     --collect-all OpenEXR `
     --collect-all Imath `
+    --collect-all cupy `
+    --collect-all cupyx `
     --add-data "$projectRoot\contracts\session.schema.json;contracts" `
     "$projectRoot\stitcher\scripts\pano_stitch_gui.py"
 
