@@ -26,6 +26,8 @@ def test_windows_release_script_builds_isolated_cpu_and_cuda_archives() -> None:
         'Copy-Item (Join-Path $pyInstallerDist "PanoramaCaptureStitcher") $stitcherStage' in script
     )
     assert '"--specpath", $pyInstallerSpec' in script
+    assert '"--runtime-hook", $runtimeHook' in script
+    assert '"PANO_STITCH_BUILD_FLAVOR`"] = `"$Flavor`"' in script
     assert "Remove-Item -LiteralPath $buildRoot -Recurse -Force" in script
     assert "Removed temporary release build files from $buildRoot" in script
     assert "CPU stitcher bundle unexpectedly contains CuPy or CUDA runtime files" in script
@@ -34,6 +36,13 @@ def test_windows_release_script_builds_isolated_cpu_and_cuda_archives() -> None:
         encoding="utf-8"
     )
     assert '"--verify-cuda-runtime"' in entrypoint
+
+    gui_source = (Path(__file__).resolve().parents[1] / "src" / "pano_stitch" / "gui.py").read_text(
+        encoding="utf-8"
+    )
+    assert 'PANO_STITCH_BUILD_FLAVOR", "cuda"' in gui_source
+    assert "tk.BooleanVar(value=self.cuda_build)" in gui_source
+    assert gui_source.count("if self.cuda_build:") >= 3
 
 
 def test_gpu_package_uses_only_runtime_and_nvrtc_components() -> None:

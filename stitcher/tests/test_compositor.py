@@ -31,6 +31,7 @@ from pano_stitch.compositor import (
     _write_exr,
     cuda_session_cache_key,
     estimate_render_resources,
+    prepare_cuda_session,
     render_preview,
     render_session,
     validate_images,
@@ -430,6 +431,60 @@ def test_cached_exposure_reports_completed_progress_before_mapping(tmp_path: Pat
     )
 
     assert progress[0] == (1, 1, "[1/5] exposure (cached)")
+
+
+def test_prepare_cuda_session_reports_each_source_upload(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    frames = tuple(
+        FrameMetadata(index, f"frame-{index}.png", 0.0, 0.0, 0.0, "captured") for index in range(2)
+    )
+    session = SessionMetadata(
+        1, "upload-progress", CaptureMode.FULL_SPHERE, 90.0, 90.0, 0.08, frames, True
+    )
+    for frame in frames:
+        Image.new("RGB", (2, 2), (32, 64, 96)).save(tmp_path / frame.filename)
+
+    class FakeCudaSession:
+        def __init__(self, **_kwargs: object) -> None:
+            self.log_gains = np.zeros(len(frames), dtype=np.float32)
+
+        def pinned_slot(self, _index: int) -> np.ndarray:
+            return np.empty(12, dtype=np.uint8)
+
+        def upload_source(self, _frame: int, _slot: np.ndarray, _slot_index: int) -> None:
+            pass
+
+        def finish_uploads(self) -> None:
+            pass
+
+        def solve_exposure_gains(self, **_kwargs: object) -> object:
+            return object()
+
+        def download_exposure_report(self, _exposure: object) -> tuple[int, int, np.ndarray]:
+            return 0, 0, self.log_gains
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(compositor, "CudaSession", FakeCudaSession)
+    progress: list[tuple[int, int, str]] = []
+    prepared = prepare_cuda_session(
+        session,
+        tmp_path,
+        SourceInfo(2, 2, ImageEncoding()),
+        CudaMemoryPlan(1, 1, 1, 1, 1, None, 1, 1),
+        progress_callback=lambda completed, total, phase: progress.append(
+            (completed, total, phase)
+        ),
+    )
+    prepared.close()
+
+    assert progress == [
+        (0, 2, "loading from disk"),
+        (1, 2, "loading from disk"),
+        (2, 2, "loading from disk"),
+    ]
 
 
 def test_jpeg_sources_are_supported(tmp_path: Path) -> None:

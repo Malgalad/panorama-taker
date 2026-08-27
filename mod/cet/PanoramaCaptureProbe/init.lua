@@ -1,4 +1,4 @@
-local MOD_VERSION = "0.1.64"
+local MOD_VERSION = "0.1.65"
 local DEVELOPMENT_MODE = false
 
 local function log(message)
@@ -58,6 +58,7 @@ local captureConfig = {
 }
 local STANDALONE_CAMERA_PATH = "base\\entities\\cameras\\simple_free_camera.ent"
 local CAMERA_SPAWN_TIMEOUT_SECONDS = 3.0
+local INITIAL_EXPOSURE_HOLD_SECONDS = 0.1
 local CAMERA_POSITION_TOLERANCE = 0.001
 local CAMERA_FOV_TOLERANCE_DEGREES = 0.05
 local CAMERA_PITCH_TOLERANCE_DEGREES = 0.25
@@ -1178,10 +1179,6 @@ local function applyStandalonePose(environment, yawDegrees)
 end
 
 local function beginProductionCapture(environment)
-    local okControls, controlError = applyEnvironmentControls(environment)
-    if not okControls then
-        return false, controlError
-    end
     local captureHorizontal, captureVertical, captureFovError = effectiveFov()
     if captureHorizontal == nil then
         return false, "capture FoV readback failed: " .. tostring(captureFovError)
@@ -1291,7 +1288,9 @@ local function startProductionSession()
         return cameraSystem:GetActiveCameraForward()
     end)
     local initialCameraYaw = okForward and initialForward and horizontalYaw(initialForward) or nil
-    if initialCameraPosition == nil or initialCameraYaw == nil then
+    local initialCameraPitch = okForward and initialForward and
+        math.deg(math.asin(math.max(-1.0, math.min(1.0, initialForward.z)))) or nil
+    if initialCameraPosition == nil or initialCameraYaw == nil or initialCameraPitch == nil then
         log("Production session cancelled: active camera origin or heading is unavailable.")
         return
     end
@@ -1309,6 +1308,7 @@ local function startProductionSession()
         playerCamera = playerCamera,
         initialCameraPosition = initialCameraPosition,
         initialCameraYaw = initialCameraYaw,
+        initialCameraPitch = initialCameraPitch,
         player = player,
         playerHash = playerHash,
         position = Vector4.new(player:GetWorldPosition().x, player:GetWorldPosition().y,
@@ -1555,20 +1555,40 @@ registerForEvent("onUpdate", function(deltaTime)
                     abortEnvironment("standalone camera FoV assignment failed")
                     return
                 end
-                environmentSequence.targetPitch = productionSession.plan.poses[1].pitch
-                local poseOk = pcall(function()
-                    applyStandalonePose(environmentSequence, productionSession.plan.poses[1].yaw)
+                environmentSequence.targetPitch = environmentSequence.initialCameraPitch
+                local activationOk = pcall(function()
+                    applyStandalonePose(environmentSequence, 0.0)
                     component:Activate(0, false)
                 end)
-                if not poseOk then
+                if not activationOk then
                     abortEnvironment("standalone camera activation failed")
                     return
                 end
-                environmentSequence.state = "rotated_pending"
+                local controlsOk, controlsError = applyEnvironmentControls(environmentSequence)
+                if not controlsOk then
+                    abortEnvironment(controlsError)
+                    return
+                end
+                environmentSequence.state = "initial_exposure_hold"
+                environmentSequence.settleElapsed = 0.0
                 return
             end
             if standalone.spawnElapsed >= CAMERA_SPAWN_TIMEOUT_SECONDS then
                 abortEnvironment("standalone camera spawn timed out")
+            end
+            return
+        end
+        if environmentSequence.state == "initial_exposure_hold" then
+            if type(deltaTime) == "number" and deltaTime > 0 then
+                environmentSequence.settleElapsed = environmentSequence.settleElapsed + deltaTime
+            end
+            if environmentSequence.settleElapsed >= INITIAL_EXPOSURE_HOLD_SECONDS then
+                local firstPose = productionSession.plan.poses[1]
+                environmentSequence.targetYaw = firstPose.yaw
+                environmentSequence.targetPitch = firstPose.pitch
+                environmentSequence.settleElapsed = 0.0
+                environmentSequence.state = "rotated_pending"
+                applyStandalonePose(environmentSequence, firstPose.yaw)
             end
             return
         end

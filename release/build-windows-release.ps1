@@ -90,12 +90,18 @@ function New-StitcherArchive {
     $pyInstallerWork = Join-Path $buildRoot "pyinstaller-work-$Flavor"
     $pyInstallerDist = Join-Path $buildRoot "pyinstaller-dist-$Flavor"
     $pyInstallerSpec = Join-Path $buildRoot "pyinstaller-spec-$Flavor"
+    $runtimeHook = Join-Path $buildRoot "build-flavor-$Flavor.py"
+    Set-Content -LiteralPath $runtimeHook -Value @(
+        "import os"
+        "os.environ[`"PANO_STITCH_BUILD_FLAVOR`"] = `"$Flavor`""
+    )
     $pyInstallerArgs = @(
         "--noconfirm", "--clean", "--windowed",
         "--name", "PanoramaCaptureStitcher",
         "--workpath", $pyInstallerWork,
         "--distpath", $pyInstallerDist,
         "--specpath", $pyInstallerSpec,
+        "--runtime-hook", $runtimeHook,
         "--collect-all", "OpenEXR",
         "--collect-all", "Imath"
     )

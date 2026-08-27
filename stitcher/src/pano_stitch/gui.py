@@ -36,13 +36,38 @@ from pano_stitch.sessions import (
 )
 
 LOGGER = logging.getLogger(__name__)
+MIB = 1024**2
+GIB = 1024**3
+CUDA_BUILD = os.environ.get("PANO_STITCH_BUILD_FLAVOR", "cuda") == "cuda"
+
+
+def _backend_status(backend: str, detail: str, *, cuda_requested: bool, log_directory: Path) -> str:
+    if backend == "cpu" and cuda_requested:
+        return f"Backend: CPU — CUDA error occurred; check logs in {log_directory}"
+    if backend.startswith("cuda"):
+        prefix, separator, remainder = detail.partition("reserve=")
+        byte_count, unit_separator, suffix = remainder.partition(" bytes")
+        if separator and unit_separator:
+            try:
+                reserve_bytes = int(byte_count)
+            except ValueError:
+                pass
+            else:
+                reserve = (
+                    f"{reserve_bytes / GIB:.2f} GB"
+                    if reserve_bytes >= GIB
+                    else f"{reserve_bytes / MIB:.0f} MB"
+                )
+                detail = f"{prefix}reserve={reserve}{suffix}"
+    return f"Backend: {backend.upper()} — {detail}"
 
 
 class StitcherApp:
     """Tkinter UI that delegates all image work to the existing stitcher API."""
 
-    def __init__(self, root: tk.Tk) -> None:
+    def __init__(self, root: tk.Tk, *, cuda_build: bool = CUDA_BUILD) -> None:
         self.root = root
+        self.cuda_build = cuda_build
         self.root.title("Cyberpunk Panorama Stitcher")
         self.root.minsize(680, 400)
         self._events: queue.Queue[tuple[str, Any]] = queue.Queue()
@@ -60,26 +85,22 @@ class StitcherApp:
         self._load_settings()
         self._build_widgets()
         self._form_controls = self._form_control_widgets()
+        self._output_dir_writable = self._is_output_directory_writable()
         self.session_var.trace_add("write", self._input_changed)
         self.game_dir_var.trace_add("write", lambda *_args: self._refresh_sessions())
         self.image_dir_var.trace_add("write", self._input_changed)
+        self.output_dir_var.trace_add("write", self._output_directory_changed)
         self.output_name_var.trace_add("write", self._output_name_changed)
         self.format_var.trace_add("write", self._format_changed)
-        for variable in (
-            self.output_dir_var,
-            self.width_var,
-            self.resolution_percent_var,
-            self.session_thumbnail_var,
+        preview_variables = [
             self.blend_var,
-            self.memory_var,
-            self.workers_var,
             self.allow_incomplete_var,
-            self.coverage_var,
             self.auto_contrast_var,
-            self.use_gpu_var,
-            self.jpeg_quality_var,
-        ):
-            variable.trace_add("write", self._input_changed)
+        ]
+        if self.cuda_build:
+            preview_variables.append(self.use_gpu_var)
+        for variable in preview_variables:
+            variable.trace_add("write", self._preview_option_changed)
         self._update_resolution_label()
         self._update_jpeg_quality_label()
         self._format_changed()
@@ -177,7 +198,7 @@ class StitcherApp:
         self.allow_incomplete_var = tk.BooleanVar(value=False)
         self.coverage_var = tk.BooleanVar(value=False)
         self.auto_contrast_var = tk.BooleanVar(value=True)
-        self.use_gpu_var = tk.BooleanVar(value=True)
+        self.use_gpu_var = tk.BooleanVar(value=self.cuda_build)
         self.backend_var = tk.StringVar(value="Backend: not selected")
         self.status_var = tk.StringVar(value="Choose a game directory and session.")
 
@@ -301,13 +322,14 @@ class StitcherApp:
         self._option_row(
             self.advanced_frame,
             3,
-            "Memory budget (MiB)",
+            "CPU memory budget (MiB)",
             ttk.Spinbox(
                 self.advanced_frame, textvariable=self.memory_var, from_=1, to=8096, width=14
             ),
         )
         ttk.Label(
-            self.advanced_frame, text="Larger budgets can render faster if RAM is available."
+            self.advanced_frame,
+            text="Applies only to the CPU backend; larger budgets can render faster.",
         ).grid(row=4, column=1, sticky="w", padx=6)
         worker_choices = ("Auto", *(str(worker) for worker in range(1, (os.cpu_count() or 1) + 1)))
         self._option_row(
@@ -328,14 +350,15 @@ class StitcherApp:
         ttk.Checkbutton(
             self.advanced_frame, text="Write coverage diagnostic PNG", variable=self.coverage_var
         ).grid(row=7, column=1, sticky="w", padx=6, pady=3)
-        ttk.Checkbutton(
-            self.advanced_frame,
-            text="Use GPU acceleration when available",
-            variable=self.use_gpu_var,
-        ).grid(row=8, column=1, sticky="w", padx=6, pady=3)
+        if self.cuda_build:
+            ttk.Checkbutton(
+                self.advanced_frame,
+                text="Use GPU acceleration when available",
+                variable=self.use_gpu_var,
+            ).grid(row=8, column=1, sticky="w", padx=6, pady=3)
         ttk.Checkbutton(
             self.advanced_frame, text="Auto contrast (SDR outputs)", variable=self.auto_contrast_var
-        ).grid(row=8, column=1, sticky="w", padx=6, pady=3)
+        ).grid(row=9, column=1, sticky="w", padx=6, pady=3)
 
         actions = ttk.Frame(self.left_column)
         actions.pack(fill="x", padx=12, pady=8)
@@ -353,9 +376,10 @@ class StitcherApp:
 
         self.progress = ttk.Progressbar(self.left_column, mode="determinate", maximum=100)
         self.progress.pack(fill="x", padx=12, pady=4)
-        ttk.Label(self.left_column, textvariable=self.backend_var).pack(
-            fill="x", padx=12, pady=(4, 0)
-        )
+        if self.cuda_build:
+            ttk.Label(self.left_column, textvariable=self.backend_var).pack(
+                fill="x", padx=12, pady=(4, 0)
+            )
         ttk.Label(self.left_column, textvariable=self.status_var, wraplength=640).pack(
             fill="x", padx=12, pady=8
         )
@@ -466,9 +490,8 @@ class StitcherApp:
         if chosen:
             self._set_path(self.output_dir_var, chosen)
 
-    def _paths(self) -> tuple[Path, Path, Path]:
+    def _input_paths(self) -> tuple[Path, Path]:
         session = Path(self.session_var.get()).expanduser().resolve()
-        output_dir = Path(self.output_dir_var.get()).expanduser().resolve()
         if not session.is_file():
             raise ValueError("capture JSON does not exist")
         image_text = self.image_dir_var.get().strip()
@@ -483,8 +506,14 @@ class StitcherApp:
                 "screenshots directory does not exist; choose one or use a CET JSON "
                 "with valid paths"
             )
+        return session, image_dir
+
+    def _output_directory(self) -> Path:
+        output_dir = Path(self.output_dir_var.get()).expanduser().resolve()
         output_dir.mkdir(parents=True, exist_ok=True)
-        return session, image_dir, output_dir
+        if not output_dir.is_dir() or not os.access(output_dir, os.W_OK):
+            raise ValueError("output directory is not writable")
+        return output_dir
 
     @staticmethod
     def _inferred_image_directory(session: Any, fallback: Path) -> Path | None:
@@ -504,7 +533,7 @@ class StitcherApp:
     def _toggle_advanced(self) -> None:
         self._advanced_visible = not self._advanced_visible
         if self._advanced_visible:
-            self.advanced_frame.grid(row=4, column=0, columnspan=2, sticky="ew", padx=6)
+            self.advanced_frame.grid(row=5, column=0, columnspan=2, sticky="ew", padx=6)
             self.advanced_button.configure(text="Advanced options ▾")
         else:
             self.advanced_frame.grid_remove()
@@ -514,6 +543,24 @@ class StitcherApp:
         if self._preview_report is not None:
             self.discard_preview()
         self._output_name_dirty = True
+
+    def _preview_option_changed(self, *_args: object) -> None:
+        if self._preview_report is not None:
+            self.discard_preview()
+
+    def _is_output_directory_writable(self) -> bool:
+        candidate = Path(self.output_dir_var.get().strip() or ".").expanduser()
+        while not candidate.exists() and candidate != candidate.parent:
+            candidate = candidate.parent
+        return candidate.is_dir() and os.access(candidate, os.W_OK)
+
+    def _output_directory_changed(self, *_args: object) -> None:
+        self._output_dir_writable = self._is_output_directory_writable()
+        self.render_button.configure(
+            state="normal" if self._validated and self._output_dir_writable else "disabled"
+        )
+        if not self._output_dir_writable:
+            self.status_var.set("Output directory is not writable.")
 
     def _format_changed(self, *_args: object) -> None:
         if self._preview_report is not None:
@@ -587,7 +634,7 @@ class StitcherApp:
         self._worker.start()
 
     def render(self) -> None:
-        if not self._validated:
+        if not self._validated or not self._output_dir_writable:
             return
         if self._preview_report is None:
             self.root.update_idletasks()
@@ -640,13 +687,14 @@ class StitcherApp:
         try:
             LOGGER.info("%s started", operation)
             self._events.put(("backend", ("selecting", "checking GPU availability and VRAM")))
-            session_path, image_dir, output_dir = self._paths()
+            session_path, image_dir = self._input_paths()
             session = load_session(session_path, image_directory=image_dir)
             allow_incomplete = self.allow_incomplete_var.get()
             validate_images(session, image_dir, allow_incomplete)
             if operation == "validate":
                 self._events.put(("validated", f"Valid session: {session.session_id}"))
                 return
+            output_dir = self._output_directory()
             session = renderable_session(session, image_dir, allow_incomplete)
             scale = Fraction(self.resolution_percent_var.get(), 100)
             if scale <= 0 or scale > 1:
@@ -773,7 +821,14 @@ class StitcherApp:
                     self.status_var.set(payload)
                 elif kind == "backend":
                     backend, detail = payload
-                    self.backend_var.set(f"Backend: {backend.upper()} — {detail}")
+                    self.backend_var.set(
+                        _backend_status(
+                            backend,
+                            detail,
+                            cuda_requested=self.use_gpu_var.get(),
+                            log_directory=self._log_path().parent,
+                        )
+                    )
                 elif kind == "preview":
                     preview = payload
                     image = Image.fromarray(preview.pixels, mode="RGB")
@@ -785,8 +840,14 @@ class StitcherApp:
                     self.status_var.set("Preview ready. Render full size or discard it.")
                 elif kind == "validated":
                     self._validated = True
-                    self.render_button.configure(state="normal")
-                    self.status_var.set(payload)
+                    self.render_button.configure(
+                        state="normal" if self._output_dir_writable else "disabled"
+                    )
+                    self.status_var.set(
+                        payload
+                        if self._output_dir_writable
+                        else "Output directory is not writable."
+                    )
                 elif kind == "success":
                     self.discard_preview()
                     self.status_var.set(payload)
@@ -838,7 +899,9 @@ class StitcherApp:
     def _set_busy(self, busy: bool) -> None:
         self._set_form_enabled(not busy)
         state = "disabled" if busy else "normal"
-        self.render_button.configure(state=state if self._validated else "disabled")
+        self.render_button.configure(
+            state=state if self._validated and self._output_dir_writable else "disabled"
+        )
         self.cancel_button.configure(state="normal" if busy else "disabled")
 
 

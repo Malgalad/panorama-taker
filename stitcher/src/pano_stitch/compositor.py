@@ -1740,6 +1740,7 @@ def prepare_cuda_session(
     source: SourceInfo,
     gpu_plan: CudaMemoryPlan,
     cancel_event: Event | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> PreparedCudaSession:
     """Upload one session and solve its exposure once for reusable CUDA output jobs."""
 
@@ -1757,6 +1758,8 @@ def prepare_cuda_session(
     )
     try:
         upload_started = time.perf_counter()
+        if progress_callback is not None:
+            progress_callback(0, len(session.frames), "loading from disk")
         for frame_position, frame in enumerate(session.frames):
             if cancel_event is not None and cancel_event.is_set():
                 raise RenderCancelledError("render cancelled")
@@ -1768,6 +1771,8 @@ def prepare_cuda_session(
             finally:
                 del decoded
             cuda_session.upload_source(frame_position, slot, slot_index)
+            if progress_callback is not None:
+                progress_callback(frame_position + 1, len(session.frames), "loading from disk")
         cuda_session.finish_uploads()
         upload_seconds = time.perf_counter() - upload_started
         exposure_started = time.perf_counter()
@@ -1800,11 +1805,17 @@ def _cached_or_prepared_cuda_session(
     gpu_plan: CudaMemoryPlan,
     gpu_memory_budget_bytes: int | None,
     cancel_event: Event | None,
+    progress_callback: Callable[[int, int, str], None] | None,
 ) -> tuple[PreparedCudaSession, CudaSessionCache | None]:
     """Return a matching cached session or prepare one for this render."""
 
     if cache is None or session_path is None:
-        return prepare_cuda_session(session, image_root, source, gpu_plan, cancel_event), None
+        return (
+            prepare_cuda_session(
+                session, image_root, source, gpu_plan, cancel_event, progress_callback
+            ),
+            None,
+        )
     device = cuda_device_info()
     key = cuda_session_cache_key(
         device_name=device.name,
@@ -1818,7 +1829,9 @@ def _cached_or_prepared_cuda_session(
     if prepared is not None:
         return prepared, cache
     try:
-        prepared = prepare_cuda_session(session, image_root, source, gpu_plan, cancel_event)
+        prepared = prepare_cuda_session(
+            session, image_root, source, gpu_plan, cancel_event, progress_callback
+        )
     except Exception:
         cache.invalidate("preparation failed")
         raise
@@ -2078,7 +2091,9 @@ def _render_cuda(
 ) -> ExposureReport | PreviewResult:
     """Prepare one CUDA session, render it once, and release its device ownership."""
 
-    prepared = prepare_cuda_session(session, image_root, source, gpu_plan, cancel_event)
+    prepared = prepare_cuda_session(
+        session, image_root, source, gpu_plan, cancel_event, progress_callback
+    )
     try:
         return _render_prepared_cuda(
             session,
@@ -2233,6 +2248,7 @@ def render_session(
                 gpu_plan=gpu_plan,
                 gpu_memory_budget_bytes=gpu_memory_budget_bytes,
                 cancel_event=cancel_event,
+                progress_callback=progress_callback,
             )
             cuda_result = _render_prepared_cuda(
                 renderable,
@@ -2400,6 +2416,7 @@ def render_preview(
                         gpu_plan=gpu_plan,
                         gpu_memory_budget_bytes=gpu_memory_budget_bytes,
                         cancel_event=cancel_event,
+                        progress_callback=progress_callback,
                     )
                     assert cache_owner is not None
                     try:
