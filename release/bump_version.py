@@ -97,7 +97,7 @@ def main() -> None:
     project_root = arguments.project_root.resolve()
 
     for path in bump_version(project_root, arguments.version):
-        print(path.relative_to(project_root))
+        print(path.relative_to(project_root).as_posix())
 
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+import tomllib
 from pathlib import Path
 
 
@@ -23,17 +24,21 @@ def test_github_actions_exclude_hardware_cuda_tests() -> None:
 
 def test_release_versions_are_synchronized() -> None:
     project_root = Path(__file__).resolve().parents[2]
+    pyproject = tomllib.loads((project_root / "stitcher" / "pyproject.toml").read_text())
+    version = pyproject["project"]["version"]
+    semver_arguments = ", ".join(version.split("."))
+    expected_declarations = {
+        "stitcher/src/pano_stitch/__init__.py": f'__version__ = "{version}"',
+        "stitcher/uv.lock": f'name = "pano-stitch"\nversion = "{version}"',
+        "mod/cet/PanoramaCaptureProbe/init.lua": f'local MOD_VERSION = "{version}"',
+        "mod/src/plugin.cpp": f"RED4EXT_V1_SEMVER({semver_arguments})",
+        "contracts/example-session.json": f'"mod_version": "{version}"',
+        "release/build-windows-release.ps1": f'[string]$Version = "{version}"',
+        ".github/workflows/release.yml": f'default: "{version}"',
+    }
 
-    assert 'version = "1.0.0"' in (project_root / "stitcher" / "pyproject.toml").read_text()
-    assert (
-        '__version__ = "1.0.0"'
-        in (project_root / "stitcher" / "src" / "pano_stitch" / "__init__.py").read_text()
-    )
-    assert (
-        'local MOD_VERSION = "1.0.0"'
-        in (project_root / "mod" / "cet" / "PanoramaCaptureProbe" / "init.lua").read_text()
-    )
-    assert "RED4EXT_V1_SEMVER(1, 0, 0)" in (project_root / "mod" / "src" / "plugin.cpp").read_text()
+    for relative_path, declaration in expected_declarations.items():
+        assert declaration in (project_root / relative_path).read_text()
 
 
 def test_windows_release_script_builds_isolated_cpu_and_cuda_archives() -> None:
