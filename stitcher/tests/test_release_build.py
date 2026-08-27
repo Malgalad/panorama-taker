@@ -1,6 +1,41 @@
 from pathlib import Path
 
 
+def test_release_workflow_publishes_existing_plain_version_release() -> None:
+    workflow = (
+        Path(__file__).resolve().parents[2] / ".github" / "workflows" / "release.yml"
+    ).read_text(encoding="utf-8")
+
+    assert '- "[0-9]*"' in workflow
+    assert "inputs.release_version || github.ref" in workflow
+    assert "github.event_name == 'push' || inputs.publish" in workflow
+    assert "gh release upload $env:RELEASE_VERSION $assets --clobber" in workflow
+
+
+def test_github_actions_exclude_hardware_cuda_tests() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+    ignore_argument = "--ignore=stitcher/tests/test_gpu_runtime.py"
+
+    for workflow_name in ("ci.yml", "release.yml"):
+        workflow = (project_root / ".github" / "workflows" / workflow_name).read_text()
+        assert ignore_argument in workflow
+
+
+def test_release_versions_are_synchronized() -> None:
+    project_root = Path(__file__).resolve().parents[2]
+
+    assert 'version = "1.0.0"' in (project_root / "stitcher" / "pyproject.toml").read_text()
+    assert (
+        '__version__ = "1.0.0"'
+        in (project_root / "stitcher" / "src" / "pano_stitch" / "__init__.py").read_text()
+    )
+    assert (
+        'local MOD_VERSION = "1.0.0"'
+        in (project_root / "mod" / "cet" / "PanoramaCaptureProbe" / "init.lua").read_text()
+    )
+    assert "RED4EXT_V1_SEMVER(1, 0, 0)" in (project_root / "mod" / "src" / "plugin.cpp").read_text()
+
+
 def test_windows_release_script_builds_isolated_cpu_and_cuda_archives() -> None:
     script = (
         Path(__file__).resolve().parents[2] / "release" / "build-windows-release.ps1"

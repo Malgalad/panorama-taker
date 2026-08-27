@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "pano-stitch"
-version = "0.1.0"
+version = "1.0.1"
 description = "Metadata-driven Cyberpunk 2077 panorama stitching tools"
 requires-python = ">=3.12"
 dependencies = [
