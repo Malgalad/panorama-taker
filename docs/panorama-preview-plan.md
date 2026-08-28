@@ -1,5 +1,10 @@
 # Panorama preview implementation plan
 
+> Historical implementation plan. The current code and tests are authoritative; manual exposure
+> behavior, pose-overlay interaction, and its resource/threading invariants are documented in
+> [exposure-normalization.md](exposure-normalization.md). Later implementation results are recorded
+> in [progress.md](progress.md).
+
 ## Goal
 
 Change the GUI render flow from one action into two stages:

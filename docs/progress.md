@@ -490,3 +490,14 @@ CUDA (2.65×); CPU/CUDA PNGs differed by at most one RGB code. The cache,
 transfer, parity, and simulated 6 GiB admission gates are therefore evidenced
 locally. Clean Windows driver-only packaged-artifact validation remains the
 external release gate.
+
+GUI exposure-preview acceleration (2026-08-28): CUDA preview admission now
+includes a retained RGB8 full preview, one full-resolution byte mask per pose,
+the high-quality overview, and a reusable viewport output. Compact CPU masks
+are expanded once on CUDA; moving crops, hover tint, and one-pixel boundaries
+then compose in a single GPU kernel. The display worker presents the newest
+completed generation during continuous pointer motion instead of starving on
+newer queued requests. Tk still applies the downloaded viewport image. CPU
+fallback retains the background Pillow compositor. Focused CPU tests and the
+elevated 13-test CUDA runtime suite pass; packaged Windows responsiveness and
+visual hit testing remain part of the clean-machine release gate.

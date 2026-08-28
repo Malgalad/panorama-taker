@@ -19,6 +19,7 @@ from pano_stitch.compositor import (
 from pano_stitch.gpu import (
     CudaMemoryPlan,
     CudaOutputJob,
+    CudaPreviewDisplay,
     CudaSession,
     GpuUnavailableError,
     cuda_device_info,
@@ -82,8 +83,6 @@ def test_cuda_render_session_writes_final_output_without_scratch(tmp_path: Path)
     assert diagnostics[0].transfer_stats.disk_scratch_bytes == 0
     assert {name for name, _seconds in diagnostics[0].phase_seconds} == {
         "upload",
-        "exposure",
-        "local_exposure",
         "compositing",
         "conversion_download",
         "encode",
@@ -110,7 +109,6 @@ def test_cuda_render_avoids_cpu_image_helpers(
         pytest.fail("CUDA renderer invoked a CPU image helper")
 
     for name in (
-        "_estimate_exposure_gains",
         "_composite_strip",
         "_auto_contrast_levels",
         "camera_maps",
@@ -280,12 +278,7 @@ def test_cuda_banded_output_job_copies_multiple_bands() -> None:
         source = np.full((2, 2, 3), 128, dtype=np.uint8)
         session.upload_source(0, source)
         session.finish_uploads()
-        exposure = session.solve_exposure_gains(
-            latitude_span=180.0,
-            horizontal_fov=90.0,
-            vertical_fov=90.0,
-            transfer_function="srgb",
-        )
+        session.log_gains = session._cp.zeros(1, dtype=session._cp.float32)
         with CudaOutputJob(
             session,
             output_width=8,
@@ -295,12 +288,6 @@ def test_cuda_banded_output_job_copies_multiple_bands() -> None:
         ) as job:
             assert job.is_banded
             host = session.pinned_array((4, 8, 3), np.dtype(np.uint8))
-            job.build_local_exposure(
-                latitude_span=180.0,
-                horizontal_fov=90.0,
-                vertical_fov=90.0,
-                log_gains=exposure.log_gains,
-            )
             for row_start in (0, 2):
                 job.compose_band(
                     row_start=row_start,
@@ -324,7 +311,7 @@ def test_cuda_banded_output_job_copies_multiple_bands() -> None:
     assert int(host.max()) == 255
 
 
-def test_cuda_global_exposure_solves_a_two_frame_overlap(tmp_path: Path) -> None:
+def test_cuda_default_render_does_not_adjust_pose_exposure(tmp_path: Path) -> None:
     frames = (
         FrameMetadata(0, "dark.png", 0.0, 0.0, 0.0, "captured"),
         FrameMetadata(1, "bright.png", 0.0, 0.0, 0.0, "captured"),
@@ -351,8 +338,8 @@ def test_cuda_global_exposure_solves_a_two_frame_overlap(tmp_path: Path) -> None
         use_gpu=True,
     )
 
-    assert report.edge_count == 1
-    assert report.gains == pytest.approx((2.0, 0.5), abs=1e-5)
+    assert report.edge_count == 0
+    assert report.gains == (1.0, 1.0)
 
 
 def test_cuda_multi_frame_exposure_matches_cpu_for_shared_scene(tmp_path: Path) -> None:
@@ -445,6 +432,37 @@ def test_prepare_cuda_session_retains_uploaded_sources_for_reuse(tmp_path: Path)
     finally:
         prepared.close()
     assert prepared.cuda_session.sources is None
+
+
+def test_cuda_preview_display_composes_retained_crop_and_boundary(tmp_path: Path) -> None:
+    frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
+    metadata = SessionMetadata(
+        1, "preview-display", CaptureMode.FULL_SPHERE, 90.0, 90.0, 0.08, (frame,), True
+    )
+    Image.new("RGB", (4, 2), (96, 64, 32)).save(tmp_path / frame.filename)
+    prepared = prepare_cuda_session(
+        metadata,
+        tmp_path,
+        SourceInfo(4, 2, ImageEncoding("uint8", "srgb", "srgb")),
+        CudaMemoryPlan(24, 36, 1024, 96, 0, None, 2048, 10_000_000),
+    )
+    preview = np.arange(8 * 4 * 3, dtype=np.uint8).reshape((4, 8, 3))
+    overview = np.zeros((2, 4, 3), dtype=np.uint8)
+    mask = np.zeros((2, 4), dtype=bool)
+    mask[:, :2] = True
+    display = CudaPreviewDisplay(prepared.cuda_session, preview, overview, (mask,))
+    try:
+        crop = display.render((4, 2, 8, 4), frozenset(), None, False, False)
+        hovered = display.render(None, frozenset({0}), None, False, False)
+        boundary = display.render(None, frozenset(), 0, False, True)
+    finally:
+        display.close()
+        prepared.close()
+
+    assert np.array_equal(crop, preview[2:4, 4:8])
+    assert np.array_equal(hovered[0, 0], np.array((255, 0, 255), dtype=np.uint8))
+    assert np.array_equal(hovered[0, 3], np.zeros(3, dtype=np.uint8))
+    assert np.array_equal(boundary[0, 1], np.array((0, 102, 255), dtype=np.uint8))
 
 
 def test_prepared_cuda_output_does_not_take_session_ownership(tmp_path: Path) -> None:

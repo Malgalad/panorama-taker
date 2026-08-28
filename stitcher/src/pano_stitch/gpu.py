@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from importlib import import_module
+from threading import Lock
 from typing import Any, Literal
 
 import numpy as np
@@ -15,7 +16,6 @@ GPU_RESERVE_BYTES = 384 * MiB
 GPU_RESERVE_FRACTION = 0.15
 GPU_OVERHEAD_BYTES = 64 * MiB
 _MINIMUM_BAND_ROWS = 32
-_LOCAL_EXPOSURE_SCALE = 4
 _HISTOGRAM_BYTES = 4096 * 8
 _WATCHDOG_TARGET_SECONDS = 0.25
 _WATCHDOG_INITIAL_ROWS = 256
@@ -47,7 +47,7 @@ class BackendSelection:
 
 @dataclass(frozen=True)
 class CudaMemoryPlan:
-    """Exact CUDA allocation budget for one output job."""
+    """Exact CUDA allocation budget for one render and retained preview cache."""
 
     source_bytes: int
     session_workspace_bytes: int
@@ -57,6 +57,7 @@ class CudaMemoryPlan:
     output_band_rows: int | None
     required_bytes: int
     available_bytes: int
+    preview_cache_bytes: int = 0
 
 
 @dataclass
@@ -604,6 +605,17 @@ class CudaSession:
         self.record_download(int(gains.nbytes) + np.dtype(np.int32).itemsize * 2)
         return anchor, edge_count, tuple(float(value) for value in gains)
 
+    def download_exposure_proxies(self) -> tuple[np.ndarray[Any, Any], ...]:
+        """Download the small exposure proxies already built by the CUDA solve."""
+
+        if self.exposure_proxies is None:
+            return ()
+        self.compute_stream.synchronize()
+        self._synchronizations += 1
+        proxies = self._cp.asnumpy(self.exposure_proxies)
+        self.record_download(int(proxies.nbytes))
+        return tuple(proxies[position] for position in range(proxies.shape[0]))
+
     def _refresh_peak_bytes(self) -> None:
         try:
             used_bytes = int(self._cp.get_default_memory_pool().used_bytes())
@@ -663,22 +675,12 @@ class CudaOutputJob:
         self.output_vertical_fov = output_vertical_fov
         self.band_rows = self._plan.output_band_rows or output_height
         self.is_banded = self._plan.output_band_rows is not None
-        self.local_exposure: Any = None
         self.color: Any = None
         self.coverage: Any = None
         self.converted: Any = None
         self.histogram: Any = None
         self.levels: Any = None
         try:
-            local_width = max(
-                1, (output_width + _LOCAL_EXPOSURE_SCALE - 1) // _LOCAL_EXPOSURE_SCALE
-            )
-            local_height = max(
-                1, (output_height + _LOCAL_EXPOSURE_SCALE - 1) // _LOCAL_EXPOSURE_SCALE
-            )
-            self.local_exposure = self._cp.zeros(
-                (local_height, local_width), dtype=self._cp.float32
-            )
             self.color = self._cp.empty((self.band_rows, output_width, 3), dtype=self._cp.float32)
             self.coverage = self._cp.empty((self.band_rows, output_width), dtype=self._cp.uint8)
             if needs_sdr_conversion:
@@ -696,46 +698,6 @@ class CudaOutputJob:
 
     def __exit__(self, exception_type: object, exception: object, traceback: object) -> None:
         self.close()
-
-    def build_local_exposure(
-        self,
-        *,
-        latitude_span: float,
-        horizontal_fov: float,
-        vertical_fov: float,
-        log_gains: Any,
-    ) -> None:
-        """Build the quarter-resolution local exposure in one all-frame kernel."""
-
-        if self._closed:
-            raise RuntimeError("CUDA output job is closed")
-        self._session.log_gains = self._cp.asarray(log_gains, dtype=self._cp.float32)
-        field_height, field_width = self.local_exposure.shape
-        block = (16, 16)
-        grid = ((int(field_width) + 15) // 16, (int(field_height) + 15) // 16)
-        with self._session.compute_stream:
-            self._session.module["build_local_exposure"](
-                grid,
-                block,
-                (
-                    self.local_exposure,
-                    self._cp.int32(field_width),
-                    self._cp.int32(field_height),
-                    self._cp.int32(self.output_width),
-                    self._cp.int32(self.output_height),
-                    self._cp.float32(latitude_span),
-                    self._session.rotations,
-                    self._session.log_gains,
-                    self._cp.int32(self._session.sources.shape[0]),
-                    self._cp.int32(self._session.sources.shape[2]),
-                    self._cp.int32(self._session.sources.shape[1]),
-                    self._cp.float32(horizontal_fov),
-                    self._cp.float32(vertical_fov),
-                    self._cp.int32(self.rectilinear_output),
-                    self._cp.float32(self.output_vertical_fov),
-                ),
-            )
-        self._session.record_kernel_launch()
 
     def build_auto_contrast_histogram(
         self,
@@ -886,7 +848,6 @@ class CudaOutputJob:
         if transfer_code is None:
             raise ValueError(f"unsupported CUDA transfer function: {transfer_function}")
         source_code = {"uint8": 0, "uint16": 1, "float32": 2}[self._session.sample_type]
-        field_height, field_width = self.local_exposure.shape
         block = (16, 16)
         grid = ((self.output_width + 15) // 16, (rows + 15) // 16)
         with self._session.compute_stream:
@@ -899,9 +860,6 @@ class CudaOutputJob:
                     self._cp.int32(transfer_code),
                     self._session.rotations,
                     self._session.log_gains,
-                    self.local_exposure,
-                    self._cp.int32(field_width),
-                    self._cp.int32(field_height),
                     self.color,
                     self.coverage,
                     self._cp.int32(self._session.sources.shape[2]),
@@ -926,12 +884,169 @@ class CudaOutputJob:
         if self._closed:
             return
         self._closed = True
-        self.local_exposure = None
         self.color = None
         self.coverage = None
         self.converted = None
         self.histogram = None
         self.levels = None
+
+
+def cuda_preview_display_bytes(
+    *,
+    frame_count: int,
+    preview_width: int,
+    preview_height: int,
+    viewport_width: int,
+    viewport_height: int,
+) -> int:
+    """Return retained and construction-time VRAM for the interactive preview."""
+
+    if min(frame_count, preview_width, preview_height, viewport_width, viewport_height) < 1:
+        raise ValueError("CUDA preview display dimensions must be positive")
+    preview_pixels = preview_width * preview_height
+    viewport_pixels = viewport_width * viewport_height
+    return preview_pixels * (3 + frame_count) + viewport_pixels * (6 + frame_count) + frame_count
+
+
+class CudaPreviewDisplay:
+    """Retained full-preview buffers used for interactive crop and overlay display."""
+
+    def __init__(
+        self,
+        session: CudaSession,
+        preview: np.ndarray[Any, Any],
+        overview: np.ndarray[Any, Any],
+        masks: tuple[np.ndarray[Any, Any], ...],
+    ) -> None:
+        if preview.ndim != 3 or preview.shape[2] != 3 or preview.dtype != np.uint8:
+            raise ValueError("CUDA preview display requires an RGB8 preview")
+        if overview.ndim != 3 or overview.shape[2] != 3 or overview.dtype != np.uint8:
+            raise ValueError("CUDA preview display requires an RGB8 overview")
+        if not masks or any(mask.shape != masks[0].shape for mask in masks):
+            raise ValueError("CUDA preview display masks must have one shared shape")
+        self._session = session
+        self._cp = session._cp
+        self._lock = Lock()
+        self._closed = False
+        self.preview_width = int(preview.shape[1])
+        self.preview_height = int(preview.shape[0])
+        self.output_width = int(overview.shape[1])
+        self.output_height = int(overview.shape[0])
+        self.frame_count = len(masks)
+        self.preview: Any = None
+        self.overview: Any = None
+        self.masks: Any = None
+        self.hovered: Any = None
+        self.output: Any = None
+        try:
+            compact = np.stack(masks).astype(np.uint8, copy=False)
+            compact_device = self._cp.asarray(compact)
+            self.preview = self._cp.asarray(np.ascontiguousarray(preview))
+            self.overview = self._cp.asarray(np.ascontiguousarray(overview))
+            self.masks = self._cp.empty(
+                (self.frame_count, self.preview_height, self.preview_width),
+                dtype=self._cp.uint8,
+            )
+            self.hovered = self._cp.empty(self.frame_count, dtype=self._cp.uint8)
+            self.output = self._cp.empty(
+                (self.output_height, self.output_width, 3), dtype=self._cp.uint8
+            )
+            pixels = self.frame_count * self.preview_width * self.preview_height
+            with session.compute_stream:
+                session.module["expand_preview_masks"](
+                    ((pixels + 255) // 256,),
+                    (256,),
+                    (
+                        compact_device,
+                        self.masks,
+                        self._cp.int32(self.frame_count),
+                        self._cp.int32(compact.shape[2]),
+                        self._cp.int32(compact.shape[1]),
+                        self._cp.int32(self.preview_width),
+                        self._cp.int32(self.preview_height),
+                    ),
+                )
+            session.record_kernel_launch()
+            session.compute_stream.synchronize()
+            session._synchronizations += 1
+            session._refresh_peak_bytes()
+        except Exception as exc:
+            self.close()
+            raise GpuUnavailableError(f"CUDA preview display allocation failed: {exc}") from exc
+
+    def render(
+        self,
+        crop_box: tuple[int, int, int, int] | None,
+        hovered_poses: frozenset[int],
+        target_pose: int | None,
+        target_mode: bool,
+        overlay: bool,
+    ) -> np.ndarray[Any, Any]:
+        """Compose and download one viewport-sized RGB8 display image."""
+
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("CUDA preview display is closed")
+            crop = crop_box or (0, 0, self.preview_width, self.preview_height)
+            left, top, right, bottom = crop
+            if crop_box is not None and (
+                left < 0
+                or top < 0
+                or right - left != self.output_width
+                or bottom - top != self.output_height
+                or right > self.preview_width
+                or bottom > self.preview_height
+            ):
+                raise ValueError("CUDA preview crop does not match the display viewport")
+            hovered = np.zeros(self.frame_count, dtype=np.uint8)
+            for position in hovered_poses:
+                if 0 <= position < self.frame_count:
+                    hovered[position] = 1
+            self.hovered.set(hovered, stream=self._session.compute_stream)
+            rendered_frame_count = self.frame_count if overlay or bool(hovered_poses) else 0
+            pixels = self.output_width * self.output_height
+            with self._session.compute_stream:
+                self._session.module["compose_preview_display"](
+                    ((pixels + 255) // 256,),
+                    (256,),
+                    (
+                        self.preview,
+                        self.overview,
+                        self.masks,
+                        self.hovered,
+                        self.output,
+                        self._cp.int32(self.preview_width),
+                        self._cp.int32(self.preview_height),
+                        self._cp.int32(self.output_width),
+                        self._cp.int32(self.output_height),
+                        self._cp.int32(self.output_width),
+                        self._cp.int32(self.output_height),
+                        self._cp.int32(left),
+                        self._cp.int32(top),
+                        self._cp.int32(rendered_frame_count),
+                        self._cp.int32(target_pose if target_pose is not None else -1),
+                        self._cp.int32(target_mode),
+                        self._cp.int32(overlay),
+                        self._cp.int32(crop_box is None),
+                    ),
+                )
+            self._session.record_kernel_launch()
+            self._session.compute_stream.synchronize()
+            self._session._synchronizations += 1
+            result = self._cp.asnumpy(self.output)
+            self._session.record_download(int(result.nbytes))
+            return np.asarray(result, dtype=np.uint8)
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            self.preview = None
+            self.overview = None
+            self.masks = None
+            self.hovered = None
+            self.output = None
 
 
 def cuda_device_info() -> GpuDeviceInfo:
@@ -992,6 +1107,7 @@ def cuda_memory_plan(
     free_bytes: int,
     total_bytes: int,
     gpu_budget_bytes: int | None = None,
+    preview_cache_bytes: int = 0,
 ) -> CudaMemoryPlan | None:
     """Choose a full-frame or row-banded CUDA allocation plan before upload.
 
@@ -1006,21 +1122,14 @@ def cuda_memory_plan(
         raise ValueError("GPU memory values are invalid")
     if gpu_budget_bytes is not None and gpu_budget_bytes < 1:
         raise ValueError("GPU memory budget must be positive")
+    if preview_cache_bytes < 0:
+        raise ValueError("CUDA preview cache size cannot be negative")
 
     reserve_bytes = max(GPU_RESERVE_BYTES, int(total_bytes * GPU_RESERVE_FRACTION))
     available_bytes = max(0, min(free_bytes, gpu_budget_bytes or free_bytes) - reserve_bytes)
     source_bytes = native_source_bytes(frame_count, source_width, source_height, sample_type)
-    proxy_width = min(256, source_width)
-    proxy_height = max(1, round(source_height * proxy_width / source_width))
-    proxy_bytes = frame_count * proxy_width * proxy_height * 3 * 4
-    exposure_sample_bytes = frame_count * 256 * 128 * (4 + 4 + 1 + 1)
     rotation_bytes = frame_count * 9 * 4
-    session_workspace_bytes = (
-        proxy_bytes + exposure_sample_bytes + rotation_bytes + _HISTOGRAM_BYTES
-    )
-    local_width = max(1, (output_width + _LOCAL_EXPOSURE_SCALE - 1) // _LOCAL_EXPOSURE_SCALE)
-    local_height = max(1, (output_height + _LOCAL_EXPOSURE_SCALE - 1) // _LOCAL_EXPOSURE_SCALE)
-    local_exposure_bytes = local_width * local_height * 4
+    session_workspace_bytes = rotation_bytes
     host_output_bytes = output_width * output_height * 3 * output_sample_bytes
 
     def output_workspace(rows: int) -> int:
@@ -1029,16 +1138,12 @@ def cuda_memory_plan(
         converted_bytes = (
             rows * output_width * 3 * output_sample_bytes if needs_sdr_conversion else 0
         )
-        return (
-            local_exposure_bytes
-            + linear_bytes
-            + coverage_bytes
-            + converted_bytes
-            + _HISTOGRAM_BYTES
-        )
+        return linear_bytes + coverage_bytes + converted_bytes + _HISTOGRAM_BYTES
 
     resident_workspace = output_workspace(output_height)
-    resident_required = source_bytes + session_workspace_bytes + resident_workspace
+    resident_required = (
+        source_bytes + session_workspace_bytes + max(resident_workspace, preview_cache_bytes)
+    )
     if resident_required <= available_bytes:
         return CudaMemoryPlan(
             source_bytes,
@@ -1049,9 +1154,12 @@ def cuda_memory_plan(
             None,
             resident_required,
             available_bytes,
+            preview_cache_bytes,
         )
 
-    fixed_bytes = source_bytes + session_workspace_bytes + local_exposure_bytes + _HISTOGRAM_BYTES
+    fixed_bytes = source_bytes + session_workspace_bytes + _HISTOGRAM_BYTES
+    if source_bytes + session_workspace_bytes + preview_cache_bytes > available_bytes:
+        return None
     bytes_per_row = output_width * (
         3 * 4 + 1 + (3 * output_sample_bytes if needs_sdr_conversion else 0)
     )
@@ -1060,7 +1168,7 @@ def cuda_memory_plan(
         return None
     band_rows = max(_MINIMUM_BAND_ROWS, (maximum_rows // _MINIMUM_BAND_ROWS) * _MINIMUM_BAND_ROWS)
     workspace = output_workspace(band_rows)
-    required_bytes = source_bytes + session_workspace_bytes + workspace
+    required_bytes = source_bytes + session_workspace_bytes + max(workspace, preview_cache_bytes)
     return CudaMemoryPlan(
         source_bytes,
         session_workspace_bytes,
@@ -1070,6 +1178,7 @@ def cuda_memory_plan(
         band_rows,
         required_bytes,
         available_bytes,
+        preview_cache_bytes,
     )
 
 
@@ -1084,6 +1193,7 @@ def select_cuda_backend(
     output_sample_bytes: int,
     needs_sdr_conversion: bool,
     gpu_budget_bytes: int | None = None,
+    preview_cache_bytes: int = 0,
     strict: bool = False,
 ) -> tuple[BackendSelection, CudaMemoryPlan | None]:
     """Select CUDA before image decode, returning CPU only for pre-kernel failures."""
@@ -1102,6 +1212,7 @@ def select_cuda_backend(
             free_bytes=device.free_bytes,
             total_bytes=device.total_bytes,
             gpu_budget_bytes=gpu_budget_bytes,
+            preview_cache_bytes=preview_cache_bytes,
         )
     except (GpuUnavailableError, ValueError) as error:
         if strict:

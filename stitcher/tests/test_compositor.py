@@ -1,6 +1,7 @@
 import logging
 import math
 from pathlib import Path
+from threading import Event
 from types import SimpleNamespace
 
 import cv2
@@ -15,13 +16,11 @@ from pano_stitch.compositor import (
     CudaSessionCache,
     CudaSessionCacheKey,
     ExposureReport,
+    RenderCancelledError,
     SourceInfo,
     _auto_contrast_levels,
     _choose_strip_height,
-    _estimate_exposure_gains,
     _exposure_clipped,
-    _local_exposure_multiplier,
-    _local_exposure_rows,
     _output_dimensions,
     _pq_to_linear,
     _probe_source,
@@ -31,6 +30,7 @@ from pano_stitch.compositor import (
     _write_exr,
     cuda_session_cache_key,
     estimate_render_resources,
+    estimate_target_exposure_gain,
     prepare_cuda_session,
     render_preview,
     render_session,
@@ -197,6 +197,19 @@ def test_full_sphere_render_has_coverage_and_expected_directions(tmp_path: Path)
     assert np.all(exr_result > 0.0)
 
 
+def test_image_validation_honors_cancellation(tmp_path: Path) -> None:
+    frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
+    session = SessionMetadata(
+        1, "cancel-validation", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (frame,), True
+    )
+    Image.new("RGB", (8, 8)).save(tmp_path / frame.filename)
+    cancelled = Event()
+    cancelled.set()
+
+    with pytest.raises(RenderCancelledError, match="render cancelled"):
+        validate_images(session, tmp_path, cancel_event=cancelled)
+
+
 def test_render_preview_returns_sdr_pixels_and_exposure_report(tmp_path: Path) -> None:
     frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
     session = SessionMetadata(
@@ -205,13 +218,55 @@ def test_render_preview_returns_sdr_pixels_and_exposure_report(tmp_path: Path) -
     Image.new("RGB", (32, 16), (128, 64, 32)).save(tmp_path / frame.filename)
 
     result = render_preview(
-        session, tmp_path, 24, ".exr", allow_incomplete=True, auto_contrast=True
+        session,
+        tmp_path,
+        24,
+        ".exr",
+        allow_incomplete=True,
+        auto_contrast=True,
+        use_gpu=False,
+        cuda_width_multiplier=4,
     )
 
     assert result.pixels.shape == (4, 24, 3)
     assert result.pixels.dtype == np.uint8
     assert result.exposure_report.gains == (1.0,)
     assert not any(tmp_path.glob("pano-preview-*"))
+
+
+def test_render_preview_applies_width_multiplier_only_to_selected_cuda(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
+    session = SessionMetadata(
+        1, "cuda-preview-size", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (frame,), True
+    )
+    Image.new("RGB", (32, 16), (128, 64, 32)).save(tmp_path / frame.filename)
+    plan = CudaMemoryPlan(1, 1, 1, 1, 1, None, 1, 1)
+    dimensions: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(
+        compositor,
+        "select_cuda_backend",
+        lambda **_kwargs: (BackendSelection("cuda", "test", "resident", 1, 1, "test"), plan),
+    )
+    monkeypatch.setattr(compositor, "compile_cuda_module", lambda: None)
+
+    def render_cuda(*args: object, **_kwargs: object) -> compositor.PreviewResult:
+        width, height = int(args[4]), int(args[5])
+        dimensions.append((width, height))
+        return compositor.PreviewResult(
+            np.zeros((height, width, 3), dtype=np.uint8), ExposureReport(0, 0, (1.0,))
+        )
+
+    monkeypatch.setattr(compositor, "_render_cuda", render_cuda)
+
+    result = render_preview(
+        session, tmp_path, 24, ".png", allow_incomplete=True, cuda_width_multiplier=4
+    )
+
+    assert dimensions == [(96, 16)]
+    assert result.pixels.shape == (16, 96, 3)
 
 
 def test_render_session_reports_selected_cpu_backend(
@@ -408,7 +463,7 @@ def test_cuda_session_cache_closes_replaced_and_invalidated_sessions_once() -> N
     assert second.close_calls == 1
 
 
-def test_cached_exposure_reports_completed_progress_before_mapping(tmp_path: Path) -> None:
+def test_render_progress_starts_with_compositing(tmp_path: Path) -> None:
     frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
     session = SessionMetadata(
         1, "cached-progress", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (frame,), True
@@ -430,7 +485,7 @@ def test_cached_exposure_reports_completed_progress_before_mapping(tmp_path: Pat
         ),
     )
 
-    assert progress[0] == (1, 1, "[1/5] exposure (cached)")
+    assert progress[0][2] == "[1/3] compositing"
 
 
 def test_prepare_cuda_session_reports_each_source_upload(
@@ -457,12 +512,6 @@ def test_prepare_cuda_session_reports_each_source_upload(
 
         def finish_uploads(self) -> None:
             pass
-
-        def solve_exposure_gains(self, **_kwargs: object) -> object:
-            return object()
-
-        def download_exposure_report(self, _exposure: object) -> tuple[int, int, np.ndarray]:
-            return 0, 0, self.log_gains
 
         def close(self) -> None:
             pass
@@ -534,85 +583,38 @@ def test_hdr_sdr_conversion_preserves_saturated_highlight_chroma() -> None:
     assert saturation(converted[0, 0]) > saturation(old_converted[0, 0])
 
 
-def test_exposure_solver_recovers_relative_sdr_gain(tmp_path: Path) -> None:
+def test_target_exposure_gain_uses_overlapping_selected_pose(tmp_path: Path) -> None:
     frames = (
         FrameMetadata(0, "bright.png", 0.0, 0.0, 0.0, "captured"),
         FrameMetadata(1, "dim.png", 30.0, 0.0, 0.0, "captured"),
     )
     session = SessionMetadata(
-        schema_version=1,
-        session_id="exposure",
-        capture_mode=CaptureMode.FULL_SPHERE,
-        horizontal_fov_deg=120.0,
-        vertical_fov_deg=90.0,
-        overlap_fraction=0.08,
-        frames=frames,
-        completed=True,
+        1, "target-exposure", CaptureMode.FULL_SPHERE, 120.0, 90.0, 0.08, frames, True
     )
     Image.new("RGB", (64, 64), (160, 160, 160)).save(tmp_path / "bright.png")
     Image.new("RGB", (64, 64), (80, 80, 80)).save(tmp_path / "dim.png")
 
-    report = _estimate_exposure_gains(session, tmp_path, SourceInfo(64, 64, ImageEncoding()))
-
-    assert report.edge_count == 1
-    assert report.gains[1] / report.gains[0] == pytest.approx(4.0, rel=0.03)
-
-
-def test_exposure_solver_keeps_black_overlaps_renderable(tmp_path: Path) -> None:
-    frames = (
-        FrameMetadata(0, "first.png", 0.0, 0.0, 0.0, "captured"),
-        FrameMetadata(1, "second.png", 30.0, 0.0, 0.0, "captured"),
+    progress: list[tuple[int, int, str]] = []
+    gain = estimate_target_exposure_gain(
+        session, tmp_path, 0, (1,), progress_callback=lambda *update: progress.append(update)
     )
-    session = SessionMetadata(
-        schema_version=1,
-        session_id="black-exposure",
-        capture_mode=CaptureMode.FULL_SPHERE,
-        horizontal_fov_deg=120.0,
-        vertical_fov_deg=90.0,
-        overlap_fraction=0.08,
-        frames=frames,
-        completed=True,
-    )
-    Image.new("RGB", (64, 64), (0, 0, 0)).save(tmp_path / "first.png")
-    Image.new("RGB", (64, 64), (0, 0, 0)).save(tmp_path / "second.png")
+    repeated_gain = estimate_target_exposure_gain(session, tmp_path, 0, (1,), (1.0, gain))
 
-    report = _estimate_exposure_gains(session, tmp_path, SourceInfo(64, 64, ImageEncoding()))
+    assert gain == pytest.approx(4.38, rel=0.03)
+    assert repeated_gain == pytest.approx(1.0, rel=0.03)
+    assert (2, 2, "sampling poses") in progress
+    assert progress[-1] == (1, 1, "comparing overlaps")
 
-    assert report.edge_count == 1
-    assert report.gains == pytest.approx((1.0, 1.0))
-
-
-def test_local_exposure_compensation_preserves_single_source_regions() -> None:
-    log_gains = (0.0, math.log(4.0))
-    single_left = np.asarray([[log_gains[0]]], dtype=np.float32)
-    single_right = np.asarray([[log_gains[1]]], dtype=np.float32)
-    assert _local_exposure_multiplier(log_gains[0], single_left)[0, 0] == pytest.approx(1.0)
-    assert _local_exposure_multiplier(log_gains[1], single_right)[0, 0] == pytest.approx(1.0)
-
-    overlap = np.asarray([[math.log(2.0)]], dtype=np.float32)
-    left = _local_exposure_multiplier(log_gains[0], overlap)[0, 0]
-    right = _local_exposure_multiplier(log_gains[1], overlap)[0, 0]
-    assert right / left == pytest.approx(4.0)
-    shifted = overlap + np.float32(7.0)
-    assert _local_exposure_multiplier(log_gains[0] + 7.0, shifted) == pytest.approx(
-        _local_exposure_multiplier(log_gains[0], overlap)
-    )
+    cancelled = Event()
+    cancelled.set()
+    with pytest.raises(RenderCancelledError, match="render cancelled"):
+        estimate_target_exposure_gain(session, tmp_path, 0, (1,), cancel_event=cancelled)
 
 
 def test_linear_hdr_highlights_are_not_treated_as_clipped() -> None:
     image = np.full((2, 2, 3), 4.0, dtype=np.float32)
     assert not np.any(_exposure_clipped(image, ImageEncoding("float32", "rec2020", "linear")))
     assert np.all(_exposure_clipped(image, ImageEncoding("uint16", "rec2020", "pq")))
-
-
-def test_local_exposure_rows_use_exact_non_divisible_output_ratio() -> None:
-    field = np.arange(155 * 309, dtype=np.float32).reshape((155, 309))
-    output_width = 1234
-    output_height = 617
-    expanded = cv2.resize(field, (output_width, output_height), interpolation=cv2.INTER_LINEAR)
-    bottom = _local_exposure_rows(field, 600, 17, output_width, output_height)
-
-    assert np.allclose(bottom, expanded[600:617], atol=1e-4)
 
 
 def test_auto_contrast_uses_shared_sdr_levels() -> None:
@@ -731,7 +733,7 @@ def test_render_resource_estimate_uses_color_and_weight_scratch(tmp_path: Path) 
     resources = estimate_render_resources(session, tmp_path, width=64)
 
     assert resources.output_height == 32
-    assert resources.scratch_bytes == (64 * 32 * 4 + 16 * 8) * np.dtype(np.float32).itemsize
+    assert resources.scratch_bytes == 64 * 32 * 4 * np.dtype(np.float32).itemsize
 
 
 def test_full_sphere_output_dimensions_are_always_two_to_one() -> None:

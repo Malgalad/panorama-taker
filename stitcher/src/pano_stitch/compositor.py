@@ -13,7 +13,7 @@ import zlib
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from importlib import import_module
 from pathlib import Path
 from threading import Event
@@ -29,11 +29,13 @@ from pano_stitch.gpu import (
     CudaMemoryPlan,
     CudaOutputJob,
     CudaPreflightError,
+    CudaPreviewDisplay,
     CudaRenderDiagnostics,
     CudaSession,
     GpuUnavailableError,
     compile_cuda_module,
     cuda_device_info,
+    cuda_preview_display_bytes,
     select_cuda_backend,
 )
 from pano_stitch.metadata import FrameMetadata, ImageEncoding, SessionMetadata
@@ -52,7 +54,6 @@ MAX_MEMORY_BUDGET_BYTES = 8192 * 1024 * 1024
 _RESERVED_RUNTIME_BYTES = 192 * 1024 * 1024
 _TILE_BYTES_PER_PIXEL = 164
 _MAX_AUTO_WORKERS = 8
-_EXPOSURE_FIELD_SCALE = 4
 _AUTO_CONTRAST_BINS = 4096
 _AUTO_CONTRAST_CLIP = 0.005
 
@@ -79,11 +80,12 @@ class RenderResources:
 
 @dataclass(frozen=True)
 class ExposureReport:
-    """Summary of the automatic linear-light exposure solve."""
+    """Cached data available to explicit manual exposure matching."""
 
     anchor_frame: int
     edge_count: int
     gains: tuple[float, ...]
+    match_proxies: tuple[FloatImage, ...] = field(default=(), compare=False, repr=False)
 
     @property
     def log_gains(self) -> tuple[float, ...]:
@@ -92,20 +94,30 @@ class ExposureReport:
 
 @dataclass(frozen=True)
 class PreviewResult:
-    """Displayable SDR preview pixels and the exposure solve used to create them."""
+    """Displayable SDR preview pixels and manual exposure-match data."""
 
     pixels: NDArray[np.uint8]
     exposure_report: ExposureReport
 
 
+def _validated_manual_gains(
+    manual_gains: tuple[float, ...] | None, frame_count: int
+) -> tuple[float, ...]:
+    gains = manual_gains or (1.0,) * frame_count
+    if len(gains) != frame_count:
+        raise ValueError("manual exposure gains do not match the renderable session")
+    if any(not np.isfinite(gain) or gain <= 0.0 for gain in gains):
+        raise ValueError("manual exposure gains must be finite and positive")
+    return gains
+
+
 @dataclass
 class PreparedCudaSession:
-    """Reusable resident CUDA inputs and their one-time exposure solve."""
+    """Reusable resident CUDA inputs."""
 
     cuda_session: CudaSession
     exposure_report: ExposureReport
     upload_seconds: float
-    exposure_seconds: float
 
     def close(self) -> None:
         self.cuda_session.close()
@@ -191,6 +203,18 @@ class CudaSessionCache:
             LOGGER.info("CUDA session cache cleanup: %s", reason)
             prepared.close()
 
+    def create_preview_display(
+        self,
+        preview: NDArray[np.uint8],
+        overview: NDArray[np.uint8],
+        masks: tuple[NDArray[np.bool_], ...],
+    ) -> CudaPreviewDisplay | None:
+        """Create a retained display compositor only for a resident CUDA session."""
+
+        if self._prepared is None:
+            return None
+        return CudaPreviewDisplay(self._prepared.cuda_session, preview, overview, masks)
+
     def close(self) -> None:
         self.invalidate("shutdown")
 
@@ -245,135 +269,127 @@ def _exposure_proxy(source: FloatImage, maximum_width: int = 256) -> FloatImage:
     )
 
 
-def _estimate_exposure_gains(
+def estimate_target_exposure_gain(
     session: SessionMetadata,
     image_root: Path,
-    source_info: SourceInfo,
+    target_position: int,
+    selected_positions: tuple[int, ...],
+    manual_gains: tuple[float, ...] | None = None,
     cancel_event: Event | None = None,
-    progress_callback: Callable[[int], None] | None = None,
-) -> ExposureReport:
-    """Solve robust per-frame gains from low-resolution geometric overlaps."""
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    match_proxies: tuple[FloatImage, ...] = (),
+) -> float:
+    """Estimate one shared gain for selected frames that overlap a target frame."""
 
-    frame_count = len(session.frames)
-    if frame_count <= 1:
-        return ExposureReport(0, 0, (1.0,) * frame_count)
-
-    sample_width = 256
-    sample_height = 128
+    if target_position in selected_positions:
+        raise ValueError("target pose cannot also be selected for exposure correction")
+    if not 0 <= target_position < len(session.frames):
+        raise ValueError("target pose is outside the session")
+    if any(position < 0 or position >= len(session.frames) for position in selected_positions):
+        raise ValueError("selected pose is outside the session")
+    manual_gains = _validated_manual_gains(manual_gains, len(session.frames))
+    if match_proxies and len(match_proxies) != len(session.frames):
+        raise ValueError("exposure match proxies do not match the renderable session")
+    source_info = _source_info_for_session(session, image_root)
     latitude_span = (
         180.0 if session.capture_mode.value == "full_sphere" else session.vertical_fov_deg
     )
-    directions = equirectangular_directions(sample_width, sample_height, latitude_span)
-    coverage_masks: list[NDArray[np.bool_]] = []
-    valid_masks: list[NDArray[np.bool_]] = []
-    luminances: list[FloatImage] = []
-    for position, frame in enumerate(session.frames):
+    directions = equirectangular_directions(256, 128, latitude_span)
+    sampling_total = len(selected_positions) + 1
+    sampling_completed = 0
+
+    def samples(position: int) -> tuple[FloatImage, NDArray[np.bool_]]:
+        nonlocal sampling_completed
         if cancel_event is not None and cancel_event.is_set():
             raise RenderCancelledError("render cancelled")
-        source = _read_source(_image_path(image_root, frame.filename), source_info.encoding)
-        try:
-            proxy = _exposure_proxy(source)
-            map_x, map_y, valid, _ = camera_maps(
-                directions,
-                frame,
-                proxy.shape[1],
-                proxy.shape[0],
-                session.horizontal_fov_deg,
-                session.vertical_fov_deg,
+        if match_proxies:
+            proxy = match_proxies[position]
+        else:
+            source = _read_source(
+                _image_path(image_root, session.frames[position].filename), source_info.encoding
             )
-            sampled = remap_source(proxy, map_x, map_y)
-        finally:
-            del source
-        luminance = _exposure_luminance(sampled)
-        finite = np.isfinite(luminance) & (luminance > np.float32(1e-5))
-        clipped = _exposure_clipped(sampled, source_info.encoding)
-        log_luminance = np.log(np.maximum(luminance, np.float32(1e-5)))
-        gradient_x = cv2.Sobel(log_luminance, cv2.CV_32F, 1, 0, ksize=3)
-        gradient_y = cv2.Sobel(log_luminance, cv2.CV_32F, 0, 1, ksize=3)
-        gradient = np.hypot(gradient_x, gradient_y)
-        gradient_limit = float(np.quantile(gradient[np.isfinite(gradient)], 0.9))
-        luminances.append(luminance)
-        coverage_masks.append(valid)
-        valid_masks.append(valid & finite & ~clipped & (gradient <= gradient_limit))
-        if progress_callback is not None:
-            progress_callback(position + 1)
-
-    equations: list[tuple[int, int, float, float]] = []
-    adjacency: list[set[int]] = [set() for _ in session.frames]
-    geometric_overlaps: list[tuple[int, int]] = []
-    for left in range(frame_count):
-        for right in range(left + 1, frame_count):
-            if int(np.count_nonzero(coverage_masks[left] & coverage_masks[right])) >= 24:
-                geometric_overlaps.append((left, right))
-            mask = valid_masks[left] & valid_masks[right]
-            if int(np.count_nonzero(mask)) < 24:
-                continue
-            left_values = luminances[left][mask]
-            right_values = luminances[right][mask]
-            log_ratios = np.log(left_values) - np.log(right_values)
-            finite_ratios = log_ratios[np.isfinite(log_ratios)]
-            if finite_ratios.size < 24:
-                continue
-            low, high = np.quantile(finite_ratios, (0.1, 0.9))
-            inliers = finite_ratios[(finite_ratios >= low) & (finite_ratios <= high)]
-            if inliers.size < 12:
-                continue
-            median = float(np.median(inliers))
-            mad = float(np.median(np.abs(inliers - median)))
-            if mad > 0.5:
-                continue
-            equations.append((left, right, median, float(np.sqrt(inliers.size) / (1.0 + mad))))
-            adjacency[left].add(right)
-            adjacency[right].add(left)
-
-    # A dark or clipped overlap cannot estimate a relative gain, but it must not
-    # make an otherwise valid capture unrenderable. Link such components with a
-    # neutral constraint so their unmeasurable relationship remains unchanged.
-    def reachable() -> set[int]:
-        seen = {0}
-        pending = [0]
-        while pending:
-            current = pending.pop()
-            for neighbor in adjacency[current]:
-                if neighbor not in seen:
-                    seen.add(neighbor)
-                    pending.append(neighbor)
-        return seen
-
-    connected = reachable()
-    while True:
-        bridge = next(
-            (
-                (left, right)
-                for left, right in geometric_overlaps
-                if (left in connected) != (right in connected)
-            ),
-            None,
+            try:
+                proxy = _exposure_proxy(source)
+            finally:
+                del source
+        map_x, map_y, valid, _ = camera_maps(
+            directions,
+            session.frames[position],
+            proxy.shape[1],
+            proxy.shape[0],
+            session.horizontal_fov_deg,
+            session.vertical_fov_deg,
         )
-        if bridge is None:
-            break
-        left, right = bridge
-        equations.append((left, right, 0.0, 1.0))
-        adjacency[left].add(right)
-        adjacency[right].add(left)
-        connected = reachable()
+        sampled = remap_source(proxy, map_x, map_y)
+        luminance = _exposure_luminance(sampled)
+        luminance *= np.float32(manual_gains[position])
+        usable = (
+            valid
+            & np.isfinite(luminance)
+            & (luminance > np.float32(1e-5))
+            & ~_exposure_clipped(sampled, source_info.encoding)
+        )
+        sampling_completed += 1
+        if progress_callback is not None:
+            progress_callback(sampling_completed, sampling_total, "sampling poses")
+        return luminance, usable
 
-    matrix = np.zeros((len(equations) + 1, frame_count), dtype=np.float64)
-    values = np.zeros(len(equations) + 1, dtype=np.float64)
-    for row, (left, right, ratio, weight) in enumerate(equations):
-        matrix[row, left] = -weight
-        matrix[row, right] = weight
-        values[row] = ratio * weight
-    matrix[-1, 0] = 1.0
-    solution, *_ = np.linalg.lstsq(matrix, values, rcond=None)
-    solution -= np.median(solution)
-    limit = np.log(2.0)
-    gains = np.exp(np.clip(solution, -limit, limit)).astype(np.float32)
-    return ExposureReport(
-        anchor_frame=int(np.argmin(np.abs(solution - np.median(solution)))),
-        edge_count=len(equations),
-        gains=tuple(float(gain) for gain in gains),
+    target_luminance, target_valid = samples(target_position)
+    selected_samples = [samples(position) for position in selected_positions]
+    shifts: list[float] = []
+    for compared, (selected_luminance, selected_valid) in enumerate(selected_samples, start=1):
+        if cancel_event is not None and cancel_event.is_set():
+            raise RenderCancelledError("render cancelled")
+        if progress_callback is not None:
+            progress_callback(compared, len(selected_positions), "comparing overlaps")
+        overlap = target_valid & selected_valid
+        if int(np.count_nonzero(overlap)) < 24:
+            continue
+        ratios = np.log(target_luminance[overlap]) - np.log(selected_luminance[overlap])
+        ratios = ratios[np.isfinite(ratios)]
+        if ratios.size < 24:
+            continue
+        low, high = np.quantile(ratios, (0.1, 0.9))
+        inliers = ratios[(ratios >= low) & (ratios <= high)]
+        if inliers.size >= 12:
+            shifts.append(float(np.median(inliers)))
+    if not shifts:
+        raise ValueError("target pose must overlap at least one selected pose")
+    return float(np.exp(np.median(shifts)))
+
+
+def frame_coverage_masks(
+    session: SessionMetadata,
+    image_root: Path,
+    width: int,
+    height: int,
+    cancel_event: Event | None = None,
+) -> tuple[NDArray[np.bool_], ...]:
+    """Return equirectangular geometric coverage for each renderable frame."""
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise RenderCancelledError("render cancelled")
+    source = _source_info_for_session(session, image_root)
+    latitude_span = (
+        180.0 if session.capture_mode.value == "full_sphere" else session.vertical_fov_deg
     )
+    directions = equirectangular_directions(width, height, latitude_span)
+    masks = []
+    for frame in session.frames:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RenderCancelledError("render cancelled")
+        _, _, valid, _ = camera_maps(
+            directions,
+            frame,
+            source.width,
+            source.height,
+            session.horizontal_fov_deg,
+            session.vertical_fov_deg,
+        )
+        masks.append(valid)
+    if cancel_event is not None and cancel_event.is_set():
+        raise RenderCancelledError("render cancelled")
+    return tuple(masks)
 
 
 def _png_chunks(path: Path) -> dict[bytes, bytes]:
@@ -850,8 +866,6 @@ def _composite_strip(
     strip_height: int,
     blend: str,
     cancel_event: Event | None,
-    local_exposure: FloatImage | None = None,
-    log_gain: float = 0.0,
 ) -> None:
     """Composite one row-disjoint strip in disk-backed shared array views."""
 
@@ -872,12 +886,6 @@ def _composite_strip(
     color = color_scratch[row_start : row_start + rows]
     weight = weight_scratch[row_start : row_start + rows]
     sampled = remap_source(source, map_x, map_y)
-    if local_exposure is not None:
-        correction = _local_exposure_multiplier(
-            log_gain,
-            _local_exposure_rows(local_exposure, row_start, rows, output_width, output_height),
-        )
-        sampled *= correction[..., np.newaxis]
     if blend == "hard":
         candidate = np.where(valid, np.maximum(edge_distance, 1e-6), 0.0)
         selected = candidate > weight
@@ -894,42 +902,6 @@ def _exposure_weight(
 ) -> FloatImage:
     feather_width = max(1.0, min(source_info.width, source_info.height) * 0.08)
     return np.where(valid, np.maximum(edge_distance / feather_width, 1e-6), 0.0).astype(np.float32)
-
-
-def _local_exposure_multiplier(log_gain: float, local_exposure: FloatImage) -> FloatImage:
-    """Return overlap-only compensation; a constant exposure gauge cancels."""
-
-    return np.exp(np.float32(log_gain) - local_exposure).astype(np.float32)
-
-
-def _exposure_field_dimensions(output_width: int, output_height: int) -> tuple[int, int]:
-    return (
-        max(1, (output_width + _EXPOSURE_FIELD_SCALE - 1) // _EXPOSURE_FIELD_SCALE),
-        max(1, (output_height + _EXPOSURE_FIELD_SCALE - 1) // _EXPOSURE_FIELD_SCALE),
-    )
-
-
-def _local_exposure_rows(
-    field: FloatImage,
-    row_start: int,
-    rows: int,
-    output_width: int,
-    output_height: int,
-) -> FloatImage:
-    """Bilinearly expand a quarter-resolution field for one output strip."""
-
-    if field.shape == (output_height, output_width):
-        return field[row_start : row_start + rows]
-    field_height, field_width = field.shape
-    x = (np.arange(output_width, dtype=np.float32) + 0.5) * field_width / output_width - 0.5
-    y = (
-        np.arange(row_start, row_start + rows, dtype=np.float32) + 0.5
-    ) * field_height / output_height - 0.5
-    x = np.clip(x, 0.0, field_width - 1)
-    y = np.clip(y, 0.0, field_height - 1)
-    map_x, map_y = np.meshgrid(x, y)
-    sampled = remap_source(field[..., np.newaxis], map_x, map_y)
-    return sampled if sampled.ndim == 2 else sampled[..., 0]
 
 
 def _close_scratch_memmap(array: Any) -> None:
@@ -985,7 +957,7 @@ def _render_thumbnail(
     blend: str,
     jpeg_quality: int,
     cancel_event: Event | None,
-    log_gains: tuple[float, ...],
+    manual_gains: tuple[float, ...],
     allow_incomplete: bool,
     auto_contrast: bool,
     memory_budget_bytes: int,
@@ -1005,74 +977,14 @@ def _render_thumbnail(
         weights = np.memmap(
             Path(scratch) / "weights.f32", mode="w+", dtype=np.float32, shape=(height, width)
         )
-        exposure = np.memmap(
-            Path(scratch) / "exposure.f32", mode="w+", dtype=np.float32, shape=(height, width)
-        )
-        exposure_weights = np.memmap(
-            Path(scratch) / "exposure-weights.f32",
-            mode="w+",
-            dtype=np.float32,
-            shape=(height, width),
-        )
         color[:] = 0.0
         weights[:] = 0.0
-        exposure[:] = 0.0
-        exposure_weights[:] = 0.0
         temporary: Path | None = None
         try:
-            exposure_completed = 0
-            for frame_position, frame in enumerate(session.frames):
-
-                def map_thumbnail_exposure(row_start: int) -> None:
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise RenderCancelledError("render cancelled")
-                    rows = min(strip_height, height - row_start)
-                    directions = rectilinear_directions(
-                        width,
-                        rows,
-                        90.0,
-                        float(vertical_fov),
-                        row_offset=row_start,
-                        full_height=height,
-                    )
-                    _, _, valid, edge_distance = camera_maps(
-                        directions,
-                        frame,
-                        source.width,
-                        source.height,
-                        session.horizontal_fov_deg,
-                        session.vertical_fov_deg,
-                    )
-                    exposure_weight = _exposure_weight(valid, edge_distance, source)
-                    row_slice = slice(row_start, row_start + rows)
-                    exposure[row_slice] += exposure_weight * np.float32(log_gains[frame_position])
-                    exposure_weights[row_slice] += exposure_weight
-
-                with _limit_opencv_threads(worker_count):
-                    with ThreadPoolExecutor(max_workers=worker_count) as executor:
-                        futures = [
-                            executor.submit(map_thumbnail_exposure, row_start)
-                            for row_start in range(0, height, strip_height)
-                        ]
-                        for future in as_completed(futures):
-                            future.result()
-                            exposure_completed += 1
-                        if progress_callback is not None:
-                            progress_callback(
-                                exposure_completed,
-                                len(session.frames) * strip_count,
-                                "thumbnail exposure",
-                            )
-            for row_start in range(0, height, strip_height):
-                rows = min(strip_height, height - row_start)
-                row_slice = slice(row_start, row_start + rows)
-                covered_exposure = exposure_weights[row_slice] > 0.0
-                exposure_rows = exposure[row_slice]
-                exposure_rows[covered_exposure] /= exposure_weights[row_slice][covered_exposure]
-
             compositing_completed = 0
             for frame_position, frame in enumerate(session.frames):
                 decoded = _read_source(_image_path(image_root, frame.filename), source.encoding)
+                decoded *= np.float32(manual_gains[frame_position])
 
                 def composite_thumbnail_strip(row_start: int) -> None:
                     if cancel_event is not None and cancel_event.is_set():
@@ -1096,9 +1008,6 @@ def _render_thumbnail(
                         session.vertical_fov_deg,
                     )
                     sampled = remap_source(decoded, map_x, map_y)
-                    sampled *= np.exp(np.float32(log_gains[frame_position]) - exposure[row_slice])[
-                        ..., np.newaxis
-                    ]
                     candidate = (
                         np.where(valid, np.maximum(edge_distance, 1e-6), 0.0)
                         if blend == "hard"
@@ -1176,7 +1085,7 @@ def _render_thumbnail(
                 temporary.unlink(missing_ok=True)
             raise
         finally:
-            for mapping in (color, weights, exposure, exposure_weights):
+            for mapping in (color, weights):
                 _close_scratch_memmap(mapping)
 
 
@@ -1224,13 +1133,10 @@ def estimate_render_resources(
         raise ValueError("session contains no frames")
     source = _source_info_for_session(session, image_root)
     output_width, output_height = _output_dimensions(session, source.width, width)
-    exposure_width, exposure_height = _exposure_field_dimensions(output_width, output_height)
     worker_count, strip_height = _choose_render_plan(
         source, output_width, output_height, memory_budget_bytes, workers
     )
-    scratch_bytes = (
-        output_height * output_width * 4 + exposure_height * exposure_width
-    ) * np.dtype(np.float32).itemsize
+    scratch_bytes = output_height * output_width * 4 * np.dtype(np.float32).itemsize
     return RenderResources(output_width, output_height, strip_height, worker_count, scratch_bytes)
 
 
@@ -1253,6 +1159,7 @@ def _render_cpu(
     use_gpu: bool | None = True,
     gpu_memory_budget_bytes: int | None = None,
     backend_callback: Callable[[str, str], None] | None = None,
+    manual_gains: tuple[float, ...] | None = None,
 ) -> ExposureReport:
     """Render one session with the legacy bounded-RAM CPU pipeline."""
 
@@ -1268,6 +1175,7 @@ def _render_cpu(
         raise ValueError("session contains frames that are not captured")
 
     session = renderable_session(session, image_root, allow_incomplete)
+    manual_gains = _validated_manual_gains(manual_gains, len(session.frames))
 
     first_source = _source_info_for_session(session, image_root)
     output_suffix = output_path.suffix.lower()
@@ -1279,21 +1187,12 @@ def _render_cpu(
     strip_height = resources.strip_height
     composite_strips = (output_height + strip_height - 1) // strip_height
     auto_contrast_active = auto_contrast and output_suffix in {".png", ".jpg", ".jpeg"}
-    phase_count = 5 if auto_contrast_active else 4
+    phase_count = 3 if auto_contrast_active else 2
     phase_labels = {
-        "exposure": f"[1/{phase_count}] exposure",
-        "exposure mapping": f"[2/{phase_count}] exposure mapping",
-        "compositing": f"[3/{phase_count}] compositing",
-        "auto contrast": f"[4/{phase_count}] auto contrast",
-        "writing": f"[{5 if auto_contrast_active else 4}/{phase_count}] writing",
+        "compositing": f"[1/{phase_count}] compositing",
+        "auto contrast": f"[2/{phase_count}] auto contrast",
+        "writing": f"[{3 if auto_contrast_active else 2}/{phase_count}] writing",
     }
-    exposure_width, exposure_height = _exposure_field_dimensions(output_width, output_height)
-    exposure_strip_height = max(
-        1, (strip_height + _EXPOSURE_FIELD_SCALE - 1) // _EXPOSURE_FIELD_SCALE
-    )
-    exposure_strips = (exposure_height + exposure_strip_height - 1) // exposure_strip_height
-    exposure_work = len(session.frames)
-    local_exposure_work = (len(session.frames) + 1) * exposure_strips
     compositing_work = len(session.frames) * composite_strips
     latitude_span = (
         180.0 if session.capture_mode.value == "full_sphere" else session.vertical_fov_deg
@@ -1313,96 +1212,9 @@ def _render_cpu(
         if backend_callback is not None:
             backend_callback("cpu", backend_detail)
         if exposure_report is None:
-            exposure_report = _estimate_exposure_gains(
-                session,
-                image_root,
-                first_source,
-                cancel_event,
-                (
-                    (
-                        lambda completed: progress_callback(
-                            completed, exposure_work, phase_labels["exposure"]
-                        )
-                    )
-                    if progress_callback is not None
-                    else None
-                ),
-            )
+            exposure_report = ExposureReport(0, 0, (1.0,) * len(session.frames))
         elif len(exposure_report.gains) != len(session.frames):
             raise ValueError("cached exposure report does not match the renderable session")
-        elif progress_callback is not None:
-            progress_callback(exposure_work, exposure_work, f"{phase_labels['exposure']} (cached)")
-        local_exposure_path = scratch_root / "local-exposure.f32"
-        local_weight_path = scratch_root / "local-exposure-weight.f32"
-        local_exposure: Any | None = None
-        local_weight: Any | None = None
-        try:
-            local_exposure = np.memmap(
-                local_exposure_path,
-                mode="w+",
-                dtype=np.float32,
-                shape=(exposure_height, exposure_width),
-            )
-            local_weight = np.memmap(
-                local_weight_path,
-                mode="w+",
-                dtype=np.float32,
-                shape=(exposure_height, exposure_width),
-            )
-            local_exposure[:] = 0.0
-            local_weight[:] = 0.0
-            mapping_completed = 0
-            for frame_position, frame in enumerate(session.frames):
-                for row_start in range(0, exposure_height, exposure_strip_height):
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise RenderCancelledError("render cancelled")
-                    rows = min(exposure_strip_height, exposure_height - row_start)
-                    directions = equirectangular_directions(
-                        exposure_width, rows, latitude_span, row_start, exposure_height
-                    )
-                    _, _, valid, edge_distance = camera_maps(
-                        directions,
-                        frame,
-                        first_source.width,
-                        first_source.height,
-                        session.horizontal_fov_deg,
-                        session.vertical_fov_deg,
-                    )
-                    weights = _exposure_weight(valid, edge_distance, first_source)
-                    local_exposure[row_start : row_start + rows] += weights * np.float32(
-                        exposure_report.log_gains[frame_position]
-                    )
-                    local_weight[row_start : row_start + rows] += weights
-                    mapping_completed += 1
-                    if progress_callback is not None:
-                        progress_callback(
-                            mapping_completed, local_exposure_work, phase_labels["exposure mapping"]
-                        )
-            for row_start in range(0, exposure_height, exposure_strip_height):
-                if cancel_event is not None and cancel_event.is_set():
-                    raise RenderCancelledError("render cancelled")
-                rows = min(exposure_strip_height, exposure_height - row_start)
-                exposure_rows = local_exposure[row_start : row_start + rows]
-                weight_rows = local_weight[row_start : row_start + rows]
-                covered_exposure = weight_rows > 0.0
-                exposure_rows[covered_exposure] /= weight_rows[covered_exposure]
-                mapping_completed += 1
-                if progress_callback is not None:
-                    progress_callback(
-                        mapping_completed,
-                        local_exposure_work,
-                        phase_labels["exposure mapping"],
-                    )
-            local_exposure.flush()
-        except Exception:
-            if local_weight is not None:
-                _close_scratch_memmap(local_weight)
-            if local_exposure is not None:
-                _close_scratch_memmap(local_exposure)
-            raise
-        _close_scratch_memmap(local_weight)
-        del local_weight
-        assert local_exposure is not None
         color_path = scratch_root / "color.f32"
         weight_path = scratch_root / "weight.f32"
         color_scratch: Any | None = None
@@ -1425,7 +1237,6 @@ def _render_cpu(
                 _close_scratch_memmap(color_scratch)
             if weight_scratch is not None:
                 _close_scratch_memmap(weight_scratch)
-            _close_scratch_memmap(local_exposure)
             raise
         assert color_scratch is not None
         assert weight_scratch is not None
@@ -1439,6 +1250,7 @@ def _render_cpu(
                     source = _read_source(
                         _image_path(image_root, frame.filename), first_source.encoding
                     )
+                    source *= np.float32(manual_gains[frame_position])
                     try:
                         with ThreadPoolExecutor(max_workers=compositor_workers) as executor:
                             futures = [
@@ -1458,8 +1270,6 @@ def _render_cpu(
                                     strip_height,
                                     blend,
                                     cancel_event,
-                                    local_exposure,
-                                    exposure_report.log_gains[frame_position],
                                 )
                                 for row_start in range(0, output_height, strip_height)
                             ]
@@ -1594,7 +1404,7 @@ def _render_cpu(
                         blend,
                         jpeg_quality,
                         cancel_event,
-                        exposure_report.log_gains,
+                        manual_gains,
                         allow_incomplete,
                         auto_contrast,
                         memory_budget_bytes,
@@ -1623,10 +1433,8 @@ def _render_cpu(
         finally:
             _close_scratch_memmap(color_scratch)
             _close_scratch_memmap(weight_scratch)
-            _close_scratch_memmap(local_exposure)
             del color_scratch
             del weight_scratch
-            del local_exposure
 
 
 def _write_cuda_sdr_output(
@@ -1651,6 +1459,7 @@ def _render_cuda_thumbnail(
     output_suffix: str,
     jpeg_quality: int,
     auto_contrast: bool,
+    manual_gains: tuple[float, ...],
 ) -> None:
     """Encode the rectilinear thumbnail from already resident CUDA session data."""
 
@@ -1667,11 +1476,9 @@ def _render_cuda_thumbnail(
         output_vertical_fov=vertical_fov,
         plan=cuda_session._plan,
     ) as job:
-        job.build_local_exposure(
-            latitude_span=180.0,
-            horizontal_fov=session.horizontal_fov_deg,
-            vertical_fov=session.vertical_fov_deg,
-            log_gains=cuda_session.log_gains,
+        cuda_session.log_gains = cuda_session._cp.asarray(
+            np.log(manual_gains),
+            dtype=cuda_session._cp.float32,
         )
         output_dtype = np.dtype(np.uint8 if needs_sdr else np.float32)
         host_output = cuda_session.pinned_array((height, width, 3), output_dtype)
@@ -1742,11 +1549,8 @@ def prepare_cuda_session(
     cancel_event: Event | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
 ) -> PreparedCudaSession:
-    """Upload one session and solve its exposure once for reusable CUDA output jobs."""
+    """Upload one session for reusable CUDA output jobs."""
 
-    latitude_span = (
-        180.0 if session.capture_mode.value == "full_sphere" else session.vertical_fov_deg
-    )
     rotations = np.stack([_frame_rotation(frame) for frame in session.frames], dtype=np.float32)
     cuda_session = CudaSession(
         frame_count=len(session.frames),
@@ -1775,20 +1579,10 @@ def prepare_cuda_session(
                 progress_callback(frame_position + 1, len(session.frames), "loading from disk")
         cuda_session.finish_uploads()
         upload_seconds = time.perf_counter() - upload_started
-        exposure_started = time.perf_counter()
-        exposure = cuda_session.solve_exposure_gains(
-            latitude_span=latitude_span,
-            horizontal_fov=session.horizontal_fov_deg,
-            vertical_fov=session.vertical_fov_deg,
-            transfer_function=source.encoding.transfer_function,
-        )
-        anchor, edge_count, gains = cuda_session.download_exposure_report(exposure)
-        exposure_seconds = time.perf_counter() - exposure_started
         return PreparedCudaSession(
             cuda_session,
-            ExposureReport(anchor, edge_count, tuple(float(np.exp(gain)) for gain in gains)),
+            ExposureReport(0, 0, (1.0,) * len(session.frames)),
             upload_seconds,
-            exposure_seconds,
         )
     except Exception:
         cuda_session.close()
@@ -1883,6 +1677,7 @@ def _render_prepared_cuda(
     session_thumbnail: bool = False,
     return_preview: bool = False,
     diagnostics_callback: Callable[[CudaRenderDiagnostics], None] | None = None,
+    manual_gains: tuple[float, ...] | None = None,
 ) -> ExposureReport | PreviewResult:
     """Render a session through the CUDA-only numerical pipeline."""
 
@@ -1894,27 +1689,24 @@ def _render_prepared_cuda(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if debug_coverage_path is not None:
         debug_coverage_path.parent.mkdir(parents=True, exist_ok=True)
-    phase_count = 5 if auto_contrast and needs_sdr_conversion else 4
+    phase_count = 4 if auto_contrast and needs_sdr_conversion else 3
     phases = {
         "upload": f"[1/{phase_count}] CUDA upload",
-        "exposure": f"[2/{phase_count}] CUDA exposure",
-        "compositing": f"[3/{phase_count}] CUDA compositing",
-        "conversion": f"[4/{phase_count}] CUDA conversion",
+        "compositing": f"[2/{phase_count}] CUDA compositing",
+        "conversion": f"[3/{phase_count}] CUDA conversion",
         "writing": f"[{phase_count}/{phase_count}] writing",
     }
     if auto_contrast and needs_sdr_conversion:
-        phases["conversion"] = f"[4/{phase_count}] CUDA auto contrast"
-        phases["writing"] = f"[5/{phase_count}] writing"
+        phases["conversion"] = f"[3/{phase_count}] CUDA auto contrast"
 
     phase_seconds: dict[str, float] = {
         "upload": prepared.upload_seconds,
-        "exposure": prepared.exposure_seconds,
     }
     with nullcontext(prepared.cuda_session) as cuda_session:
         report = prepared.exposure_report
+        manual_gains = _validated_manual_gains(manual_gains, len(session.frames))
         if progress_callback is not None:
             progress_callback(len(session.frames), len(session.frames), phases["upload"])
-            progress_callback(1, 1, phases["exposure"])
 
         with CudaOutputJob(
             cuda_session,
@@ -1924,14 +1716,11 @@ def _render_prepared_cuda(
             needs_sdr_conversion=needs_sdr_conversion,
             plan=gpu_plan,
         ) as output_job:
-            phase_started = time.perf_counter()
-            output_job.build_local_exposure(
-                latitude_span=latitude_span,
-                horizontal_fov=session.horizontal_fov_deg,
-                vertical_fov=session.vertical_fov_deg,
-                log_gains=cuda_session.log_gains,
+            cuda_session.log_gains = cuda_session._cp.asarray(
+                np.log(manual_gains),
+                dtype=cuda_session._cp.float32,
             )
-            phase_seconds["local_exposure"] = time.perf_counter() - phase_started
+            phase_started = time.perf_counter()
             output_dtype = np.dtype(np.uint8 if needs_sdr_conversion else np.float32)
             host_output = cuda_session.pinned_array((output_height, output_width, 3), output_dtype)
             host_coverage = (
@@ -2061,6 +1850,7 @@ def _render_prepared_cuda(
                     output_suffix,
                     jpeg_quality,
                     auto_contrast,
+                    manual_gains,
                 )
             if diagnostics_callback is not None:
                 diagnostics_callback(
@@ -2088,6 +1878,7 @@ def _render_cuda(
     session_thumbnail: bool = False,
     return_preview: bool = False,
     diagnostics_callback: Callable[[CudaRenderDiagnostics], None] | None = None,
+    manual_gains: tuple[float, ...] | None = None,
 ) -> ExposureReport | PreviewResult:
     """Prepare one CUDA session, render it once, and release its device ownership."""
 
@@ -2115,6 +1906,7 @@ def _render_cuda(
             session_thumbnail,
             return_preview,
             diagnostics_callback,
+            manual_gains,
         )
     finally:
         prepared.close()
@@ -2143,6 +1935,7 @@ def render_session(
     gpu_diagnostics_callback: Callable[[CudaRenderDiagnostics], None] | None = None,
     cuda_session_cache: CudaSessionCache | None = None,
     cuda_session_path: Path | None = None,
+    manual_gains: tuple[float, ...] | None = None,
 ) -> ExposureReport:
     """Dispatch one render to the CUDA-only or bounded CPU pipeline."""
 
@@ -2166,13 +1959,13 @@ def render_session(
         gpu_memory_budget_bytes,
     )
     if use_gpu is False:
-        return _render_cpu(*cpu_arguments, backend_callback)
+        return _render_cpu(*cpu_arguments, backend_callback, manual_gains)
     if not session.frames:
-        return _render_cpu(*cpu_arguments, backend_callback)
+        return _render_cpu(*cpu_arguments, backend_callback, manual_gains)
     if not allow_incomplete and (
         not session.completed or any(frame.status != "captured" for frame in session.frames)
     ):
-        return _render_cpu(*cpu_arguments, backend_callback)
+        return _render_cpu(*cpu_arguments, backend_callback, manual_gains)
     renderable = renderable_session(session, image_root, allow_incomplete)
     try:
         source = _source_info_for_session(renderable, image_root)
@@ -2211,7 +2004,7 @@ def render_session(
         LOGGER.info("render backend selected: CPU (%s)", detail)
         if backend_callback is not None:
             backend_callback("cpu", detail)
-        return _render_cpu(*cpu_arguments, None)
+        return _render_cpu(*cpu_arguments, None, manual_gains)
     LOGGER.info("render backend selected: CUDA %s (%s)", selection.memory_mode, detail)
     if backend_callback is not None:
         backend_callback(f"cuda {selection.memory_mode}", detail)
@@ -2237,6 +2030,7 @@ def render_session(
                 gpu_plan,
                 session_thumbnail=session_thumbnail,
                 diagnostics_callback=gpu_diagnostics_callback,
+                manual_gains=manual_gains,
             )
         else:
             prepared, cache_owner = _cached_or_prepared_cuda_session(
@@ -2269,6 +2063,7 @@ def render_session(
                 prepared,
                 session_thumbnail=session_thumbnail,
                 diagnostics_callback=gpu_diagnostics_callback,
+                manual_gains=manual_gains,
             )
     except CudaPreflightError as error:
         if strict_gpu:
@@ -2277,7 +2072,7 @@ def render_session(
         LOGGER.info("render backend selected: CPU (%s)", detail)
         if backend_callback is not None:
             backend_callback("cpu", detail)
-        return _render_cpu(*cpu_arguments, None)
+        return _render_cpu(*cpu_arguments, None, manual_gains)
     except Exception:
         if cache_owner is not None:
             cache_owner.invalidate("render failed")
@@ -2293,6 +2088,7 @@ def validate_images(
     session: SessionMetadata,
     image_root: Path,
     allow_incomplete: bool = False,
+    cancel_event: Event | None = None,
 ) -> None:
     """Validate image references without retaining decoded sources."""
 
@@ -2308,6 +2104,8 @@ def validate_images(
     if len(set(filenames)) != len(filenames):
         raise ValueError("frame filenames must be unique")
     for filename in filenames:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RenderCancelledError("render cancelled")
         path = filename if filename.is_absolute() else image_root / filename
         if not path.is_file():
             if allow_incomplete:
@@ -2338,11 +2136,16 @@ def render_preview(
     cuda_session_cache: CudaSessionCache | None = None,
     cuda_session_path: Path | None = None,
     gpu_memory_budget_bytes: int | None = None,
+    cuda_width_multiplier: int = 1,
+    manual_gains: tuple[float, ...] | None = None,
+    exposure_report: ExposureReport | None = None,
 ) -> PreviewResult:
-    """Render an ephemeral, displayable SDR preview and return its exposure solve."""
+    """Render an ephemeral, displayable SDR preview."""
 
     if width < 1:
         raise ValueError("preview width must be positive")
+    if cuda_width_multiplier < 1:
+        raise ValueError("CUDA preview width multiplier must be positive")
     if output_suffix.lower() not in {".exr", ".jpg", ".jpeg", ".png"}:
         raise ValueError("output extension must be .exr, .jpg, .jpeg, or .png")
     image_root = image_root.resolve()
@@ -2357,7 +2160,16 @@ def render_preview(
         renderable = renderable_session(session, image_root, allow_incomplete)
         try:
             source = _source_info_for_session(renderable, image_root)
-            output_width, output_height = _output_dimensions(renderable, source.width, width)
+            cuda_width = width * cuda_width_multiplier
+            output_width, output_height = _output_dimensions(renderable, source.width, cuda_width)
+            viewport_height = max(1, round(width * output_height / output_width))
+            preview_cache_bytes = cuda_preview_display_bytes(
+                frame_count=len(renderable.frames),
+                preview_width=output_width,
+                preview_height=output_height,
+                viewport_width=width,
+                viewport_height=viewport_height,
+            )
             selection, gpu_plan = select_cuda_backend(
                 frame_count=len(renderable.frames),
                 source_width=source.width,
@@ -2368,6 +2180,7 @@ def render_preview(
                 output_sample_bytes=1,
                 needs_sdr_conversion=True,
                 gpu_budget_bytes=gpu_memory_budget_bytes,
+                preview_cache_bytes=preview_cache_bytes,
                 strict=strict_gpu,
             )
             if selection.backend == "cuda":
@@ -2405,6 +2218,7 @@ def render_preview(
                         gpu_plan,
                         return_preview=True,
                         diagnostics_callback=gpu_diagnostics_callback,
+                        manual_gains=manual_gains,
                     )
                 else:
                     prepared, cache_owner = _cached_or_prepared_cuda_session(
@@ -2439,6 +2253,7 @@ def render_preview(
                             prepared,
                             return_preview=True,
                             diagnostics_callback=gpu_diagnostics_callback,
+                            manual_gains=manual_gains,
                         )
                     except Exception:
                         cache_owner.invalidate("preview failed")
@@ -2469,6 +2284,8 @@ def render_preview(
             use_gpu=use_gpu,
             strict_gpu=strict_gpu,
             backend_callback=backend_callback,
+            manual_gains=manual_gains,
+            exposure_report=exposure_report,
         )
         with Image.open(preview_path) as image:
             pixels = np.array(image.convert("RGB"), dtype=np.uint8, copy=True)

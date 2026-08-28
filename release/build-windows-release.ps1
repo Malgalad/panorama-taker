@@ -4,7 +4,7 @@ param(
     [ValidateScript({ Test-Path $_ -PathType Leaf })]
     [string]$AddonPath,
 
-    [string]$Version = "1.0.2",
+    [string]$Version = "1.0.3",
     [string]$PythonCommand = "python",
     [string]$OutputDirectory = ""
 )

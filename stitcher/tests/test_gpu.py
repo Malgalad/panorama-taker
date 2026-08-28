@@ -14,6 +14,7 @@ from pano_stitch.gpu import (
     MiB,
     cuda_device_info,
     cuda_memory_plan,
+    cuda_preview_display_bytes,
     native_source_bytes,
     select_cuda_backend,
 )
@@ -112,6 +113,37 @@ def test_cuda_memory_plan_admits_a_large_capture_on_a_simulated_six_gib_card() -
     assert plan.required_bytes <= plan.available_bytes
 
 
+def test_cuda_preview_display_bytes_includes_full_pose_masks_and_viewport_buffers() -> None:
+    assert (
+        cuda_preview_display_bytes(
+            frame_count=16,
+            preview_width=4000,
+            preview_height=2000,
+            viewport_width=1000,
+            viewport_height=500,
+        )
+        == 163_000_016
+    )
+
+
+def test_cuda_memory_plan_reserves_retained_preview_cache() -> None:
+    plan = cuda_memory_plan(
+        frame_count=1,
+        source_width=1,
+        source_height=1,
+        output_width=32,
+        output_height=32,
+        sample_type="uint8",
+        output_sample_bytes=1,
+        needs_sdr_conversion=True,
+        free_bytes=512 * MiB,
+        total_bytes=512 * MiB,
+        preview_cache_bytes=129 * MiB,
+    )
+
+    assert plan is None
+
+
 def test_select_cuda_backend_reports_pre_kernel_memory_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -156,8 +188,9 @@ def test_select_cuda_backend_strict_mode_raises_for_pre_kernel_memory_fallback(
         "build_exposure_proxies",
         "sample_exposure_grid",
         "classify_exposure_samples",
-        "build_local_exposure",
         "compose_output",
+        "expand_preview_masks",
+        "compose_preview_display",
     ),
 )
 def test_cuda_module_contains_full_gpu_pipeline_kernels(kernel_name: str) -> None:

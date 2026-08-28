@@ -38,6 +38,14 @@ Keep each generated `PanoramaCaptureBridge.pano-<session-id>.json` with its scre
 
 5. Choose an output directory and format, then click Render.
 
+The stitcher does not alter pose exposure automatically. If the game changed exposure during a
+capture, render a preview and open **Correct exposure**. Enable **Show boundaries overlay**, then
+hover or click the numbered poses or their regions in the preview. Moving over the preview shows a
+magnified view for precise selection. Select the affected poses, choose a neighboring pose with
+**Target exposure**, and click **Match exposure**. That action remains disabled until both a target
+and at least one affected pose are selected. The correction is non-destructive and lasts only for
+the current stitcher session.
+
 The session list shows the local capture date, whether capture completed, and whether it has been stitched before. The Screenshots field can be used when captures were moved from the game directory. The default memory budget is 1024 MiB.
 
 The session actions can delete only the JSON, or the JSON and captured screenshots. For stitched sessions, deleting source files preserves the stitched panorama. JSON-only deletion of an incomplete session does not require confirmation; other deletion actions ask for confirmation.

@@ -157,7 +157,7 @@ def main() -> None:
                 f"{resources.worker_count} workers, {resources.strip_height}-row strips, "
                 f"{scratch_gib:.2f} GiB scratch"
             )
-            exposure_report = render_session(
+            render_session(
                 session,
                 image_root,
                 arguments.output,
@@ -180,11 +180,6 @@ def main() -> None:
                 strict_gpu=arguments.gpu_strict,
             )
             print(file=sys.stderr)
-            gains = ", ".join(f"{gain:.3f}" for gain in exposure_report.gains)
-            print(
-                f"exposure normalization: anchor={exposure_report.anchor_frame + 1}, "
-                f"overlap edges={exposure_report.edge_count}, relative exposure estimates=[{gains}]"
-            )
             state = "enabled" if arguments.auto_contrast else "disabled"
             if arguments.output.suffix.lower() == ".exr":
                 state = "skipped for EXR"

@@ -133,20 +133,20 @@ def build_document(
     frames = []
     for record, filename in zip(records, images, strict=True):
         frame = {
-                "index": int(record["index"]),
-                "filename": filename,
-                "row": int(record["row"]),
-                "column": int(record["column"]),
-                "commanded_yaw_deg": float(record["yaw"]),
-                "commanded_pitch_deg": float(record["pitch"]),
-                "observed_forward": _vector(record["forward"]),
-                "observed_right": _vector(record["right"]),
-                "observed_up": _vector(record["up"]),
-                "camera_basis_row_major": _canonical_basis(record, base),
-                "horizontal_fov_deg": float(record["hfov"]),
-                "vertical_fov_deg": float(record["vfov"]),
-                "settle_seconds": float(record["seconds"]),
-                "basis_valid": record["valid"] == "true",
+            "index": int(record["index"]),
+            "filename": filename,
+            "row": int(record["row"]),
+            "column": int(record["column"]),
+            "commanded_yaw_deg": float(record["yaw"]),
+            "commanded_pitch_deg": float(record["pitch"]),
+            "observed_forward": _vector(record["forward"]),
+            "observed_right": _vector(record["right"]),
+            "observed_up": _vector(record["up"]),
+            "camera_basis_row_major": _canonical_basis(record, base),
+            "horizontal_fov_deg": float(record["hfov"]),
+            "vertical_fov_deg": float(record["vfov"]),
+            "settle_seconds": float(record["seconds"]),
+            "basis_valid": record["valid"] == "true",
         }
         frames.append(frame)
     return {

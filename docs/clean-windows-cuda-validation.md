@@ -24,9 +24,15 @@ CuPy wheel, but not a CUDA Toolkit installation.
    session.
 5. Render a preview and a full PNG with CUDA enabled. Confirm the GUI reports `CUDA resident` or
    `CUDA banded`, not CPU fallback.
-6. Render an EXR and a thumbnail. Confirm all requested artifacts open and that cancelling a
+6. In the CUDA preview, open **Correct exposure** and enable **Show boundaries overlay**. Move
+   across the preview and click several off-center points in the magnified view; confirm the
+   highlighted pose covers the visibly clicked point and pointer movement remains responsive.
+   Confirm **Match exposure** stays disabled until a target and at least one other pose are selected.
+7. While boundaries are enabled, start a fresh preview and exercise Cancel, then repeat and close
+   the window. Confirm both actions remain responsive and process memory returns after exit.
+8. Render an EXR and a thumbnail. Confirm all requested artifacts open and that cancelling a
    separate render leaves no `.partial` output.
-7. Close and reopen the GUI, then repeat one preview-to-full render. Collect the stitcher log and
+9. Close and reopen the GUI, then repeat one preview-to-full render. Collect the stitcher log and
    confirm the session-cache hit and the absence of a second source upload/exposure solve.
 
 Record pass/fail, GPU/driver, archive hash, selected CUDA mode, output checksums, and the relevant

@@ -276,8 +276,8 @@ extern "C" __global__ void build_local_exposure(
 
 extern "C" __global__ void compose_output(
     const void* sources, int source_sample_type, int transfer_function, const float* rotations,
-    const float* log_gains, const float* local_exposure, int local_width, int local_height,
-    float* color, unsigned char* coverage, int source_width, int source_height, int output_width,
+    const float* log_gains, float* color, unsigned char* coverage, int source_width,
+    int source_height, int output_width,
     int output_height, int row_start, int rows, float latitude_span, float horizontal_fov,
     float vertical_fov, int frame_count, int hard_blend, int incomplete_magenta,
     int rectilinear_output, float output_vertical_fov) {
@@ -286,8 +286,6 @@ extern "C" __global__ void compose_output(
   if (x >= output_width || local_row >= rows) return;
   const int index = local_row * output_width + x;
   const int y = row_start + local_row;
-  const float exposure = sample_local_exposure(
-      local_exposure, local_width, local_height, output_width, output_height, x, y);
   float output_r = 0.0f, output_g = 0.0f, output_b = 0.0f;
   float best_weight = 0.0f, total_weight = 0.0f;
   const float feather = fmaxf(1.0f, fminf(source_width, source_height) * 0.08f);
@@ -308,7 +306,7 @@ extern "C" __global__ void compose_output(
     const long long p10 = base + ((long long)y0 * source_width + x1) * 3;
     const long long p01 = base + ((long long)y1 * source_width + x0) * 3;
     const long long p11 = base + ((long long)y1 * source_width + x1) * 3;
-    const float gain = expf(log_gains[frame] - exposure);
+    const float gain = expf(log_gains[frame]);
     const float red = gain * (w00 * decode_source_value(
         sources, p00, source_sample_type, transfer_function)
         + w10 * decode_source_value(sources, p10, source_sample_type, transfer_function)
@@ -449,11 +447,90 @@ extern "C" __global__ void convert_output(
   converted[index * 3 + 1] = quantize_sdr(green);
   converted[index * 3 + 2] = quantize_sdr(blue);
 }
+
+extern "C" __global__ void expand_preview_masks(
+    const unsigned char* compact, unsigned char* expanded, int frame_count,
+    int compact_width, int compact_height, int preview_width, int preview_height) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const int pixels_per_frame = preview_width * preview_height;
+  const int pixels = frame_count * pixels_per_frame;
+  if (index >= pixels) return;
+  const int frame = index / pixels_per_frame;
+  const int pixel = index - frame * pixels_per_frame;
+  const int x = pixel % preview_width, y = pixel / preview_width;
+  const int compact_x = min(compact_width - 1, x * compact_width / preview_width);
+  const int compact_y = min(compact_height - 1, y * compact_height / preview_height);
+  expanded[index] = compact[(frame * compact_height + compact_y) * compact_width + compact_x];
+}
+
+extern "C" __global__ void compose_preview_display(
+    const unsigned char* preview, const unsigned char* overview,
+    const unsigned char* masks, const unsigned char* hovered, unsigned char* output,
+    int preview_width, int preview_height, int overview_width, int overview_height,
+    int output_width, int output_height, int crop_left, int crop_top, int frame_count,
+    int target_pose, int target_mode, int show_boundaries, int use_overview) {
+  const int index = blockIdx.x * blockDim.x + threadIdx.x;
+  const int pixels = output_width * output_height;
+  if (index >= pixels) return;
+  const int x = index % output_width, y = index / output_width;
+  const int source_x = use_overview
+      ? min(preview_width - 1, (int)((x + 0.5f) * preview_width / output_width))
+      : crop_left + x;
+  const int source_y = use_overview
+      ? min(preview_height - 1, (int)((y + 0.5f) * preview_height / output_height))
+      : crop_top + y;
+  const int base = use_overview ? (y * overview_width + x) * 3
+                                : (source_y * preview_width + source_x) * 3;
+  const unsigned char* base_image = use_overview ? overview : preview;
+  float red = base_image[base], green = base_image[base + 1], blue = base_image[base + 2];
+  const int mask_pixels = preview_width * preview_height;
+  const int left_output_x = x == 0 ? output_width - 1 : x - 1;
+  const int right_output_x = x == output_width - 1 ? 0 : x + 1;
+  const int left_x = use_overview
+      ? min(preview_width - 1,
+            (int)((left_output_x + 0.5f) * preview_width / output_width))
+      : crop_left + left_output_x;
+  const int right_x = use_overview
+      ? min(preview_width - 1,
+            (int)((right_output_x + 0.5f) * preview_width / output_width))
+      : crop_left + right_output_x;
+  const int top_y = use_overview
+      ? min(preview_height - 1, (int)((max(y - 1, 0) + 0.5f)
+                                     * preview_height / output_height))
+      : crop_top + max(y - 1, 0);
+  const int bottom_y = use_overview
+      ? min(preview_height - 1, (int)((min(y + 1, output_height - 1) + 0.5f)
+                                     * preview_height / output_height))
+      : crop_top + min(y + 1, output_height - 1);
+  for (int frame = 0; frame < frame_count; ++frame) {
+    const int frame_base = frame * mask_pixels;
+    const bool covered = masks[frame_base + source_y * preview_width + source_x] != 0;
+    if (!covered) continue;
+    if (hovered[frame]) {
+      const float tint_red = target_mode ? 0.0f : 255.0f;
+      const float tint_green = target_mode ? 102.0f : 0.0f;
+      red = red * 0.8f + tint_red * 0.2f;
+      green = green * 0.8f + tint_green * 0.2f;
+      blue = blue * 0.8f + 255.0f * 0.2f;
+    }
+    const bool boundary = !masks[frame_base + source_y * preview_width + left_x]
+        || !masks[frame_base + source_y * preview_width + right_x]
+        || !masks[frame_base + top_y * preview_width + source_x]
+        || !masks[frame_base + bottom_y * preview_width + source_x];
+    if ((show_boundaries || hovered[frame]) && boundary) {
+      red = frame == target_pose ? 0.0f : 255.0f;
+      green = frame == target_pose ? 102.0f : 0.0f;
+      blue = 255.0f;
+    }
+  }
+  output[index * 3] = (unsigned char)red;
+  output[index * 3 + 1] = (unsigned char)green;
+  output[index * 3 + 2] = (unsigned char)blue;
+}
 """
 
 
 CUDA_KERNEL_NAMES = (
-    "build_local_exposure",
     "compose_output",
     "build_exposure_proxies",
     "sample_exposure_grid",
@@ -462,6 +539,8 @@ CUDA_KERNEL_NAMES = (
     "build_auto_contrast_histogram",
     "select_auto_contrast_levels",
     "convert_output",
+    "expand_preview_masks",
+    "compose_preview_display",
 )
 
 # One translation unit keeps shared helpers and compiler settings identical for

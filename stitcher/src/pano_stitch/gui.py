@@ -8,11 +8,15 @@ import os
 import queue
 import threading
 import tkinter as tk
+from dataclasses import replace
+from enum import Enum, auto
 from fractions import Fraction
+from functools import partial
 from pathlib import Path
 from tkinter import filedialog, font, messagebox, ttk
-from typing import Any
+from typing import Any, cast
 
+import numpy as np
 from PIL import Image, ImageTk
 
 from pano_stitch.compositor import (
@@ -20,13 +24,16 @@ from pano_stitch.compositor import (
     ExposureReport,
     RenderCancelledError,
     estimate_render_resources,
+    estimate_target_exposure_gain,
+    frame_coverage_masks,
     render_preview,
     render_session,
     renderable_session,
     thumbnail_output_path,
     validate_images,
 )
-from pano_stitch.metadata import load_session
+from pano_stitch.gpu import CudaPreviewDisplay
+from pano_stitch.metadata import SessionMetadata, load_session
 from pano_stitch.sessions import (
     SessionRecord,
     delete_files,
@@ -39,14 +46,95 @@ LOGGER = logging.getLogger(__name__)
 MIB = 1024**2
 GIB = 1024**3
 CUDA_BUILD = os.environ.get("PANO_STITCH_BUILD_FLAVOR", "cuda") == "cuda"
+CUDA_PREVIEW_WIDTH_MULTIPLIER = 4
+
+
+class UiState(Enum):
+    EMPTY = auto()
+    READY = auto()
+    PREVIEW = auto()
+    BUSY = auto()
+    CLOSING = auto()
+
+
+def _magnified_crop_box(
+    source_size: tuple[int, int],
+    viewport_size: tuple[int, int],
+    pointer: tuple[float, float],
+) -> tuple[int, int, int, int]:
+    """Center a viewport-sized crop on a proportional preview pointer position."""
+
+    source_width, source_height = source_size
+    viewport_width, viewport_height = viewport_size
+    center_x = round(min(1.0, max(0.0, pointer[0])) * source_width)
+    center_y = round(min(1.0, max(0.0, pointer[1])) * source_height)
+    left = min(max(0, center_x - viewport_width // 2), source_width - viewport_width)
+    top = min(max(0, center_y - viewport_height // 2), source_height - viewport_height)
+    return left, top, left + viewport_width, top + viewport_height
+
+
+def _mask_boundary(mask: np.ndarray) -> np.ndarray:
+    boundary = mask & ~np.roll(mask, 1, axis=1)
+    boundary |= mask & ~np.roll(mask, -1, axis=1)
+    boundary |= mask & ~np.vstack((mask[:1], mask[:-1]))
+    boundary |= mask & ~np.vstack((mask[1:], mask[-1:]))
+    return cast(np.ndarray, boundary)
+
+
+def _compose_preview_display(
+    source: Image.Image,
+    viewport: tuple[int, int],
+    masks: tuple[np.ndarray, ...],
+    show_boundaries: bool,
+    crop_box: tuple[int, int, int, int] | None,
+    hovered_poses: frozenset[int],
+    target_pose: int | None,
+    target_mode: bool,
+) -> Image.Image:
+    display = (
+        source.resize(viewport, Image.Resampling.LANCZOS)
+        if crop_box is None
+        else source.crop(crop_box)
+    )
+    if not masks:
+        return display
+    rgba = np.asarray(display.convert("RGBA"), dtype=np.uint8).copy()
+    for position, source_mask in enumerate(masks):
+        mask_image = Image.fromarray(source_mask.astype(np.uint8) * 255, mode="L")
+        if crop_box is not None:
+            left, top, right, bottom = crop_box
+            mask_box = (
+                left * source_mask.shape[1] / source.width,
+                top * source_mask.shape[0] / source.height,
+                right * source_mask.shape[1] / source.width,
+                bottom * source_mask.shape[0] / source.height,
+            )
+            mask_image = mask_image.transform(
+                display.size,
+                Image.Transform.EXTENT,
+                mask_box,
+                Image.Resampling.NEAREST,
+            )
+        elif mask_image.size != display.size:
+            mask_image = mask_image.resize(display.size, Image.Resampling.NEAREST)
+        mask = np.asarray(mask_image, dtype=np.uint8) > 0
+        if position in hovered_poses:
+            color = np.array((0, 102, 255) if target_mode else (255, 0, 255), dtype=np.float32)
+            rgba[mask, :3] = np.asarray(rgba[mask, :3] * 0.8 + color * 0.2, dtype=np.uint8)
+        if show_boundaries or position in hovered_poses:
+            boundary_color = (0, 102, 255, 255) if position == target_pose else (255, 0, 255, 255)
+            rgba[_mask_boundary(mask)] = boundary_color
+    return Image.fromarray(rgba, mode="RGBA").convert("RGB")
 
 
 def _backend_status(backend: str, detail: str, *, cuda_requested: bool, log_directory: Path) -> str:
-    if backend == "cpu" and cuda_requested:
-        return f"Backend: CPU — CUDA error occurred; check logs in {log_directory}"
+    if backend == "cpu":
+        if cuda_requested:
+            return f"CPU (failed to initialize CUDA; see error log in {log_directory})"
+        return "CPU"
     if backend.startswith("cuda"):
-        prefix, separator, remainder = detail.partition("reserve=")
-        byte_count, unit_separator, suffix = remainder.partition(" bytes")
+        _, separator, remainder = detail.partition("reserve=")
+        byte_count, unit_separator, _ = remainder.partition(" bytes")
         if separator and unit_separator:
             try:
                 reserve_bytes = int(byte_count)
@@ -58,7 +146,7 @@ def _backend_status(backend: str, detail: str, *, cuda_requested: bool, log_dire
                     if reserve_bytes >= GIB
                     else f"{reserve_bytes / MIB:.0f} MB"
                 )
-                detail = f"{prefix}reserve={reserve}{suffix}"
+                return f"CUDA (reserved {reserve} VRAM)"
     return f"Backend: {backend.upper()} — {detail}"
 
 
@@ -74,12 +162,38 @@ class StitcherApp:
         self._cancel_event: threading.Event | None = None
         self._worker: threading.Thread | None = None
         self._validation_after: str | None = None
+        self._close_when_idle = False
+        self._state = UiState.EMPTY
+        self._state_before_busy = UiState.EMPTY
+        self._active_operation: str | None = None
         self._validated = False
         self._history: dict[str, Any] = {}
         self._sessions: tuple[SessionRecord, ...] = ()
         self._preview_report: ExposureReport | None = None
         self._preview_photo: Any | None = None
+        self._preview_magnified_photo: Any | None = None
+        self._preview_image: Image.Image | None = None
+        self._preview_overview: Image.Image | None = None
+        self._cuda_preview_display: CudaPreviewDisplay | None = None
+        self._preview_viewport = (1, 1)
         self._preview_width = 1
+        self._preview_session: SessionMetadata | None = None
+        self._coverage_masks: tuple[Any, ...] = ()
+        self._active_preview_crop: tuple[int, int, int, int] | None = None
+        self._display_lock = threading.Lock()
+        self._display_generation = 0
+        self._display_valid_generation = 0
+        self._display_applied_generation = 0
+        self._display_pending: tuple[Any, ...] | None = None
+        self._display_worker: threading.Thread | None = None
+        self._manual_gains: tuple[float, ...] = ()
+        self._selected_poses: set[int] = set()
+        self._target_pose: int | None = None
+        self._hovered_poses: set[int] = set()
+        self._target_mode = False
+        self._pose_widgets: list[tk.Label] = []
+        self._native_output_size: tuple[int, int] | None = None
+        self._resolution_geometry: tuple[str, float] | None = None
         self._cuda_session_cache = CudaSessionCache()
         self._build_variables()
         self._load_settings()
@@ -91,6 +205,7 @@ class StitcherApp:
         self.image_dir_var.trace_add("write", self._input_changed)
         self.output_dir_var.trace_add("write", self._output_directory_changed)
         self.output_name_var.trace_add("write", self._output_name_changed)
+        self.width_var.trace_add("write", lambda *_args: self._update_expected_resolution())
         self.format_var.trace_add("write", self._format_changed)
         preview_variables = [
             self.blend_var,
@@ -158,11 +273,21 @@ class StitcherApp:
         variable.set(self._display_path(value))
 
     def _close(self) -> None:
-        if self._worker is not None and self._worker.is_alive():
-            self.cancel()
-            self.status_var.set("Render is still stopping; close again when idle.")
+        if self._state is UiState.CLOSING:
+            if self._worker is None or not self._worker.is_alive():
+                self._finish_close()
             return
-        self.discard_preview()
+        if self._state is UiState.BUSY:
+            self._state = UiState.CLOSING
+            self._close_when_idle = True
+            self.cancel()
+            self.status_var.set("Cancellation requested; closing when the worker stops…")
+            return
+        self._state = UiState.CLOSING
+        self._finish_close()
+
+    def _finish_close(self) -> None:
+        self._close_cuda_preview_display()
         self._cuda_session_cache.close()
         self._save_settings()
         self.root.destroy()
@@ -198,6 +323,7 @@ class StitcherApp:
         self.allow_incomplete_var = tk.BooleanVar(value=False)
         self.coverage_var = tk.BooleanVar(value=False)
         self.auto_contrast_var = tk.BooleanVar(value=True)
+        self.overlay_var = tk.BooleanVar(value=False)
         self.use_gpu_var = tk.BooleanVar(value=self.cuda_build)
         self.backend_var = tk.StringVar(value="Backend: not selected")
         self.status_var = tk.StringVar(value="Choose a game directory and session.")
@@ -209,8 +335,56 @@ class StitcherApp:
         self.left_column = ttk.Frame(self.main_content)
         self.left_column.grid(row=0, column=0, sticky="ns")
         self.preview_frame = ttk.LabelFrame(self.main_content, text="Preview")
+        self.preview_frame.columnconfigure(0, weight=1)
+        self.preview_frame.rowconfigure(0, weight=1)
         self.preview_label = ttk.Label(self.preview_frame, text="Preview will appear here")
-        self.preview_label.pack(expand=True, padx=12, pady=12)
+        self.preview_label.grid(row=0, column=0, sticky="nsew", padx=12, pady=12)
+        self.preview_label.bind("<Motion>", self._magnify_preview)
+        self.preview_label.bind("<Leave>", self._restore_preview_overview)
+        self.preview_label.bind("<Button-1>", self._preview_clicked)
+        self.exposure_expand_button = ttk.Button(
+            self.preview_frame,
+            text="Correct exposure >>",
+            command=self._toggle_exposure_panel,
+        )
+        self.exposure_expand_button.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 12))
+        self.exposure_expand_button.grid_remove()
+        exposure_status_font = font.Font(
+            root=self.root,
+            font=font.nametofont("TkDefaultFont", root=self.root),
+        )
+        exposure_status_font.configure(slant="italic")
+        self._exposure_status_font = exposure_status_font
+        self.exposure_status_label = ttk.Label(
+            self.preview_frame, text="", font=self._exposure_status_font
+        )
+        self.exposure_status_label.grid(row=2, column=0, sticky="w", padx=12, pady=(0, 12))
+        self.exposure_status_label.grid_remove()
+        self.exposure_panel = ttk.LabelFrame(self.preview_frame, text="Exposure correction")
+        ttk.Checkbutton(
+            self.exposure_panel,
+            text="Show boundaries overlay",
+            variable=self.overlay_var,
+            command=self._refresh_preview_display,
+        ).pack(anchor="w", padx=8, pady=6)
+        self.target_button = ttk.Button(
+            self.exposure_panel, text="Target exposure", command=self._toggle_target_mode
+        )
+        self.target_button.pack(anchor="w", padx=8, pady=4)
+        self.pose_grid = ttk.Frame(self.exposure_panel)
+        self.pose_grid.pack(fill="x", padx=8, pady=6)
+        exposure_actions = ttk.Frame(self.exposure_panel)
+        exposure_actions.pack(fill="x", padx=8, pady=6)
+        self.match_exposure_button = ttk.Button(
+            exposure_actions,
+            text="Match exposure",
+            command=self._match_exposure,
+            state="disabled",
+        )
+        self.match_exposure_button.pack(side="left")
+        self.discard_exposure_button = ttk.Button(
+            exposure_actions, text="Discard changes", command=self._discard_exposure_changes
+        )
         paths = ttk.LabelFrame(self.left_column, text="Capture")
         paths.pack(fill="x", padx=12, pady=8)
         self._path_row(paths, 0, "Game directory", self.game_dir_var, self._pick_game_dir)
@@ -290,6 +464,14 @@ class StitcherApp:
         self.resolution_scale.pack(side="left")
         ttk.Label(resolution, textvariable=self.resolution_label_var, width=6).pack(side="left")
         self._option_row(options, 2, "Resolution", resolution)
+        muted_style = ttk.Style(self.root)
+        muted_style.configure("Muted.TLabel", foreground="#777777")
+        self.expected_resolution_var = tk.StringVar()
+        ttk.Label(
+            options,
+            textvariable=self.expected_resolution_var,
+            style="Muted.TLabel",
+        ).grid(row=3, column=0, sticky="w", padx=6, pady=3)
         ttk.Checkbutton(
             options, text="Generate session thumbnail", variable=self.session_thumbnail_var
         ).grid(row=3, column=1, sticky="w", padx=6, pady=3)
@@ -476,6 +658,7 @@ class StitcherApp:
             if not messagebox.askyesno(
                 "Delete session files",
                 "Are you sure?\n\nThis will delete the selected session files.",
+                parent=self.root,
             ):
                 return
         deleted, missing = delete_files(deletion_targets(record, include_images))
@@ -526,6 +709,32 @@ class StitcherApp:
 
     def _update_resolution_label(self) -> None:
         self.resolution_label_var.set(f"{self.resolution_percent_var.get()}%")
+        if hasattr(self, "expected_resolution_var"):
+            self._update_expected_resolution()
+
+    def _update_expected_resolution(self) -> None:
+        if self._native_output_size is None or self._resolution_geometry is None:
+            self.expected_resolution_var.set("")
+            return
+        width_text = self.width_var.get().strip()
+        try:
+            width = (
+                int(width_text)
+                if width_text
+                else max(
+                    1, int(self._native_output_size[0] * self.resolution_percent_var.get() / 100)
+                )
+            )
+        except ValueError:
+            self.expected_resolution_var.set("Expected: invalid width")
+            return
+        mode, vertical_fov = self._resolution_geometry
+        if mode == "full_sphere":
+            width = max(2, width - width % 2)
+            height = width // 2
+        else:
+            height = max(1, round(width * vertical_fov / 360.0))
+        self.expected_resolution_var.set(f"Expected: {width} × {height}")
 
     def _update_jpeg_quality_label(self) -> None:
         self.jpeg_quality_label_var.set(f"{self.jpeg_quality_var.get()}%")
@@ -540,8 +749,6 @@ class StitcherApp:
             self.advanced_button.configure(text="Advanced options ▸")
 
     def _output_name_changed(self, *_args: object) -> None:
-        if self._preview_report is not None:
-            self.discard_preview()
         self._output_name_dirty = True
 
     def _preview_option_changed(self, *_args: object) -> None:
@@ -607,11 +814,29 @@ class StitcherApp:
         output_path = Path(output_text).expanduser() / output_name
         return output_path.with_suffix(suffix)
 
+    def _mark_session_stitched(self, session_id: str, output_name: str) -> None:
+        records = list(self._sessions)
+        for index, record in enumerate(records):
+            if record.metadata.session_id != session_id:
+                continue
+            records[index] = replace(record, stitched_name=output_name)
+            iid = str(index)
+            if self.sessions_tree.exists(iid):
+                self.sessions_tree.set(iid, "stitched", "Yes")
+            break
+        self._sessions = tuple(records)
+
     def _input_changed(self, *_args: object) -> None:
+        self._close_cuda_preview_display()
         self._cuda_session_cache.invalidate("input changed")
         if self._preview_report is not None:
             self.discard_preview()
         self._validated = False
+        self._state = UiState.EMPTY
+        self._native_output_size = None
+        self._resolution_geometry = None
+        if hasattr(self, "expected_resolution_var"):
+            self._update_expected_resolution()
         self.render_button.configure(state="disabled")
         if self._validation_after is not None:
             self.root.after_cancel(self._validation_after)
@@ -626,17 +851,33 @@ class StitcherApp:
             self._start_worker("validate")
 
     def _start_worker(self, operation: str) -> None:
-        if self._worker is not None and self._worker.is_alive():
+        if self._state in {UiState.BUSY, UiState.CLOSING}:
             return
+        if operation != "validate":
+            self._close_cuda_preview_display()
+        self._state_before_busy = self._state
+        self._state = UiState.BUSY
+        self._active_operation = operation
         self._set_busy(True)
         self._cancel_event = threading.Event()
         self._worker = threading.Thread(target=self._worker_main, args=(operation,), daemon=True)
         self._worker.start()
 
+    def _emit_event(self, kind: str, payload: Any) -> None:
+        self._events.put((kind, payload))
+
+    def _requested_render_operation(self) -> str | None:
+        if self._state is UiState.READY:
+            return "preview"
+        if self._state is UiState.PREVIEW:
+            return "render"
+        return None
+
     def render(self) -> None:
-        if not self._validated or not self._output_dir_writable:
+        operation = self._requested_render_operation()
+        if not self._validated or not self._output_dir_writable or operation is None:
             return
-        if self._preview_report is None:
+        if operation == "preview":
             self.root.update_idletasks()
             self._preview_width = max(1, self.root.winfo_width() - 24)
             self.preview_frame.grid(row=0, column=1, sticky="nsew", padx=12, pady=8)
@@ -664,19 +905,245 @@ class StitcherApp:
                 "The following output files already exist:\n"
                 + "\n".join(path.name for path in existing)
                 + "\nReplace them?",
+                parent=self.root,
             ):
                 return
-        self._start_worker("render")
+        self._start_worker(operation)
 
     def discard_preview(self) -> None:
+        self._close_cuda_preview_display()
         self._cuda_session_cache.invalidate("preview discarded")
         self._preview_report = None
         self._preview_photo = None
+        self._preview_magnified_photo = None
+        self._preview_image = None
+        self._preview_overview = None
+        self._preview_session = None
+        self._coverage_masks = ()
+        self._active_preview_crop = None
+        with self._display_lock:
+            self._display_generation += 1
+            self._display_valid_generation = self._display_generation
+            self._display_applied_generation = self._display_generation
+            self._display_pending = None
+        self._manual_gains = ()
+        if hasattr(self, "_selected_poses"):
+            self._selected_poses.clear()
+        self._target_pose = None
+        if hasattr(self, "_hovered_poses"):
+            self._hovered_poses.clear()
+        self._target_mode = False
+        if hasattr(self, "overlay_var"):
+            self.overlay_var.set(False)
+        if hasattr(self, "discard_exposure_button"):
+            self.discard_exposure_button.pack_forget()
+        if hasattr(self, "pose_grid"):
+            for child in self.pose_grid.winfo_children():
+                if isinstance(child, tk.Widget):
+                    child.grid_remove()
+            self.exposure_panel.grid_remove()
+            self.exposure_expand_button.grid_remove()
+            self.exposure_expand_button.configure(text="Correct exposure >>")
+            self.exposure_status_label.configure(text="")
+            self.exposure_status_label.grid_remove()
+            self.target_button.configure(text="Target exposure")
+            self.preview_label.configure(cursor="")
         if hasattr(self, "preview_label"):
             self.preview_label.configure(image="", text="Preview will appear here")
             self.preview_frame.grid_remove()
         self.render_button.configure(text="Preview")
         self.discard_button.pack_forget()
+        self._state = UiState.READY if self._validated else UiState.EMPTY
+
+    def _toggle_exposure_panel(self) -> None:
+        if self.exposure_panel.winfo_ismapped():
+            self.exposure_panel.grid_remove()
+            self.exposure_expand_button.configure(text="Correct exposure >>")
+        else:
+            self.exposure_panel.grid(row=0, column=1, rowspan=3, sticky="ns", padx=(0, 12), pady=12)
+            self.exposure_expand_button.configure(text="Correct exposure <<")
+
+    def _toggle_target_mode(self) -> None:
+        if self._worker is not None and self._worker.is_alive():
+            return
+        self._target_mode = not self._target_mode
+        self.target_button.configure(
+            text="Target exposure (selecting)" if self._target_mode else "Target exposure"
+        )
+        try:
+            self.preview_label.configure(cursor="target" if self._target_mode else "")
+        except tk.TclError:
+            self.preview_label.configure(cursor="crosshair" if self._target_mode else "")
+        self.status_var.set(
+            "Select the target exposure pose."
+            if self._target_mode
+            else "Select poses whose exposure should be shifted."
+        )
+        self._refresh_pose_grid()
+        self._refresh_preview_display()
+
+    def _finish_target_selection(self) -> None:
+        self._target_mode = False
+        self.target_button.configure(text="Target exposure")
+        self.preview_label.configure(cursor="")
+        self.status_var.set("Select poses whose exposure should be shifted.")
+
+    def _build_pose_grid(self) -> None:
+        if self._preview_session is None:
+            return
+        columns = 8
+        for position, frame in enumerate(self._preview_session.frames):
+            if position < len(self._pose_widgets):
+                label = self._pose_widgets[position]
+                label.configure(text=str(frame.index))
+            else:
+                label = tk.Label(
+                    self.pose_grid,
+                    text=str(frame.index),
+                    width=3,
+                    height=1,
+                    bd=0,
+                    highlightthickness=1,
+                )
+                label.bind("<Enter>", partial(self._pose_entered, position))
+                label.bind("<Leave>", partial(self._pose_left, position))
+                label.bind("<Button-1>", partial(self._pose_clicked, position))
+                self._pose_widgets.append(label)
+            label.grid(row=position // columns, column=position % columns, padx=2, pady=2)
+        for label in self._pose_widgets[len(self._preview_session.frames) :]:
+            label.grid_remove()
+        self._refresh_pose_grid()
+
+    def _pose_entered(self, position: int, _event: Any = None) -> None:
+        if self._worker is not None and self._worker.is_alive():
+            return
+        self._hovered_poses = {position}
+        self._refresh_pose_grid()
+        self._refresh_preview_display()
+
+    def _pose_left(self, position: int, _event: Any = None) -> None:
+        if self._worker is not None and self._worker.is_alive():
+            return
+        self._hovered_poses.discard(position)
+        self._refresh_pose_grid()
+        self._refresh_preview_display()
+
+    def _pose_clicked(self, position: int, _event: Any = None) -> None:
+        if self._worker is not None and self._worker.is_alive():
+            return
+        if self._target_mode:
+            if position in self._selected_poses:
+                return
+            self._target_pose = position
+            self._finish_target_selection()
+        else:
+            if position == self._target_pose:
+                return
+            if position in self._selected_poses:
+                self._selected_poses.remove(position)
+            else:
+                self._selected_poses.add(position)
+        self._refresh_pose_grid()
+        self._refresh_preview_display()
+
+    def _preview_clicked(self, event: Any) -> None:
+        if self._worker is not None and self._worker.is_alive():
+            return
+        if self._preview_image is None or not self.overlay_var.get():
+            return
+        candidates = self._preview_pose_candidates(event, self._active_preview_crop)
+        if self._target_mode:
+            if candidates:
+                self._target_pose = candidates[0]
+                self._finish_target_selection()
+        else:
+            for position in candidates:
+                if position in self._selected_poses:
+                    self._selected_poses.remove(position)
+                else:
+                    self._selected_poses.add(position)
+        self._refresh_pose_grid()
+        self._refresh_preview_display()
+
+    def _preview_pose_candidates(
+        self, event: Any, crop_box: tuple[int, int, int, int] | None
+    ) -> list[int]:
+        if self._preview_image is None:
+            return []
+        viewport_width, viewport_height = self._preview_viewport
+        image_left = (self.preview_label.winfo_width() - viewport_width) / 2
+        image_top = (self.preview_label.winfo_height() - viewport_height) / 2
+        crop = crop_box or (
+            0,
+            0,
+            self._preview_image.width,
+            self._preview_image.height,
+        )
+        crop_width = crop[2] - crop[0]
+        crop_height = crop[3] - crop[1]
+        source_x = crop[0] + min(
+            crop_width - 1,
+            max(0, int((event.x - image_left) * crop_width / viewport_width)),
+        )
+        source_y = crop[1] + min(
+            crop_height - 1,
+            max(0, int((event.y - image_top) * crop_height / viewport_height)),
+        )
+        candidates = [
+            position
+            for position, mask in enumerate(self._coverage_masks)
+            if bool(
+                mask[
+                    min(mask.shape[0] - 1, source_y * mask.shape[0] // self._preview_image.height),
+                    min(mask.shape[1] - 1, source_x * mask.shape[1] // self._preview_image.width),
+                ]
+            )
+        ]
+        if self._target_mode:
+            candidates = [
+                position for position in candidates if position not in self._selected_poses
+            ]
+            return candidates[:1]
+        return [position for position in candidates if position != self._target_pose]
+
+    def _refresh_pose_grid(self) -> None:
+        for position, widget in enumerate(self._pose_widgets):
+            if position == self._target_pose:
+                widget.configure(
+                    bg="#a8cfff", fg="black", relief="solid", highlightbackground="blue"
+                )
+            elif position in self._selected_poses:
+                border = (
+                    "blue"
+                    if position in self._hovered_poses and self._target_mode
+                    else "magenta"
+                    if position in self._hovered_poses
+                    else "green"
+                )
+                widget.configure(
+                    bg="#91bc91", fg="black", relief="solid", highlightbackground=border
+                )
+            elif position in self._hovered_poses:
+                color = "blue" if self._target_mode else "magenta"
+                widget.configure(bg="#d9d9d9", fg=color, relief="solid", highlightbackground=color)
+            else:
+                widget.configure(
+                    bg="#d9d9d9", fg="black", relief="solid", highlightbackground="gray"
+                )
+        state = "normal" if self._target_pose is not None and self._selected_poses else "disabled"
+        self.match_exposure_button.configure(state=state)
+
+    def _match_exposure(self) -> None:
+        if self._target_pose is not None and self._selected_poses:
+            self._start_worker("match_exposure")
+
+    def _discard_exposure_changes(self) -> None:
+        if self._manual_gains:
+            self._manual_gains = (1.0,) * len(self._manual_gains)
+            self.discard_exposure_button.pack_forget()
+            self.exposure_status_label.configure(text="")
+            self.exposure_status_label.grid_remove()
+            self._start_worker("preview")
 
     def cancel(self) -> None:
         if self._cancel_event is not None:
@@ -686,24 +1153,61 @@ class StitcherApp:
     def _worker_main(self, operation: str) -> None:
         try:
             LOGGER.info("%s started", operation)
-            self._events.put(("backend", ("selecting", "checking GPU availability and VRAM")))
+            self._emit_event("backend", ("selecting", "checking GPU availability and VRAM"))
             session_path, image_dir = self._input_paths()
             session = load_session(session_path, image_directory=image_dir)
             allow_incomplete = self.allow_incomplete_var.get()
-            validate_images(session, image_dir, allow_incomplete)
+            validate_images(session, image_dir, allow_incomplete, self._cancel_event)
             if operation == "validate":
-                self._events.put(("validated", f"Valid session: {session.session_id}"))
+                if self._cancel_event is not None and self._cancel_event.is_set():
+                    raise RenderCancelledError("render cancelled")
+                renderable = renderable_session(session, image_dir, allow_incomplete)
+                native = estimate_render_resources(renderable, image_dir, None, 1024 * MIB, None)
+                self._emit_event(
+                    "resolution",
+                    (
+                        (native.output_width, native.output_height),
+                        (session.capture_mode.value, session.vertical_fov_deg),
+                    ),
+                )
+                self._emit_event("validated", f"Valid session: {session.session_id}")
                 return
             output_dir = self._output_directory()
             session = renderable_session(session, image_dir, allow_incomplete)
+            manual_gains = (
+                self._manual_gains
+                if len(self._manual_gains) == len(session.frames)
+                else (1.0,) * len(session.frames)
+            )
+            if operation == "match_exposure":
+                if self._target_pose is None or not self._selected_poses:
+                    raise ValueError("select a target exposure and at least one pose to shift")
+                gain = estimate_target_exposure_gain(
+                    session,
+                    image_dir,
+                    self._target_pose,
+                    tuple(sorted(self._selected_poses)),
+                    manual_gains,
+                    self._cancel_event,
+                    lambda completed, total, phase: self._progress(
+                        completed, total, f"Exposure match: {phase}"
+                    ),
+                    match_proxies=(
+                        self._preview_report.match_proxies
+                        if self._preview_report is not None
+                        else ()
+                    ),
+                )
+                updated = list(manual_gains)
+                for position in self._selected_poses:
+                    updated[position] *= gain
+                manual_gains = tuple(updated)
             scale = Fraction(self.resolution_percent_var.get(), 100)
             if scale <= 0 or scale > 1:
                 raise ValueError("resolution must be between 1/1 and a positive fraction")
             width = int(self.width_var.get()) if self.width_var.get().strip() else None
             if width is not None and width < 1:
                 raise ValueError("explicit width must be positive")
-            if width is not None and scale != 1:
-                raise ValueError("explicit width and resolution fraction cannot be combined")
             memory = int(self.memory_var.get()) * 1024 * 1024
             if memory < 1 * 1024 * 1024 or memory > 8096 * 1024 * 1024:
                 raise ValueError("memory budget must be between 1 and 8096 MiB")
@@ -723,7 +1227,7 @@ class StitcherApp:
                 else None
             )
             resources = estimate_render_resources(session, image_dir, render_width, memory, workers)
-            if operation == "preview":
+            if operation in {"preview", "match_exposure"}:
                 preview = render_preview(
                     session,
                     image_dir,
@@ -742,17 +1246,34 @@ class StitcherApp:
                     backend_callback=self._backend_selected,
                     cuda_session_cache=self._cuda_session_cache,
                     cuda_session_path=session_path,
+                    cuda_width_multiplier=CUDA_PREVIEW_WIDTH_MULTIPLIER,
+                    manual_gains=manual_gains,
+                    exposure_report=self._preview_report,
                 )
-                self._events.put(("preview", preview))
+                mask_height = max(
+                    1,
+                    round(self._preview_width * preview.pixels.shape[0] / preview.pixels.shape[1]),
+                )
+                masks = frame_coverage_masks(
+                    session, image_dir, self._preview_width, mask_height, self._cancel_event
+                )
+                overview_image = Image.fromarray(preview.pixels, mode="RGB").resize(
+                    (self._preview_width, mask_height), Image.Resampling.LANCZOS
+                )
+                overview = np.asarray(overview_image, dtype=np.uint8)
+                cuda_display = self._cuda_session_cache.create_preview_display(
+                    preview.pixels, overview, masks
+                )
+                self._emit_event(
+                    "preview", (preview, overview, masks, session, manual_gains, cuda_display)
+                )
                 return
-            self._events.put(
-                (
-                    "status",
-                    f"Rendering {resources.output_width}×{resources.output_height} "
-                    f"with {resources.worker_count} workers…",
-                )
+            self._emit_event(
+                "status",
+                f"Rendering {resources.output_width}×{resources.output_height} "
+                f"with {resources.worker_count} workers…",
             )
-            exposure_report = render_session(
+            render_session(
                 session,
                 image_dir,
                 output_path,
@@ -772,9 +1293,11 @@ class StitcherApp:
                 backend_callback=self._backend_selected,
                 cuda_session_cache=self._cuda_session_cache,
                 cuda_session_path=session_path,
+                manual_gains=manual_gains,
             )
             LOGGER.info("render completed: %s", output_path)
-            self._events.put(("stitched", (session.session_id, output_path.name)))
+            self._cuda_session_cache.invalidate("render completed")
+            self._emit_event("stitched", (session.session_id, output_path.name))
             auto_state = (
                 "skipped for EXR"
                 if output_path.suffix.lower() == ".exr"
@@ -785,29 +1308,27 @@ class StitcherApp:
                 if self.session_thumbnail_var.get()
                 else ""
             )
-            self._events.put(
-                (
-                    "success",
-                    f"Wrote {output_path} (exposure edges: {exposure_report.edge_count}; "
-                    f"auto contrast: {auto_state}{thumbnail_note})",
-                )
+            self._emit_event(
+                "success",
+                f"Wrote {output_path} (auto contrast: {auto_state}{thumbnail_note})",
             )
         except RenderCancelledError:
             self._cuda_session_cache.invalidate("render cancelled")
             LOGGER.info("%s cancelled", operation)
-            self._events.put(("cancelled", "Render cancelled; partial files were removed."))
+            self._emit_event("cancelled", "Render cancelled; partial files were removed.")
         except Exception as error:
             self._cuda_session_cache.invalidate("render failed")
             LOGGER.exception("%s failed", operation)
-            self._events.put(("error", f"{error}\n\nDetails were written to {self._log_path()}"))
+            kind = "match_error" if operation == "match_exposure" else "error"
+            self._emit_event(kind, f"{error}\n\nDetails were written to {self._log_path()}")
         finally:
-            self._events.put(("idle", ""))
+            self._emit_event("idle", "")
 
     def _progress(self, completed: int, total: int, phase: str) -> None:
-        self._events.put(("progress", (completed, total, phase)))
+        self._emit_event("progress", (completed, total, phase))
 
     def _backend_selected(self, backend: str, detail: str) -> None:
-        self._events.put(("backend", (backend, detail)))
+        self._emit_event("backend", (backend, detail))
 
     def _drain_events(self) -> None:
         try:
@@ -819,6 +1340,9 @@ class StitcherApp:
                     self.status_var.set(f"{phase}: {completed}/{total}")
                 elif kind == "status":
                     self.status_var.set(payload)
+                elif kind == "resolution":
+                    self._native_output_size, self._resolution_geometry = payload
+                    self._update_expected_resolution()
                 elif kind == "backend":
                     backend, detail = payload
                     self.backend_var.set(
@@ -830,16 +1354,58 @@ class StitcherApp:
                         )
                     )
                 elif kind == "preview":
-                    preview = payload
-                    image = Image.fromarray(preview.pixels, mode="RGB")
-                    self._preview_photo = ImageTk.PhotoImage(image)
-                    self.preview_label.configure(image=self._preview_photo, text="")
+                    preview, overview, masks, session, manual_gains, cuda_display = payload
+                    self._preview_image = Image.fromarray(preview.pixels, mode="RGB")
+                    self._preview_overview = Image.fromarray(overview, mode="RGB")
+                    self._cuda_preview_display = cuda_display
+                    overview_height = max(
+                        1,
+                        round(
+                            self._preview_width
+                            * self._preview_image.height
+                            / self._preview_image.width
+                        ),
+                    )
+                    self._preview_viewport = (self._preview_width, overview_height)
+                    self._preview_session = session
+                    self._coverage_masks = masks
+                    self._manual_gains = manual_gains
+                    self._build_pose_grid()
+                    self._refresh_preview_display()
+                    self.exposure_expand_button.grid()
                     self._preview_report = preview.exposure_report
+                    self._state = UiState.PREVIEW
                     self.render_button.configure(text="Render full size")
                     self.discard_button.pack(side="left", padx=8)
+                    if any(abs(gain - 1.0) > 1e-6 for gain in manual_gains):
+                        self.discard_exposure_button.pack(side="left", padx=8)
+                        self.exposure_status_label.configure(
+                            text="Exposure corrections will be used for final output."
+                        )
+                        self.exposure_status_label.grid()
+                    else:
+                        self.discard_exposure_button.pack_forget()
+                        self.exposure_status_label.configure(text="")
+                        self.exposure_status_label.grid_remove()
                     self.status_var.set("Preview ready. Render full size or discard it.")
+                elif kind == "preview_display":
+                    generation, display, crop_box = payload
+                    if (
+                        generation < self._display_valid_generation
+                        or generation <= self._display_applied_generation
+                        or self._preview_image is None
+                    ):
+                        continue
+                    self._display_applied_generation = generation
+                    photo = ImageTk.PhotoImage(display)
+                    if crop_box is None:
+                        self._preview_photo = photo
+                    else:
+                        self._preview_magnified_photo = photo
+                    self.preview_label.configure(image=photo, text="")
                 elif kind == "validated":
                     self._validated = True
+                    self._state = UiState.READY
                     self.render_button.configure(
                         state="normal" if self._output_dir_writable else "disabled"
                     )
@@ -849,29 +1415,139 @@ class StitcherApp:
                         else "Output directory is not writable."
                     )
                 elif kind == "success":
-                    self.discard_preview()
+                    self._state = UiState.PREVIEW
                     self.status_var.set(payload)
-                    self._refresh_sessions()
-                    messagebox.showinfo("Panorama stitcher", payload)
+                    messagebox.showinfo("Panorama stitcher", payload, parent=self.root)
                 elif kind == "stitched":
                     session_id, output_name = payload
                     mark_stitched(
                         self._history, Path(self.game_dir_var.get()), session_id, output_name
                     )
+                    self._mark_session_stitched(session_id, output_name)
                     self._save_settings()
-                    self._refresh_sessions()
                 elif kind == "error":
                     self.discard_preview()
                     self.status_var.set(f"Error: {payload}")
-                    messagebox.showerror("Panorama stitcher", payload)
+                    messagebox.showerror("Panorama stitcher", payload, parent=self.root)
+                elif kind == "match_error":
+                    self.status_var.set(f"Exposure match failed: {payload}")
+                    messagebox.showerror("Exposure match failed", payload, parent=self.root)
                 elif kind == "cancelled":
                     self.discard_preview()
                     self.status_var.set(payload)
                 elif kind == "idle":
+                    if self._state is UiState.BUSY:
+                        self._state = self._state_before_busy
+                    self._active_operation = None
                     self._set_busy(False)
+                    if self._close_when_idle:
+                        self.root.after(50, self._close)
         except queue.Empty:
             pass
         self.root.after(100, self._drain_events)
+
+    def _magnify_preview(self, event: Any) -> None:
+        if self._preview_image is None or (self._worker is not None and self._worker.is_alive()):
+            return
+        viewport_width, viewport_height = self._preview_viewport
+        image_left = (self.preview_label.winfo_width() - viewport_width) / 2
+        image_top = (self.preview_label.winfo_height() - viewport_height) / 2
+        pointer = (
+            (event.x - image_left) / viewport_width,
+            (event.y - image_top) / viewport_height,
+        )
+        box = _magnified_crop_box(self._preview_image.size, self._preview_viewport, pointer)
+        self._hovered_poses = (
+            set(self._preview_pose_candidates(event, box)) if self.overlay_var.get() else set()
+        )
+        self._refresh_pose_grid()
+        self._refresh_preview_display(box)
+
+    def _restore_preview_overview(self, _event: Any = None) -> None:
+        self._preview_magnified_photo = None
+        self._hovered_poses.clear()
+        self._refresh_pose_grid()
+        self._refresh_preview_display()
+
+    def _refresh_preview_display(self, crop_box: tuple[int, int, int, int] | None = None) -> None:
+        if self._preview_image is None:
+            return
+        self._active_preview_crop = crop_box
+        overlay = self.overlay_var.get()
+        masks = self._coverage_masks if overlay or self._hovered_poses else ()
+        with self._display_lock:
+            self._display_generation += 1
+            self._display_pending = (
+                self._display_generation,
+                self._preview_image,
+                self._preview_overview,
+                self._cuda_preview_display,
+                self._preview_viewport,
+                masks,
+                overlay,
+                crop_box,
+                frozenset(self._hovered_poses),
+                self._target_pose,
+                self._target_mode,
+            )
+            if self._display_worker is not None and self._display_worker.is_alive():
+                return
+            self._display_worker = threading.Thread(
+                target=self._preview_display_worker_main, daemon=True
+            )
+            self._display_worker.start()
+
+    def _preview_display_worker_main(self) -> None:
+        while True:
+            with self._display_lock:
+                request = self._display_pending
+                self._display_pending = None
+                if request is None:
+                    self._display_worker = None
+                    return
+            (
+                generation,
+                source,
+                overview,
+                cuda_display,
+                viewport,
+                masks,
+                overlay,
+                crop_box,
+                hovered,
+                target,
+                target_mode,
+            ) = request
+            if cuda_display is None:
+                display_source = overview if crop_box is None and overview is not None else source
+                display = _compose_preview_display(
+                    display_source,
+                    viewport,
+                    masks,
+                    overlay,
+                    crop_box,
+                    hovered,
+                    target,
+                    target_mode,
+                )
+            else:
+                try:
+                    pixels = cuda_display.render(crop_box, hovered, target, target_mode, overlay)
+                except RuntimeError:
+                    continue
+                display = Image.fromarray(pixels, mode="RGB")
+            self._emit_event("preview_display", (generation, display, crop_box))
+
+    def _close_cuda_preview_display(self) -> None:
+        with self._display_lock:
+            self._display_generation += 1
+            self._display_valid_generation = self._display_generation
+            self._display_applied_generation = self._display_generation
+            self._display_pending = None
+            display = getattr(self, "_cuda_preview_display", None)
+            self._cuda_preview_display = None
+        if display is not None:
+            display.close()
 
     def _form_control_widgets(self) -> list[tk.Widget]:
         controls: list[tk.Widget] = []
@@ -903,6 +1579,8 @@ class StitcherApp:
             state=state if self._validated and self._output_dir_writable else "disabled"
         )
         self.cancel_button.configure(state="normal" if busy else "disabled")
+        if not busy:
+            self._refresh_pose_grid()
 
 
 def _configure_scaling(root: tk.Tk) -> None:
