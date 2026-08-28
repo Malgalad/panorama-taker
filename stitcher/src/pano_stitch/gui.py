@@ -671,6 +671,7 @@ class StitcherApp:
             ):
                 return
         deleted, missing = delete_files(deletion_targets(record, include_images))
+        self.discard_preview()
         self.status_var.set(f"Deleted {deleted} file(s); {missing} already missing.")
         self._refresh_sessions()
 
@@ -761,7 +762,11 @@ class StitcherApp:
         self._output_name_dirty = True
 
     def _preview_option_changed(self, *_args: object) -> None:
-        if self._preview_report is not None:
+        if (
+            self._state is UiState.PREVIEW
+            or self._preview_image is not None
+            or self._preview_report is not None
+        ):
             self.discard_preview()
 
     def _is_output_directory_writable(self) -> bool:

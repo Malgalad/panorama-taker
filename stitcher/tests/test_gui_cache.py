@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import numpy as np
 from PIL import Image
 
+import pano_stitch.gui as gui_module
 from pano_stitch.gui import (
     StitcherApp,
     UiState,
@@ -154,6 +155,8 @@ def test_gui_preview_option_change_does_not_revalidate_session() -> None:
     app = StitcherApp.__new__(StitcherApp)
     cache = _Cache()
     app._cuda_session_cache = cache  # type: ignore[assignment]
+    app._state = UiState.READY
+    app._preview_image = None
     app._preview_report = None
     app._validated = True
     app._validation_after = None
@@ -163,6 +166,52 @@ def test_gui_preview_option_change_does_not_revalidate_session() -> None:
     assert cache.reasons == []
     assert app._validated is True
     assert app._validation_after is None
+
+
+def test_gui_preview_option_change_discards_preview_when_report_is_missing() -> None:
+    app = StitcherApp.__new__(StitcherApp)
+    app._state = UiState.PREVIEW
+    app._preview_image = Image.new("RGB", (2, 1))
+    app._preview_report = None
+    discarded = False
+
+    def discard_preview() -> None:
+        nonlocal discarded
+        discarded = True
+
+    app.discard_preview = discard_preview  # type: ignore[method-assign]
+
+    app._preview_option_changed()
+
+    assert discarded is True
+
+
+def test_delete_selected_discards_preview(monkeypatch: object) -> None:
+    app = StitcherApp.__new__(StitcherApp)
+    app.sessions_tree = SimpleNamespace(selection=lambda: ("0",))
+    app._sessions = (
+        SimpleNamespace(
+            error=None,
+            complete=False,
+            path=Path("session.json"),
+            image_paths=(),
+        ),
+    )
+    app.status_var = _StatusVariable()  # type: ignore[assignment]
+    discarded = False
+
+    def discard_preview() -> None:
+        nonlocal discarded
+        discarded = True
+
+    app.discard_preview = discard_preview  # type: ignore[method-assign]
+    app._refresh_sessions = lambda: None  # type: ignore[method-assign]
+    monkeypatch.setattr(gui_module, "delete_files", lambda _paths: (1, 0))  # type: ignore[attr-defined]
+
+    app._delete_selected(False)
+
+    assert discarded is True
+    assert app.status_var.value == "Deleted 1 file(s); 0 already missing."
 
 
 def test_output_name_change_preserves_preview_and_validation() -> None:

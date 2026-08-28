@@ -46,6 +46,11 @@ For manual correction, enable **Show boundaries overlay**, select the affected p
 neighboring target, and click **Match exposure**. Corrections are non-destructive, can be discarded,
 and last only for the current stitcher session.
 
+For HDR captures, correcting overexposed or underexposed screenshots may leave their colors
+desaturated. To minimize this, preserve as much color information as possible in the source
+screenshots; for example, do not set **Blowout** to `0` in the RenoDX ReShade add-on. This does not
+apply to SDR captures.
+
 The session list shows the local capture date, whether capture completed, and whether it has been stitched before. The Screenshots field can be used when captures were moved from the game directory. The default memory budget is 1024 MiB.
 
 The session actions can delete only the JSON, or the JSON and captured screenshots. For stitched sessions, deleting source files preserves the stitched panorama. JSON-only deletion of an incomplete session does not require confirmation; other deletion actions ask for confirmation.
