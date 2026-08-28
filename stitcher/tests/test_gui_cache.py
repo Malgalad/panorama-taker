@@ -287,13 +287,14 @@ def test_preview_hover_tints_and_outlines_only_hovered_pose_without_overlay() ->
     assert np.array_equal(pixels[1, 5], np.array((100, 100, 100), dtype=np.uint8))
 
 
-def test_enabling_form_preserves_match_exposure_disabled_state() -> None:
+def test_enabling_form_preserves_exposure_action_requirements() -> None:
     app = StitcherApp.__new__(StitcherApp)
     app.advanced_button = _Widget()  # type: ignore[assignment]
     app.cancel_button = _Widget()  # type: ignore[assignment]
     app.render_button = _Widget()  # type: ignore[assignment]
     app.match_exposure_button = _Widget()  # type: ignore[assignment]
-    app._form_controls = [app.match_exposure_button]
+    app.automatic_exposure_button = _Widget()  # type: ignore[assignment]
+    app._form_controls = [app.match_exposure_button, app.automatic_exposure_button]
     app._pose_widgets = []
     app._target_pose = None
     app._selected_poses = set()
@@ -303,6 +304,13 @@ def test_enabling_form_preserves_match_exposure_disabled_state() -> None:
     app._set_busy(False)
 
     assert app.match_exposure_button.state == "disabled"
+    assert app.automatic_exposure_button.state == "disabled"
+
+    app._target_pose = 12
+    app._refresh_pose_grid()
+
+    assert app.match_exposure_button.state == "disabled"
+    assert app.automatic_exposure_button.state == "normal"
 
 
 def test_expected_resolution_uses_scale_or_explicit_width() -> None:

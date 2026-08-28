@@ -20,9 +20,11 @@ import numpy as np
 from PIL import Image, ImageTk
 
 from pano_stitch.compositor import (
+    AutomaticExposureAmbiguousError,
     CudaSessionCache,
     ExposureReport,
     RenderCancelledError,
+    estimate_automatic_exposure_gains,
     estimate_render_resources,
     estimate_target_exposure_gain,
     frame_coverage_masks,
@@ -382,6 +384,13 @@ class StitcherApp:
             state="disabled",
         )
         self.match_exposure_button.pack(side="left")
+        self.automatic_exposure_button = ttk.Button(
+            exposure_actions,
+            text="Automatic correction",
+            command=self._correct_exposure_automatically,
+            state="disabled",
+        )
+        self.automatic_exposure_button.pack(side="left", padx=(8, 0))
         self.discard_exposure_button = ttk.Button(
             exposure_actions, text="Discard changes", command=self._discard_exposure_changes
         )
@@ -1132,10 +1141,18 @@ class StitcherApp:
                 )
         state = "normal" if self._target_pose is not None and self._selected_poses else "disabled"
         self.match_exposure_button.configure(state=state)
+        if hasattr(self, "automatic_exposure_button"):
+            self.automatic_exposure_button.configure(
+                state="normal" if self._target_pose is not None else "disabled"
+            )
 
     def _match_exposure(self) -> None:
         if self._target_pose is not None and self._selected_poses:
             self._start_worker("match_exposure")
+
+    def _correct_exposure_automatically(self) -> None:
+        if self._target_pose is not None:
+            self._start_worker("automatic_exposure")
 
     def _discard_exposure_changes(self) -> None:
         if self._manual_gains:
@@ -1179,6 +1196,7 @@ class StitcherApp:
                 if len(self._manual_gains) == len(session.frames)
                 else (1.0,) * len(session.frames)
             )
+            automatic_corrected_poses: tuple[int, ...] = ()
             if operation == "match_exposure":
                 if self._target_pose is None or not self._selected_poses:
                     raise ValueError("select a target exposure and at least one pose to shift")
@@ -1202,6 +1220,31 @@ class StitcherApp:
                 for position in self._selected_poses:
                     updated[position] *= gain
                 manual_gains = tuple(updated)
+            elif operation == "automatic_exposure":
+                if self._target_pose is None:
+                    raise ValueError("select a target exposure pose")
+                automatic = estimate_automatic_exposure_gains(
+                    session,
+                    image_dir,
+                    self._target_pose,
+                    manual_gains,
+                    self._cancel_event,
+                    lambda completed, total, phase: self._progress(
+                        completed, total, f"Automatic exposure: {phase}"
+                    ),
+                    match_proxies=(
+                        self._preview_report.match_proxies
+                        if self._preview_report is not None
+                        else ()
+                    ),
+                )
+                manual_gains = tuple(
+                    current * correction
+                    for current, correction in zip(manual_gains, automatic.gains, strict=True)
+                )
+                automatic_corrected_poses = tuple(
+                    position + 1 for position in automatic.corrected_positions
+                )
             scale = Fraction(self.resolution_percent_var.get(), 100)
             if scale <= 0 or scale > 1:
                 raise ValueError("resolution must be between 1/1 and a positive fraction")
@@ -1227,7 +1270,7 @@ class StitcherApp:
                 else None
             )
             resources = estimate_render_resources(session, image_dir, render_width, memory, workers)
-            if operation in {"preview", "match_exposure"}:
+            if operation in {"preview", "match_exposure", "automatic_exposure"}:
                 preview = render_preview(
                     session,
                     image_dir,
@@ -1267,6 +1310,8 @@ class StitcherApp:
                 self._emit_event(
                     "preview", (preview, overview, masks, session, manual_gains, cuda_display)
                 )
+                if operation == "automatic_exposure":
+                    self._emit_event("automatic_exposure_applied", automatic_corrected_poses)
                 return
             self._emit_event(
                 "status",
@@ -1316,6 +1361,9 @@ class StitcherApp:
             self._cuda_session_cache.invalidate("render cancelled")
             LOGGER.info("%s cancelled", operation)
             self._emit_event("cancelled", "Render cancelled; partial files were removed.")
+        except AutomaticExposureAmbiguousError as error:
+            LOGGER.info("automatic exposure correction not applied: %s", error)
+            self._emit_event("automatic_exposure_warning", str(error))
         except Exception as error:
             self._cuda_session_cache.invalidate("render failed")
             LOGGER.exception("%s failed", operation)
@@ -1403,6 +1451,21 @@ class StitcherApp:
                     else:
                         self._preview_magnified_photo = photo
                     self.preview_label.configure(image=photo, text="")
+                elif kind == "automatic_exposure_applied":
+                    if payload:
+                        poses = ", ".join(map(str, payload))
+                        self.status_var.set(f"Automatically corrected exposure for poses: {poses}.")
+                    else:
+                        self.status_var.set(
+                            "Pose exposures already agree; no correction was needed."
+                        )
+                elif kind == "automatic_exposure_warning":
+                    self.status_var.set(f"Automatic exposure correction skipped: {payload}")
+                    messagebox.showwarning(
+                        "Automatic exposure correction",
+                        f"{payload}\n\nSelect poses manually to correct their exposure.",
+                        parent=self.root,
+                    )
                 elif kind == "validated":
                     self._validated = True
                     self._state = UiState.READY

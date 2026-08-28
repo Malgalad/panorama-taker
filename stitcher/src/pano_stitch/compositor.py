@@ -100,6 +100,19 @@ class PreviewResult:
     exposure_report: ExposureReport
 
 
+@dataclass(frozen=True)
+class AutomaticExposureResult:
+    """Automatic gains propagated from a user-selected exposure target."""
+
+    gains: tuple[float, ...]
+    baseline_positions: tuple[int, ...]
+    corrected_positions: tuple[int, ...]
+
+
+class AutomaticExposureAmbiguousError(ValueError):
+    """Raised when overlap measurements do not identify a clear baseline."""
+
+
 def _validated_manual_gains(
     manual_gains: tuple[float, ...] | None, frame_count: int
 ) -> tuple[float, ...]:
@@ -356,6 +369,133 @@ def estimate_target_exposure_gain(
     if not shifts:
         raise ValueError("target pose must overlap at least one selected pose")
     return float(np.exp(np.median(shifts)))
+
+
+def estimate_automatic_exposure_gains(
+    session: SessionMetadata,
+    image_root: Path,
+    target_position: int,
+    manual_gains: tuple[float, ...] | None = None,
+    cancel_event: Event | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    match_proxies: tuple[FloatImage, ...] = (),
+) -> AutomaticExposureResult:
+    """Propagate exposure matching outward from one user-selected target pose."""
+
+    frame_count = len(session.frames)
+    if frame_count < 2:
+        raise AutomaticExposureAmbiguousError("at least two poses are required")
+    if not 0 <= target_position < frame_count:
+        raise ValueError("target pose is outside the session")
+    manual_gains = _validated_manual_gains(manual_gains, frame_count)
+    if match_proxies and len(match_proxies) != frame_count:
+        raise ValueError("exposure match proxies do not match the renderable session")
+    source_info = _source_info_for_session(session, image_root)
+    latitude_span = (
+        180.0 if session.capture_mode.value == "full_sphere" else session.vertical_fov_deg
+    )
+    directions = equirectangular_directions(256, 128, latitude_span)
+    samples: list[tuple[FloatImage, NDArray[np.bool_]]] = []
+    for position, frame in enumerate(session.frames):
+        if cancel_event is not None and cancel_event.is_set():
+            raise RenderCancelledError("render cancelled")
+        if match_proxies:
+            proxy = match_proxies[position]
+        else:
+            source = _read_source(_image_path(image_root, frame.filename), source_info.encoding)
+            try:
+                proxy = _exposure_proxy(source)
+            finally:
+                del source
+        map_x, map_y, valid, _ = camera_maps(
+            directions,
+            frame,
+            proxy.shape[1],
+            proxy.shape[0],
+            session.horizontal_fov_deg,
+            session.vertical_fov_deg,
+        )
+        sampled = remap_source(proxy, map_x, map_y)
+        luminance = _exposure_luminance(sampled) * np.float32(manual_gains[position])
+        usable = (
+            valid
+            & np.isfinite(luminance)
+            & (luminance > np.float32(1e-5))
+            & ~_exposure_clipped(sampled, source_info.encoding)
+        )
+        samples.append((luminance, usable))
+        if progress_callback is not None:
+            progress_callback(position + 1, frame_count, "sampling poses")
+
+    pair_total = frame_count * (frame_count - 1) // 2
+    equations: list[tuple[int, int, float, float]] = []
+    compared = 0
+    for left in range(frame_count):
+        left_luminance, left_valid = samples[left]
+        for right in range(left + 1, frame_count):
+            if cancel_event is not None and cancel_event.is_set():
+                raise RenderCancelledError("render cancelled")
+            right_luminance, right_valid = samples[right]
+            overlap = left_valid & right_valid
+            ratios = np.log(left_luminance[overlap]) - np.log(right_luminance[overlap])
+            ratios = ratios[np.isfinite(ratios)]
+            if ratios.size >= 24:
+                low, high = np.quantile(ratios, (0.1, 0.9))
+                inliers = ratios[(ratios >= low) & (ratios <= high)]
+                if inliers.size >= 12:
+                    difference = float(np.median(inliers))
+                    mad = float(np.median(np.abs(inliers - difference)))
+                    if np.isfinite(difference) and np.isfinite(mad) and mad <= 0.5:
+                        weight = float(np.sqrt(inliers.size) / (1.0 + mad))
+                        equations.append((left, right, difference, weight))
+            compared += 1
+            if progress_callback is not None:
+                progress_callback(compared, pair_total, "comparing overlaps")
+
+    return _solve_automatic_exposure(
+        frame_count, equations, target_position, cancel_event, progress_callback
+    )
+
+
+def _solve_automatic_exposure(
+    frame_count: int,
+    equations: list[tuple[int, int, float, float]],
+    target_position: int,
+    cancel_event: Event | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> AutomaticExposureResult:
+    """Propagate median pairwise corrections through the overlap graph."""
+
+    if not equations:
+        raise AutomaticExposureAmbiguousError("the poses have no reliable overlapping pixels")
+    corrections = {target_position: 0.0}
+    if progress_callback is not None:
+        progress_callback(0, frame_count - 1, "propagating exposure")
+    while len(corrections) < frame_count:
+        if cancel_event is not None and cancel_event.is_set():
+            raise RenderCancelledError("render cancelled")
+        proposals: dict[int, list[float]] = {}
+        for left, right, difference, _weight in equations:
+            if left in corrections and right not in corrections:
+                proposals.setdefault(right, []).append(corrections[left] + difference)
+            elif right in corrections and left not in corrections:
+                proposals.setdefault(left, []).append(corrections[right] - difference)
+        if not proposals:
+            raise AutomaticExposureAmbiguousError(
+                "some poses are disconnected from the selected target; use manual correction"
+            )
+        for position, candidates in proposals.items():
+            corrections[position] = float(np.median(candidates))
+        if progress_callback is not None:
+            progress_callback(len(corrections) - 1, frame_count - 1, "propagating exposure")
+
+    gains = tuple(float(np.exp(corrections[position])) for position in range(frame_count))
+    changed = tuple(
+        position
+        for position, correction in corrections.items()
+        if position != target_position and abs(correction) > 1e-6
+    )
+    return AutomaticExposureResult(gains, (target_position,), tuple(sorted(changed)))
 
 
 def frame_coverage_masks(

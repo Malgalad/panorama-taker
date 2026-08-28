@@ -13,6 +13,7 @@ from pano_stitch import compositor
 from pano_stitch.compositor import (
     DEFAULT_MEMORY_BUDGET_BYTES,
     MAX_MEMORY_BUDGET_BYTES,
+    AutomaticExposureAmbiguousError,
     CudaSessionCache,
     CudaSessionCacheKey,
     ExposureReport,
@@ -26,9 +27,11 @@ from pano_stitch.compositor import (
     _probe_source,
     _read_native_source,
     _rec2020_to_srgb_linear,
+    _solve_automatic_exposure,
     _to_sdr_srgb,
     _write_exr,
     cuda_session_cache_key,
+    estimate_automatic_exposure_gains,
     estimate_render_resources,
     estimate_target_exposure_gain,
     prepare_cuda_session,
@@ -609,6 +612,62 @@ def test_target_exposure_gain_uses_overlapping_selected_pose(tmp_path: Path) -> 
     cancelled.set()
     with pytest.raises(RenderCancelledError, match="render cancelled"):
         estimate_target_exposure_gain(session, tmp_path, 0, (1,), cancel_event=cancelled)
+
+
+def test_automatic_exposure_propagates_from_target_without_clamping(tmp_path: Path) -> None:
+    frames = tuple(
+        FrameMetadata(position, f"pose-{position}.png", 0.0, 0.0, 0.0, "captured")
+        for position in range(5)
+    )
+    session = SessionMetadata(
+        1, "automatic-exposure", CaptureMode.FULL_SPHERE, 120.0, 90.0, 0.08, frames, True
+    )
+    for position in range(4):
+        Image.new("RGB", (64, 64), (160, 160, 160)).save(tmp_path / f"pose-{position}.png")
+    Image.new("RGB", (64, 64), (40, 40, 40)).save(tmp_path / "pose-4.png")
+
+    progress: list[tuple[int, int, str]] = []
+    result = estimate_automatic_exposure_gains(
+        session, tmp_path, 0, progress_callback=lambda *update: progress.append(update)
+    )
+    repeated = estimate_automatic_exposure_gains(session, tmp_path, 0, result.gains)
+
+    assert result.baseline_positions == (0,)
+    assert result.corrected_positions == (4,)
+    assert result.gains[4] > 2.0
+    assert repeated.corrected_positions == ()
+    assert repeated.gains == pytest.approx((1.0,) * 5)
+    assert progress[-1] == (4, 4, "propagating exposure")
+
+
+def test_automatic_exposure_uses_median_from_corrected_neighbors() -> None:
+    equations = [
+        (0, 1, np.log(2.0), 1.0),
+        (0, 2, np.log(4.0), 1.0),
+        (1, 3, np.log(3.0), 1.0),
+        (2, 3, np.log(1.5), 1.0),
+    ]
+
+    result = _solve_automatic_exposure(4, equations, 0)
+
+    assert result.gains == pytest.approx((1.0, 2.0, 4.0, 6.0))
+
+
+def test_automatic_exposure_accepts_pairwise_aligned_chain() -> None:
+    equations = [(position, position + 1, 0.0, 1.0) for position in range(5)]
+
+    result = _solve_automatic_exposure(6, equations, 2)
+
+    assert result.baseline_positions == (2,)
+    assert result.corrected_positions == ()
+    assert result.gains == (1.0,) * 6
+
+
+def test_automatic_exposure_rejects_poses_disconnected_from_target() -> None:
+    equations = [(0, 1, 0.0, 1.0), (2, 3, 0.0, 1.0)]
+
+    with pytest.raises(AutomaticExposureAmbiguousError, match="disconnected"):
+        _solve_automatic_exposure(4, equations, 0)
 
 
 def test_linear_hdr_highlights_are_not_treated_as_clipped() -> None:
