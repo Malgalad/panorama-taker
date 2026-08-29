@@ -32,4 +32,4 @@ jobs:
           ruff check stitcher/src stitcher/scripts stitcher/tests reshade-addon/tests
           ruff format --check stitcher/src stitcher/scripts stitcher/tests reshade-addon/tests
           mypy stitcher/src
-          pytest -q --ignore=stitcher/tests/test_gpu_runtime.py stitcher/tests reshade-addon/tests
+          pytest -q stitcher/tests reshade-addon/tests

@@ -21,8 +21,8 @@ from PIL import Image, ImageTk
 
 from pano_stitch.compositor import (
     AutomaticExposureAmbiguousError,
-    CudaSessionCache,
     ExposureReport,
+    GpuSessionCache,
     RenderCancelledError,
     estimate_automatic_exposure_gains,
     estimate_render_resources,
@@ -34,7 +34,6 @@ from pano_stitch.compositor import (
     thumbnail_output_path,
     validate_images,
 )
-from pano_stitch.gpu import CudaPreviewDisplay
 from pano_stitch.metadata import SessionMetadata, load_session
 from pano_stitch.sessions import (
     SessionRecord,
@@ -47,8 +46,8 @@ from pano_stitch.sessions import (
 LOGGER = logging.getLogger(__name__)
 MIB = 1024**2
 GIB = 1024**3
-CUDA_BUILD = os.environ.get("PANO_STITCH_BUILD_FLAVOR", "cuda") == "cuda"
-CUDA_PREVIEW_WIDTH_MULTIPLIER = 4
+GPU_BUILD = True
+GPU_PREVIEW_WIDTH_MULTIPLIER = 4
 
 
 class UiState(Enum):
@@ -129,12 +128,12 @@ def _compose_preview_display(
     return Image.fromarray(rgba, mode="RGBA").convert("RGB")
 
 
-def _backend_status(backend: str, detail: str, *, cuda_requested: bool, log_directory: Path) -> str:
+def _backend_status(backend: str, detail: str, *, gpu_requested: bool, log_directory: Path) -> str:
     if backend == "cpu":
-        if cuda_requested:
-            return f"CPU (failed to initialize CUDA; see error log in {log_directory})"
+        if gpu_requested:
+            return f"CPU (failed to initialize GPU; see error log in {log_directory})"
         return "CPU"
-    if backend.startswith("cuda"):
+    if backend.startswith("gpu"):
         _, separator, remainder = detail.partition("reserve=")
         byte_count, unit_separator, _ = remainder.partition(" bytes")
         if separator and unit_separator:
@@ -148,16 +147,16 @@ def _backend_status(backend: str, detail: str, *, cuda_requested: bool, log_dire
                     if reserve_bytes >= GIB
                     else f"{reserve_bytes / MIB:.0f} MB"
                 )
-                return f"CUDA (reserved {reserve} VRAM)"
+                return f"D3D12 (reserved {reserve} VRAM)"
     return f"Backend: {backend.upper()} — {detail}"
 
 
 class StitcherApp:
     """Tkinter UI that delegates all image work to the existing stitcher API."""
 
-    def __init__(self, root: tk.Tk, *, cuda_build: bool = CUDA_BUILD) -> None:
+    def __init__(self, root: tk.Tk, *, gpu_build: bool = GPU_BUILD) -> None:
         self.root = root
-        self.cuda_build = cuda_build
+        self.gpu_build = gpu_build
         self.root.title("Cyberpunk Panorama Stitcher")
         self.root.minsize(680, 400)
         self._events: queue.Queue[tuple[str, Any]] = queue.Queue()
@@ -165,6 +164,7 @@ class StitcherApp:
         self._worker: threading.Thread | None = None
         self._validation_after: str | None = None
         self._close_when_idle = False
+        self._close_finished = False
         self._state = UiState.EMPTY
         self._state_before_busy = UiState.EMPTY
         self._active_operation: str | None = None
@@ -176,7 +176,7 @@ class StitcherApp:
         self._preview_magnified_photo: Any | None = None
         self._preview_image: Image.Image | None = None
         self._preview_overview: Image.Image | None = None
-        self._cuda_preview_display: CudaPreviewDisplay | None = None
+        self._gpu_preview_display: Any = None
         self._preview_viewport = (1, 1)
         self._preview_width = 1
         self._preview_session: SessionMetadata | None = None
@@ -196,7 +196,7 @@ class StitcherApp:
         self._pose_widgets: list[tk.Label] = []
         self._native_output_size: tuple[int, int] | None = None
         self._resolution_geometry: tuple[str, float] | None = None
-        self._cuda_session_cache = CudaSessionCache()
+        self._gpu_session_cache = GpuSessionCache()
         self._build_variables()
         self._load_settings()
         self._build_widgets()
@@ -214,7 +214,7 @@ class StitcherApp:
             self.allow_incomplete_var,
             self.auto_contrast_var,
         ]
-        if self.cuda_build:
+        if self.gpu_build:
             preview_variables.append(self.use_gpu_var)
         for variable in preview_variables:
             variable.trace_add("write", self._preview_option_changed)
@@ -289,8 +289,11 @@ class StitcherApp:
         self._finish_close()
 
     def _finish_close(self) -> None:
-        self._close_cuda_preview_display()
-        self._cuda_session_cache.close()
+        if self._close_finished:
+            return
+        self._close_finished = True
+        self._close_gpu_preview_display()
+        self._gpu_session_cache.close()
         self._save_settings()
         self.root.destroy()
 
@@ -326,7 +329,7 @@ class StitcherApp:
         self.coverage_var = tk.BooleanVar(value=False)
         self.auto_contrast_var = tk.BooleanVar(value=True)
         self.overlay_var = tk.BooleanVar(value=False)
-        self.use_gpu_var = tk.BooleanVar(value=self.cuda_build)
+        self.use_gpu_var = tk.BooleanVar(value=self.gpu_build)
         self.backend_var = tk.StringVar(value="Backend: not selected")
         self.status_var = tk.StringVar(value="Choose a game directory and session.")
 
@@ -541,7 +544,7 @@ class StitcherApp:
         ttk.Checkbutton(
             self.advanced_frame, text="Write coverage diagnostic PNG", variable=self.coverage_var
         ).grid(row=7, column=1, sticky="w", padx=6, pady=3)
-        if self.cuda_build:
+        if self.gpu_build:
             ttk.Checkbutton(
                 self.advanced_frame,
                 text="Use GPU acceleration when available",
@@ -567,7 +570,7 @@ class StitcherApp:
 
         self.progress = ttk.Progressbar(self.left_column, mode="determinate", maximum=100)
         self.progress.pack(fill="x", padx=12, pady=4)
-        if self.cuda_build:
+        if self.gpu_build:
             ttk.Label(self.left_column, textvariable=self.backend_var).pack(
                 fill="x", padx=12, pady=(4, 0)
             )
@@ -841,8 +844,8 @@ class StitcherApp:
         self._sessions = tuple(records)
 
     def _input_changed(self, *_args: object) -> None:
-        self._close_cuda_preview_display()
-        self._cuda_session_cache.invalidate("input changed")
+        self._close_gpu_preview_display()
+        self._gpu_session_cache.invalidate("input changed")
         if self._preview_report is not None:
             self.discard_preview()
         self._validated = False
@@ -867,8 +870,8 @@ class StitcherApp:
     def _start_worker(self, operation: str) -> None:
         if self._state in {UiState.BUSY, UiState.CLOSING}:
             return
-        if operation != "validate":
-            self._close_cuda_preview_display()
+        if operation not in {"validate", "render"}:
+            self._close_gpu_preview_display()
         self._state_before_busy = self._state
         self._state = UiState.BUSY
         self._active_operation = operation
@@ -925,8 +928,8 @@ class StitcherApp:
         self._start_worker(operation)
 
     def discard_preview(self) -> None:
-        self._close_cuda_preview_display()
-        self._cuda_session_cache.invalidate("preview discarded")
+        self._close_gpu_preview_display()
+        self._gpu_session_cache.invalidate("preview discarded")
         self._preview_report = None
         self._preview_photo = None
         self._preview_magnified_photo = None
@@ -1292,9 +1295,9 @@ class StitcherApp:
                     auto_contrast=self.auto_contrast_var.get(),
                     use_gpu=self.use_gpu_var.get(),
                     backend_callback=self._backend_selected,
-                    cuda_session_cache=self._cuda_session_cache,
-                    cuda_session_path=session_path,
-                    cuda_width_multiplier=CUDA_PREVIEW_WIDTH_MULTIPLIER,
+                    gpu_session_cache=self._gpu_session_cache,
+                    gpu_session_path=session_path,
+                    gpu_width_multiplier=GPU_PREVIEW_WIDTH_MULTIPLIER,
                     manual_gains=manual_gains,
                     exposure_report=self._preview_report,
                 )
@@ -1309,11 +1312,11 @@ class StitcherApp:
                     (self._preview_width, mask_height), Image.Resampling.LANCZOS
                 )
                 overview = np.asarray(overview_image, dtype=np.uint8)
-                cuda_display = self._cuda_session_cache.create_preview_display(
+                gpu_display = self._gpu_session_cache.create_preview_display(
                     preview.pixels, overview, masks
                 )
                 self._emit_event(
-                    "preview", (preview, overview, masks, session, manual_gains, cuda_display)
+                    "preview", (preview, overview, masks, session, manual_gains, gpu_display)
                 )
                 if operation == "automatic_exposure":
                     self._emit_event("automatic_exposure_applied", automatic_corrected_poses)
@@ -1341,12 +1344,12 @@ class StitcherApp:
                 exposure_report=self._preview_report,
                 use_gpu=self.use_gpu_var.get(),
                 backend_callback=self._backend_selected,
-                cuda_session_cache=self._cuda_session_cache,
-                cuda_session_path=session_path,
+                gpu_session_cache=self._gpu_session_cache,
+                gpu_session_path=session_path,
                 manual_gains=manual_gains,
             )
             LOGGER.info("render completed: %s", output_path)
-            self._cuda_session_cache.invalidate("render completed")
+            self._gpu_session_cache.invalidate("render completed")
             self._emit_event("stitched", (session.session_id, output_path.name))
             auto_state = (
                 "skipped for EXR"
@@ -1363,16 +1366,20 @@ class StitcherApp:
                 f"Wrote {output_path} (auto contrast: {auto_state}{thumbnail_note})",
             )
         except RenderCancelledError:
-            self._cuda_session_cache.invalidate("render cancelled")
+            self._gpu_session_cache.invalidate("render cancelled")
             LOGGER.info("%s cancelled", operation)
             self._emit_event("cancelled", "Render cancelled; partial files were removed.")
         except AutomaticExposureAmbiguousError as error:
             LOGGER.info("automatic exposure correction not applied: %s", error)
             self._emit_event("automatic_exposure_warning", str(error))
         except Exception as error:
-            self._cuda_session_cache.invalidate("render failed")
+            self._gpu_session_cache.invalidate("render failed")
             LOGGER.exception("%s failed", operation)
-            kind = "match_error" if operation == "match_exposure" else "error"
+            kind = (
+                "match_error"
+                if operation == "match_exposure"
+                else ("render_error" if operation == "render" else "error")
+            )
             self._emit_event(kind, f"{error}\n\nDetails were written to {self._log_path()}")
         finally:
             self._emit_event("idle", "")
@@ -1402,15 +1409,15 @@ class StitcherApp:
                         _backend_status(
                             backend,
                             detail,
-                            cuda_requested=self.use_gpu_var.get(),
+                            gpu_requested=self.use_gpu_var.get(),
                             log_directory=self._log_path().parent,
                         )
                     )
                 elif kind == "preview":
-                    preview, overview, masks, session, manual_gains, cuda_display = payload
+                    preview, overview, masks, session, manual_gains, gpu_display = payload
                     self._preview_image = Image.fromarray(preview.pixels, mode="RGB")
                     self._preview_overview = Image.fromarray(overview, mode="RGB")
-                    self._cuda_preview_display = cuda_display
+                    self._gpu_preview_display = gpu_display
                     overview_height = max(
                         1,
                         round(
@@ -1456,6 +1463,8 @@ class StitcherApp:
                     else:
                         self._preview_magnified_photo = photo
                     self.preview_label.configure(image=photo, text="")
+                    if crop_box is None:
+                        self._expand_window_for_preview()
                 elif kind == "automatic_exposure_applied":
                     if payload:
                         poses = ", ".join(map(str, payload))
@@ -1495,7 +1504,16 @@ class StitcherApp:
                     self._save_settings()
                 elif kind == "error":
                     self.discard_preview()
+                    self._active_operation = None
+                    self._set_busy(False)
                     self.status_var.set(f"Error: {payload}")
+                    messagebox.showerror("Panorama stitcher", payload, parent=self.root)
+                elif kind == "render_error":
+                    self._active_operation = None
+                    self._set_busy(False)
+                    self.discard_preview()
+                    self.progress["value"] = 0
+                    self.status_var.set(f"Render failed: {payload}")
                     messagebox.showerror("Panorama stitcher", payload, parent=self.root)
                 elif kind == "match_error":
                     self.status_var.set(f"Exposure match failed: {payload}")
@@ -1535,7 +1553,17 @@ class StitcherApp:
         self._preview_magnified_photo = None
         self._hovered_poses.clear()
         self._refresh_pose_grid()
+        if self._preview_photo is not None:
+            self.preview_label.configure(image=self._preview_photo, text="")
         self._refresh_preview_display()
+
+    def _expand_window_for_preview(self) -> None:
+        """Grow the window to its preview request without overriding a larger user size."""
+
+        self.root.update_idletasks()
+        width = max(self.root.winfo_width(), self.main_content.winfo_reqwidth())
+        height = max(self.root.winfo_height(), self.main_content.winfo_reqheight())
+        self.root.geometry(f"{width}x{height}")
 
     def _refresh_preview_display(self, crop_box: tuple[int, int, int, int] | None = None) -> None:
         if self._preview_image is None:
@@ -1549,7 +1577,7 @@ class StitcherApp:
                 self._display_generation,
                 self._preview_image,
                 self._preview_overview,
-                self._cuda_preview_display,
+                self._gpu_preview_display,
                 self._preview_viewport,
                 masks,
                 overlay,
@@ -1577,7 +1605,7 @@ class StitcherApp:
                 generation,
                 source,
                 overview,
-                cuda_display,
+                gpu_display,
                 viewport,
                 masks,
                 overlay,
@@ -1586,7 +1614,7 @@ class StitcherApp:
                 target,
                 target_mode,
             ) = request
-            if cuda_display is None:
+            if gpu_display is None:
                 display_source = overview if crop_box is None and overview is not None else source
                 display = _compose_preview_display(
                     display_source,
@@ -1600,20 +1628,20 @@ class StitcherApp:
                 )
             else:
                 try:
-                    pixels = cuda_display.render(crop_box, hovered, target, target_mode, overlay)
+                    pixels = gpu_display.render(crop_box, hovered, target, target_mode, overlay)
                 except RuntimeError:
                     continue
                 display = Image.fromarray(pixels, mode="RGB")
             self._emit_event("preview_display", (generation, display, crop_box))
 
-    def _close_cuda_preview_display(self) -> None:
+    def _close_gpu_preview_display(self) -> None:
         with self._display_lock:
             self._display_generation += 1
             self._display_valid_generation = self._display_generation
             self._display_applied_generation = self._display_generation
             self._display_pending = None
-            display = getattr(self, "_cuda_preview_display", None)
-            self._cuda_preview_display = None
+            display = getattr(self, "_gpu_preview_display", None)
+            self._gpu_preview_display = None
         if display is not None:
             display.close()
 

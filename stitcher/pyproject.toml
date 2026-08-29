@@ -22,11 +22,6 @@ dev = [
   "ruff>=0.6",
   "types-jsonschema>=4.24"
 ]
-gpu = [
-  "cupy-cuda12x>=14,<15",
-  "nvidia-cuda-runtime-cu12>=12,<13",
-  "nvidia-cuda-nvrtc-cu12>=12,<13"
-]
 bundle = [
   "pyinstaller>=6.10"
 ]
@@ -51,3 +46,8 @@ strict = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+  "gpu_contract: platform-independent GPU backend contract test",
+  "windows_warp: native D3D12 integration test that requires Windows WARP",
+  "gpu_hardware: GPU hardware acceptance test",
+]

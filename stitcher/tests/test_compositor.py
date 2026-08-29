@@ -1,12 +1,13 @@
 import logging
 import math
+import re
 from pathlib import Path
 from threading import Event
-from types import SimpleNamespace
 
 import cv2
 import numpy as np
 import pytest
+from conftest import single_frame_session, write_gradient_source
 from PIL import Image
 
 from pano_stitch import compositor
@@ -14,10 +15,10 @@ from pano_stitch.compositor import (
     DEFAULT_MEMORY_BUDGET_BYTES,
     MAX_MEMORY_BUDGET_BYTES,
     AutomaticExposureAmbiguousError,
-    CudaSessionCache,
-    CudaSessionCacheKey,
     ExposureReport,
+    GpuSessionCache,
     RenderCancelledError,
+    ResidentSessionBackendIdentity,
     SourceInfo,
     _auto_contrast_levels,
     _choose_strip_height,
@@ -30,19 +31,19 @@ from pano_stitch.compositor import (
     _solve_automatic_exposure,
     _to_sdr_srgb,
     _write_exr,
-    cuda_session_cache_key,
+    d3d12_session_cache_key,
     estimate_automatic_exposure_gains,
     estimate_render_resources,
     estimate_target_exposure_gain,
-    prepare_cuda_session,
+    gpu_session_cache_key,
     render_preview,
     render_session,
     validate_images,
 )
 from pano_stitch.gpu import (
     BackendSelection,
-    CudaMemoryPlan,
-    CudaPreflightError,
+    GpuMemoryPlan,
+    GpuPreflightError,
 )
 from pano_stitch.metadata import CaptureMode, FrameMetadata, ImageEncoding, SessionMetadata
 from pano_stitch.planner import plan_shots
@@ -228,7 +229,7 @@ def test_render_preview_returns_sdr_pixels_and_exposure_report(tmp_path: Path) -
         allow_incomplete=True,
         auto_contrast=True,
         use_gpu=False,
-        cuda_width_multiplier=4,
+        gpu_width_multiplier=4,
     )
 
     assert result.pixels.shape == (4, 24, 3)
@@ -237,39 +238,143 @@ def test_render_preview_returns_sdr_pixels_and_exposure_report(tmp_path: Path) -
     assert not any(tmp_path.glob("pano-preview-*"))
 
 
-def test_render_preview_applies_width_multiplier_only_to_selected_cuda(
+def test_render_preview_applies_width_multiplier_only_to_selected_gpu(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
     session = SessionMetadata(
-        1, "cuda-preview-size", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (frame,), True
+        1, "gpu-preview-size", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (frame,), True
     )
     Image.new("RGB", (32, 16), (128, 64, 32)).save(tmp_path / frame.filename)
-    plan = CudaMemoryPlan(1, 1, 1, 1, 1, None, 1, 1)
+    plan = GpuMemoryPlan(1, 1, 1, 1, 1, None, 1, 1)
     dimensions: list[tuple[int, int]] = []
 
     monkeypatch.setattr(
         compositor,
-        "select_cuda_backend",
-        lambda **_kwargs: (BackendSelection("cuda", "test", "resident", 1, 1, "test"), plan),
+        "select_gpu_backend",
+        lambda **_kwargs: (BackendSelection("gpu", "test", "resident", 1, 1, "test"), plan),
     )
-    monkeypatch.setattr(compositor, "compile_cuda_module", lambda: None)
 
-    def render_cuda(*args: object, **_kwargs: object) -> compositor.PreviewResult:
+    def render_gpu(*args: object, **_kwargs: object) -> compositor.PreviewResult:
         width, height = int(args[4]), int(args[5])
         dimensions.append((width, height))
         return compositor.PreviewResult(
             np.zeros((height, width, 3), dtype=np.uint8), ExposureReport(0, 0, (1.0,))
         )
 
-    monkeypatch.setattr(compositor, "_render_cuda", render_cuda)
+    monkeypatch.setattr(compositor, "_render_d3d12_resident", render_gpu)
 
     result = render_preview(
-        session, tmp_path, 24, ".png", allow_incomplete=True, cuda_width_multiplier=4
+        session, tmp_path, 24, ".png", allow_incomplete=True, gpu_width_multiplier=4
     )
 
     assert dimensions == [(96, 16)]
     assert result.pixels.shape == (16, 96, 3)
+
+
+def test_render_preview_routes_selected_d3d12_to_in_memory_pixels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
+    session = SessionMetadata(
+        1, "d3d12-preview", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (frame,), True
+    )
+    Image.new("RGB", (32, 16), (128, 64, 32)).save(tmp_path / frame.filename)
+    plan = GpuMemoryPlan(1, 1, 1, 1, 1, None, 1, 1)
+    expected = compositor.PreviewResult(
+        np.zeros((8, 24, 3), dtype=np.uint8), ExposureReport(0, 0, (1.0,))
+    )
+    calls: list[bool] = []
+    monkeypatch.setattr(
+        compositor,
+        "select_gpu_backend",
+        lambda **_kwargs: (BackendSelection("gpu", "test", "resident", 1, 1, "test"), plan),
+    )
+    monkeypatch.setattr(
+        compositor,
+        "_render_d3d12_resident",
+        lambda *_args, **kwargs: calls.append(bool(kwargs["return_preview"])) or expected,
+    )
+    monkeypatch.setattr(
+        compositor, "_render_cpu", lambda *_args: pytest.fail("CPU preview is forbidden")
+    )
+
+    result = render_preview(
+        session,
+        tmp_path,
+        24,
+        ".png",
+        allow_incomplete=True,
+        auto_contrast=False,
+        strict_gpu=True,
+    )
+
+    assert result is expected
+    assert calls == [True]
+    assert not list(tmp_path.glob("pano-preview-*"))
+
+
+def test_d3d12_cache_creates_generation_aware_preview_display(tmp_path: Path) -> None:
+    session = single_frame_session(session_id="d3d12-cache")
+    Image.new("RGB", (2, 1), (0, 0, 0)).save(tmp_path / "frame.png")
+    key = d3d12_session_cache_key(
+        device_name="adapter",
+        adapter_luid=44,
+        session_path=tmp_path / "session.json",
+        session=session,
+        image_root=tmp_path,
+        gpu_memory_budget_bytes=None,
+    )
+    calls: list[object] = []
+
+    class Token:
+        def close(self) -> None:
+            calls.append("token_close")
+
+    class Preview:
+        def set_generation(self, generation: int) -> None:
+            calls.append(("generation", generation))
+
+        def render_base(self, destination: bytearray, **_kwargs: object) -> None:
+            destination[:] = bytes(len(destination))
+            calls.append("base")
+
+        def render_overlay(self, destination: bytearray, **kwargs: object) -> None:
+            destination[:] = bytes(len(destination))
+            calls.append(("overlay", kwargs["target_pose"], bytes(kwargs["hovered_frames"])))
+
+        def close(self) -> None:
+            calls.append("preview_close")
+
+    class Prepared:
+        def create_preview(self, **_kwargs: object) -> Preview:
+            calls.append("create_preview")
+            return Preview()
+
+        def create_cancellation_token(self) -> Token:
+            return Token()
+
+        def close(self) -> None:
+            calls.append("prepared_close")
+
+    cache = GpuSessionCache()
+    prepared = Prepared()
+    cache.store_d3d12(key, prepared)
+    assert cache.get_d3d12(key) is prepared
+    display = cache.create_preview_display(
+        np.zeros((1, 2, 3), dtype=np.uint8),
+        np.zeros((1, 2, 3), dtype=np.uint8),
+        (np.ones((1, 2), dtype=np.bool_),),
+    )
+
+    assert display.render(None, frozenset(), None, False, False).shape == (1, 2, 3)
+    assert display.render(None, frozenset({0}), 0, True, True).shape == (1, 2, 3)
+    display.close()
+    cache.close()
+
+    assert ("generation", 1) in calls and ("generation", 2) in calls
+    assert ("overlay", 0, b"\x01") in calls
+    assert calls[-3:] == ["preview_close", "token_close", "prepared_close"]
 
 
 def test_render_session_reports_selected_cpu_backend(
@@ -319,12 +424,12 @@ def test_render_session_dispatches_once_to_cpu_pipeline(monkeypatch: pytest.Monk
     assert calls[0][15] is False
 
 
-def test_cuda_preflight_failure_restarts_once_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_gpu_preflight_failure_restarts_once_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
     frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
     session = SessionMetadata(
         1, "preflight", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (frame,), True
     )
-    plan = CudaMemoryPlan(1, 1, 1, 1, 1, None, 1, 1)
+    plan = GpuMemoryPlan(1, 1, 1, 1, 1, None, 1, 1)
     expected = ExposureReport(0, 0, (1.0,))
     cpu_calls: list[tuple[object, ...]] = []
 
@@ -336,14 +441,13 @@ def test_cuda_preflight_failure_restarts_once_on_cpu(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(compositor, "_output_dimensions", lambda *_args: (1, 1))
     monkeypatch.setattr(
         compositor,
-        "select_cuda_backend",
-        lambda **_kwargs: (BackendSelection("cuda", "test", "resident", 1, 1, "test"), plan),
+        "select_gpu_backend",
+        lambda **_kwargs: (BackendSelection("gpu", "test", "resident", 1, 1, "test"), plan),
     )
-    monkeypatch.setattr(compositor, "compile_cuda_module", lambda: None)
     monkeypatch.setattr(
         compositor,
-        "_render_cuda",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(CudaPreflightError("upload failed")),
+        "_render_d3d12_resident",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(GpuPreflightError("upload failed")),
     )
     monkeypatch.setattr(
         compositor,
@@ -358,12 +462,12 @@ def test_cuda_preflight_failure_restarts_once_on_cpu(monkeypatch: pytest.MonkeyP
     assert cpu_calls[0][15] is False
 
 
-def test_cuda_preflight_failure_is_strict_when_requested(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_gpu_preflight_failure_is_strict_when_requested(monkeypatch: pytest.MonkeyPatch) -> None:
     frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
     session = SessionMetadata(
         1, "preflight-strict", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (frame,), True
     )
-    plan = CudaMemoryPlan(1, 1, 1, 1, 1, None, 1, 1)
+    plan = GpuMemoryPlan(1, 1, 1, 1, 1, None, 1, 1)
 
     monkeypatch.setattr(
         compositor,
@@ -373,21 +477,687 @@ def test_cuda_preflight_failure_is_strict_when_requested(monkeypatch: pytest.Mon
     monkeypatch.setattr(compositor, "_output_dimensions", lambda *_args: (1, 1))
     monkeypatch.setattr(
         compositor,
-        "select_cuda_backend",
-        lambda **_kwargs: (BackendSelection("cuda", "test", "resident", 1, 1, "test"), plan),
+        "select_gpu_backend",
+        lambda **_kwargs: (BackendSelection("gpu", "test", "resident", 1, 1, "test"), plan),
     )
-    monkeypatch.setattr(compositor, "compile_cuda_module", lambda: None)
     monkeypatch.setattr(
         compositor,
-        "_render_cuda",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(CudaPreflightError("upload failed")),
+        "_render_d3d12_resident",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(GpuPreflightError("upload failed")),
     )
     monkeypatch.setattr(
         compositor, "_render_cpu", lambda *_args: pytest.fail("CPU fallback is forbidden")
     )
 
-    with pytest.raises(CudaPreflightError, match="upload failed"):
+    with pytest.raises(GpuPreflightError, match="upload failed"):
         render_session(session, Path("images"), Path("output.png"), width=1, strict_gpu=True)
+
+
+def test_gpu_post_dispatch_failure_never_restarts_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
+    session = SessionMetadata(
+        1, "post-dispatch", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (frame,), True
+    )
+    plan = GpuMemoryPlan(1, 1, 1, 1, 1, None, 1, 1)
+
+    monkeypatch.setattr(
+        compositor,
+        "_source_info_for_session",
+        lambda *_args: SourceInfo(1, 1, ImageEncoding("uint8", "srgb", "srgb")),
+    )
+    monkeypatch.setattr(compositor, "_output_dimensions", lambda *_args: (1, 1))
+    monkeypatch.setattr(
+        compositor,
+        "select_gpu_backend",
+        lambda **_kwargs: (BackendSelection("gpu", "test", "resident", 1, 1, "test"), plan),
+    )
+    from pano_stitch.d3d12_adapter import D3D12AdapterUnavailableError
+
+    monkeypatch.setattr(
+        compositor,
+        "_render_d3d12_resident",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            D3D12AdapterUnavailableError("dispatch failed")
+        ),
+    )
+    monkeypatch.setattr(
+        compositor, "_render_cpu", lambda *_args: pytest.fail("CPU fallback is forbidden")
+    )
+
+    with pytest.raises(D3D12AdapterUnavailableError, match="dispatch failed"):
+        render_session(session, Path("images"), Path("output.png"), width=1)
+
+
+@pytest.mark.parametrize("strict", (False, True))
+def test_d3d12_preflight_failure_falls_back_only_when_not_strict(
+    monkeypatch: pytest.MonkeyPatch, strict: bool
+) -> None:
+    frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
+    session = SessionMetadata(
+        1, "d3d12-preflight", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (frame,), True
+    )
+    plan = GpuMemoryPlan(1, 1, 1, 1, 1, None, 1, 1)
+    expected = ExposureReport(0, 0, (1.0,))
+    cpu_calls: list[bool] = []
+    monkeypatch.setattr(
+        compositor,
+        "_source_info_for_session",
+        lambda *_args: SourceInfo(1, 1, ImageEncoding("uint8", "srgb", "srgb")),
+    )
+    monkeypatch.setattr(compositor, "_output_dimensions", lambda *_args: (1, 1))
+    monkeypatch.setattr(
+        compositor,
+        "select_gpu_backend",
+        lambda **_kwargs: (BackendSelection("gpu", "test", "resident", 1, 1, "test"), plan),
+    )
+    monkeypatch.setattr(
+        compositor,
+        "_render_d3d12_resident",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(GpuPreflightError("device failed")),
+    )
+    monkeypatch.setattr(
+        compositor,
+        "_render_cpu",
+        lambda *_args: cpu_calls.append(True) or expected,
+    )
+
+    if strict:
+        with pytest.raises(GpuPreflightError, match="device failed"):
+            render_session(
+                session,
+                Path("images"),
+                Path("output.png"),
+                width=1,
+                auto_contrast=False,
+                strict_gpu=True,
+            )
+        assert not cpu_calls
+    else:
+        assert (
+            render_session(
+                session,
+                Path("images"),
+                Path("output.png"),
+                width=1,
+                auto_contrast=False,
+            )
+            == expected
+        )
+        assert cpu_calls == [True]
+
+
+def test_d3d12_post_dispatch_failure_never_restarts_on_cpu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pano_stitch.d3d12_adapter import D3D12AdapterUnavailableError
+
+    frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
+    session = SessionMetadata(
+        1, "d3d12-dispatch", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (frame,), True
+    )
+    plan = GpuMemoryPlan(1, 1, 1, 1, 1, None, 1, 1)
+    monkeypatch.setattr(
+        compositor,
+        "_source_info_for_session",
+        lambda *_args: SourceInfo(1, 1, ImageEncoding("uint8", "srgb", "srgb")),
+    )
+    monkeypatch.setattr(compositor, "_output_dimensions", lambda *_args: (1, 1))
+    monkeypatch.setattr(
+        compositor,
+        "select_gpu_backend",
+        lambda **_kwargs: (BackendSelection("gpu", "test", "resident", 1, 1, "test"), plan),
+    )
+    monkeypatch.setattr(
+        compositor,
+        "_render_d3d12_resident",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            D3D12AdapterUnavailableError("dispatch failed")
+        ),
+    )
+    monkeypatch.setattr(
+        compositor, "_render_cpu", lambda *_args: pytest.fail("CPU fallback is forbidden")
+    )
+
+    with pytest.raises(D3D12AdapterUnavailableError, match="dispatch failed"):
+        render_session(
+            session,
+            Path("images"),
+            Path("output.png"),
+            width=1,
+            auto_contrast=False,
+        )
+
+
+@pytest.mark.parametrize("after_dispatch", (False, True))
+@pytest.mark.parametrize(
+    "message",
+    (
+        "cannot create D3D12 hard-composite frame buffers",
+        "D3D12 device removed (HRESULT 0x887a0005; device reason 0x887a0007)",
+    ),
+)
+def test_d3d12_allocation_failure_fallback_depends_only_on_dispatch_boundary(
+    monkeypatch: pytest.MonkeyPatch, after_dispatch: bool, message: str
+) -> None:
+    from pano_stitch.d3d12_adapter import D3D12AdapterUnavailableError
+
+    frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
+    session = SessionMetadata(
+        1, "d3d12-allocation-boundary", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (frame,), True
+    )
+    plan = GpuMemoryPlan(1, 1, 1, 1, 1, None, 1, 1)
+    cpu_calls: list[bool] = []
+    monkeypatch.setattr(
+        compositor,
+        "_source_info_for_session",
+        lambda *_args: SourceInfo(1, 1, ImageEncoding("uint8", "srgb", "srgb")),
+    )
+    monkeypatch.setattr(compositor, "_output_dimensions", lambda *_args: (1, 1))
+    monkeypatch.setattr(
+        compositor,
+        "select_gpu_backend",
+        lambda **_kwargs: (BackendSelection("gpu", "test", "resident", 1, 1, "test"), plan),
+    )
+    error: Exception = (
+        D3D12AdapterUnavailableError(message) if after_dispatch else GpuPreflightError(message)
+    )
+    monkeypatch.setattr(
+        compositor,
+        "_render_d3d12_resident",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(error),
+    )
+    expected = ExposureReport(0, 0, (1.0,))
+    monkeypatch.setattr(
+        compositor, "_render_cpu", lambda *_args: cpu_calls.append(True) or expected
+    )
+
+    if after_dispatch:
+        with pytest.raises(D3D12AdapterUnavailableError, match=re.escape(message)):
+            render_session(session, Path("images"), Path("output.png"), width=1)
+        assert cpu_calls == []
+    else:
+        assert render_session(session, Path("images"), Path("output.png"), width=1) == expected
+        assert cpu_calls == [True]
+
+
+def test_d3d12_thumbnail_uses_retained_rectilinear_render_and_staged_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
+    session = SessionMetadata(
+        1, "d3d12-thumbnail", CaptureMode.FULL_SPHERE, 90.0, 60.0, 0.08, (frame,), True
+    )
+    plan = GpuMemoryPlan(1, 1, 1, 1, 1, None, 1, 1)
+    calls: list[tuple[Path, dict[str, object]]] = []
+    monkeypatch.setattr(
+        compositor,
+        "_source_info_for_session",
+        lambda *_args: SourceInfo(4, 2, ImageEncoding("uint8", "srgb", "srgb")),
+    )
+    monkeypatch.setattr(compositor, "_output_dimensions", lambda *_args: (8, 4))
+    monkeypatch.setattr(
+        compositor,
+        "select_gpu_backend",
+        lambda **_kwargs: (BackendSelection("gpu", "test", "resident", 1, 1, "test"), plan),
+    )
+
+    def render(*args: object, **kwargs: object) -> ExposureReport:
+        path = args[2]
+        assert isinstance(path, Path)
+        calls.append((path, kwargs))
+        path.write_bytes(b"thumbnail" if kwargs.get("rectilinear_output") else b"panorama")
+        return ExposureReport(0, 0, (1.0,))
+
+    monkeypatch.setattr(compositor, "_render_d3d12_resident", render)
+    monkeypatch.setattr(
+        compositor, "_render_cpu", lambda *_args: pytest.fail("CPU fallback is forbidden")
+    )
+    output_path = tmp_path / "output.png"
+
+    render_session(
+        session,
+        tmp_path,
+        output_path,
+        width=8,
+        auto_contrast=False,
+        session_thumbnail=True,
+    )
+
+    assert output_path.read_bytes() == b"panorama"
+    assert compositor.thumbnail_output_path(output_path).read_bytes() == b"thumbnail"
+    assert len(calls) == 2
+    assert calls[1][1]["rectilinear_output"] is True
+    assert calls[1][1]["output_vertical_fov_degrees"] == pytest.approx(53.130102)
+
+
+def test_d3d12_thumbnail_failure_preserves_existing_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pano_stitch.d3d12_adapter import D3D12AdapterUnavailableError
+
+    frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
+    session = SessionMetadata(
+        1, "d3d12-thumbnail-failure", CaptureMode.FULL_SPHERE, 90.0, 60.0, 0.08, (frame,), True
+    )
+    plan = GpuMemoryPlan(1, 1, 1, 1, 1, None, 1, 1)
+    monkeypatch.setattr(
+        compositor,
+        "_source_info_for_session",
+        lambda *_args: SourceInfo(4, 2, ImageEncoding("uint8", "srgb", "srgb")),
+    )
+    monkeypatch.setattr(compositor, "_output_dimensions", lambda *_args: (8, 4))
+    monkeypatch.setattr(
+        compositor,
+        "select_gpu_backend",
+        lambda **_kwargs: (BackendSelection("gpu", "test", "resident", 1, 1, "test"), plan),
+    )
+
+    def render(*args: object, **kwargs: object) -> ExposureReport:
+        path = args[2]
+        assert isinstance(path, Path)
+        if kwargs.get("rectilinear_output"):
+            raise D3D12AdapterUnavailableError("thumbnail failed")
+        path.write_bytes(b"new panorama")
+        return ExposureReport(0, 0, (1.0,))
+
+    monkeypatch.setattr(compositor, "_render_d3d12_resident", render)
+    monkeypatch.setattr(
+        compositor, "_render_cpu", lambda *_args: pytest.fail("CPU fallback is forbidden")
+    )
+    output_path = tmp_path / "output.png"
+    thumbnail_path = compositor.thumbnail_output_path(output_path)
+    output_path.write_bytes(b"old panorama")
+    thumbnail_path.write_bytes(b"old thumbnail")
+
+    with pytest.raises(D3D12AdapterUnavailableError, match="thumbnail failed"):
+        render_session(
+            session,
+            tmp_path,
+            output_path,
+            width=8,
+            auto_contrast=False,
+            session_thumbnail=True,
+        )
+
+    assert output_path.read_bytes() == b"old panorama"
+    assert thumbnail_path.read_bytes() == b"old thumbnail"
+    assert sorted(path.name for path in tmp_path.iterdir()) == sorted(
+        (output_path.name, thumbnail_path.name)
+    )
+
+
+@pytest.mark.parametrize("failed_output", ("coverage", "thumbnail", "panorama"))
+def test_d3d12_multi_output_publication_rolls_back_every_existing_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failed_output: str
+) -> None:
+    frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
+    session = SessionMetadata(
+        1, "d3d12-publication-failure", CaptureMode.FULL_SPHERE, 90.0, 60.0, 0.08, (frame,), True
+    )
+    plan = GpuMemoryPlan(1, 1, 1, 1, 1, None, 1, 1)
+    monkeypatch.setattr(
+        compositor,
+        "_source_info_for_session",
+        lambda *_args: SourceInfo(4, 2, ImageEncoding("uint8", "srgb", "srgb")),
+    )
+    monkeypatch.setattr(compositor, "_output_dimensions", lambda *_args: (8, 4))
+    monkeypatch.setattr(
+        compositor,
+        "select_gpu_backend",
+        lambda **_kwargs: (BackendSelection("gpu", "test", "resident", 1, 1, "test"), plan),
+    )
+
+    def render(*args: object, **kwargs: object) -> ExposureReport:
+        path = args[2]
+        assert isinstance(path, Path)
+        if kwargs.get("rectilinear_output"):
+            path.write_bytes(b"new thumbnail")
+        else:
+            path.write_bytes(b"new panorama")
+            coverage = kwargs.get("debug_coverage_path")
+            assert isinstance(coverage, Path)
+            coverage.write_bytes(b"new coverage")
+        return ExposureReport(0, 0, (1.0,))
+
+    monkeypatch.setattr(compositor, "_render_d3d12_resident", render)
+    monkeypatch.setattr(
+        compositor, "_render_cpu", lambda *_args: pytest.fail("CPU fallback is forbidden")
+    )
+    output_path = tmp_path / "output.png"
+    destinations = {
+        "panorama": output_path,
+        "thumbnail": compositor.thumbnail_output_path(output_path),
+        "coverage": tmp_path / "coverage.png",
+    }
+    old_contents = {name: f"old {name}".encode() for name in destinations}
+    for name, path in destinations.items():
+        path.write_bytes(old_contents[name])
+    real_replace = compositor.os.replace
+    failed = False
+
+    def fail_one_publication(source: object, destination: object) -> None:
+        nonlocal failed
+        source_path = Path(source)  # type: ignore[arg-type]
+        destination_path = Path(destination)  # type: ignore[arg-type]
+        if (
+            not failed
+            and destination_path == destinations[failed_output]
+            and source_path.read_bytes().startswith(b"new ")
+        ):
+            failed = True
+            raise OSError("injected publication failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(compositor.os, "replace", fail_one_publication)
+
+    class Cache:
+        invalidations: list[str] = []
+
+        def invalidate(self, reason: str) -> None:
+            self.invalidations.append(reason)
+
+    cache = Cache()
+
+    with pytest.raises(OSError, match="injected publication failure"):
+        render_session(
+            session,
+            tmp_path,
+            output_path,
+            width=8,
+            auto_contrast=False,
+            session_thumbnail=True,
+            debug_coverage_path=destinations["coverage"],
+            gpu_session_cache=cache,
+        )
+
+    assert failed is True
+    assert cache.invalidations == ["render failed"]
+    for name, path in destinations.items():
+        assert path.read_bytes() == old_contents[name]
+    assert sorted(path.name for path in tmp_path.iterdir()) == sorted(
+        path.name for path in destinations.values()
+    )
+
+
+def test_d3d12_multi_output_cancellation_removes_stages_and_preserves_outputs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
+    session = SessionMetadata(
+        1, "d3d12-publication-cancel", CaptureMode.FULL_SPHERE, 90.0, 60.0, 0.08, (frame,), True
+    )
+    plan = GpuMemoryPlan(1, 1, 1, 1, 1, None, 1, 1)
+    cancelled = Event()
+    monkeypatch.setattr(
+        compositor,
+        "_source_info_for_session",
+        lambda *_args: SourceInfo(4, 2, ImageEncoding("uint8", "srgb", "srgb")),
+    )
+    monkeypatch.setattr(compositor, "_output_dimensions", lambda *_args: (8, 4))
+    monkeypatch.setattr(
+        compositor,
+        "select_gpu_backend",
+        lambda **_kwargs: (BackendSelection("gpu", "test", "resident", 1, 1, "test"), plan),
+    )
+
+    def render(*args: object, **kwargs: object) -> ExposureReport:
+        path = args[2]
+        assert isinstance(path, Path)
+        if kwargs.get("rectilinear_output"):
+            path.write_bytes(b"new thumbnail")
+            cancelled.set()
+        else:
+            path.write_bytes(b"new panorama")
+            coverage = kwargs.get("debug_coverage_path")
+            assert isinstance(coverage, Path)
+            coverage.write_bytes(b"new coverage")
+        return ExposureReport(0, 0, (1.0,))
+
+    monkeypatch.setattr(compositor, "_render_d3d12_resident", render)
+    monkeypatch.setattr(
+        compositor, "_render_cpu", lambda *_args: pytest.fail("CPU fallback is forbidden")
+    )
+    output_path = tmp_path / "output.png"
+    destinations = (
+        output_path,
+        compositor.thumbnail_output_path(output_path),
+        tmp_path / "coverage.png",
+    )
+    for path in destinations:
+        path.write_bytes(f"old {path.name}".encode())
+
+    class Cache:
+        invalidations: list[str] = []
+
+        def invalidate(self, reason: str) -> None:
+            self.invalidations.append(reason)
+
+    cache = Cache()
+
+    with pytest.raises(RenderCancelledError, match="render cancelled"):
+        render_session(
+            session,
+            tmp_path,
+            output_path,
+            width=8,
+            auto_contrast=False,
+            session_thumbnail=True,
+            debug_coverage_path=destinations[2],
+            cancel_event=cancelled,
+            gpu_session_cache=cache,
+        )
+
+    assert cache.invalidations == ["render cancelled"]
+    for path in destinations:
+        assert path.read_bytes() == f"old {path.name}".encode()
+    assert sorted(path.name for path in tmp_path.iterdir()) == sorted(
+        path.name for path in destinations
+    )
+
+
+@pytest.mark.parametrize(
+    (
+        "suffix",
+        "encoding",
+        "expected_conversion",
+        "floating_point",
+        "auto_contrast",
+        "band_rows",
+        "compose_count",
+    ),
+    [
+        (".png", ImageEncoding("uint8", "srgb", "srgb"), "apply", False, False, None, 1),
+        (
+            ".jpg",
+            ImageEncoding("uint16", "rec2020", "pq", 203.0),
+            "tone_map",
+            False,
+            False,
+            None,
+            1,
+        ),
+        (
+            ".exr",
+            ImageEncoding("float32", "rec2020", "linear", 203.0),
+            "copy",
+            True,
+            False,
+            None,
+            1,
+        ),
+        (".png", ImageEncoding("uint8", "srgb", "srgb"), "apply", False, True, 1, 4),
+        (".png", ImageEncoding("uint8", "srgb", "srgb"), "apply", False, False, 1024, 3),
+        (
+            ".png",
+            ImageEncoding("uint16", "rec2020", "pq", 203.0),
+            "tone_map",
+            False,
+            True,
+            None,
+            2,
+        ),
+    ],
+)
+def test_d3d12_resident_final_output_routes_conversion_and_staged_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    suffix: str,
+    encoding: ImageEncoding,
+    expected_conversion: str,
+    floating_point: bool,
+    auto_contrast: bool,
+    band_rows: int | None,
+    compose_count: int,
+) -> None:
+    frame = FrameMetadata(0, "frame.source", 0.0, 0.0, 0.0, "captured")
+    session = SessionMetadata(
+        1, "d3d12-resident", CaptureMode.FULL_SPHERE, 90.0, 90.0, 0.08, (frame,), True
+    )
+    calls: list[str] = []
+    row_ranges: list[tuple[int, int]] = []
+    output_height = 2500 if band_rows == 1024 else (2 if band_rows else 2048)
+
+    class Token:
+        handle = None
+
+        def cancel(self) -> None:
+            calls.append("cancel")
+
+        def close(self) -> None:
+            calls.append("token_close")
+
+    class Output:
+        def compose(self, frame_requests: object, **_kwargs: object) -> None:
+            calls.append("compose")
+            request = tuple(frame_requests)[0]  # type: ignore[arg-type]
+            row_ranges.append((request.row_start, request.row_count))
+
+        def prepare_auto_contrast(self) -> None:
+            calls.append("prepare_histogram")
+
+        def accumulate_auto_contrast_srgb(self, *, converted: bool = False) -> None:
+            calls.append("accumulate_histogram_converted" if converted else "accumulate_histogram")
+
+        def select_auto_contrast_levels(self) -> object:
+            return type("Levels", (), {"processed_pixels": 4 * output_height})()
+
+        def apply_auto_contrast_srgb(self, **_kwargs: object) -> None:
+            calls.append("apply")
+
+        def quantize_srgb8(self) -> None:
+            calls.append("quantize")
+
+        def tone_map_rec2020(self, _nits: float) -> None:
+            calls.append("tone_map")
+
+        def convert_tone_mapped_rec2020_to_linear_srgb(self) -> None:
+            calls.append("convert_rec2020")
+
+        def copy_linear_float(self) -> None:
+            calls.append("copy")
+
+        def download(self, destination: memoryview, **kwargs: object) -> None:
+            calls.append("download_float" if kwargs["floating_point"] else "download_srgb8")
+            destination.cast("B")[:] = bytes(destination.nbytes)
+
+        def download_coverage(self, destination: memoryview, **_kwargs: object) -> None:
+            calls.append("download_coverage")
+            destination.cast("B")[:] = bytes([1]) * destination.nbytes
+
+        def close(self) -> None:
+            calls.append("output_close")
+
+    class Prepared:
+        def create_cancellation_token(self) -> Token:
+            return Token()
+
+        def solve_exposure(self, **_kwargs: object) -> None:
+            calls.append("solve_exposure")
+
+        def create_output(self, _options: object) -> Output:
+            calls.append("create_output")
+            return Output()
+
+        def close(self) -> None:
+            calls.append("prepared_close")
+
+    class Adapter:
+        def probe(self) -> object:
+            return type("Device", (), {"luid": 44})()
+
+        def create_cancellation_token(self) -> Token:
+            return Token()
+
+        def prepare_session(self, **kwargs: object) -> Prepared:
+            assert len(tuple(kwargs["frames"])) == 1  # type: ignore[arg-type]
+            calls.append("prepare_session")
+            return Prepared()
+
+    monkeypatch.setattr("pano_stitch.d3d12_adapter.load_d3d12_adapter", lambda: Adapter())
+    monkeypatch.setattr(
+        compositor,
+        "_read_native_source",
+        lambda *_args: np.zeros((2, 4, 3), dtype=np.dtype(encoding.sample_type)),
+    )
+    monkeypatch.setattr(
+        compositor,
+        "_write_exr",
+        lambda path, _pixels, _encoding: path.write_bytes(b"exr"),
+    )
+    output_path = tmp_path / f"output{suffix}"
+    coverage_path = (
+        tmp_path / "coverage.png"
+        if suffix == ".png" and not auto_contrast and band_rows is None
+        else None
+    )
+
+    report = compositor._render_d3d12_resident(
+        session,
+        tmp_path,
+        output_path,
+        SourceInfo(4, 2, encoding),
+        4,
+        output_height,
+        "hard",
+        False,
+        suffix,
+        95,
+        auto_contrast,
+        None,
+        None,
+        GpuMemoryPlan(1, 1, 104, 1, 1, band_rows, 1, 1),
+        None,
+        debug_coverage_path=coverage_path,
+    )
+
+    assert output_path.is_file()
+    assert report.gains == (1.0,)
+    assert calls.count("solve_exposure") == 1
+    assert calls.index("compose") < calls.index(expected_conversion)
+    assert calls.count("compose") == compose_count
+    if band_rows is None:
+        expected_ranges = [(0, output_height)]
+    else:
+        expected_ranges = [
+            (row_start, min(band_rows, output_height - row_start))
+            for row_start in range(0, output_height, band_rows)
+        ]
+    if auto_contrast:
+        expected_ranges *= 2
+    assert row_ranges == expected_ranges
+    expected_downloads = len(expected_ranges) // (2 if auto_contrast else 1)
+    assert calls.count("download_float" if floating_point else "download_srgb8") == (
+        expected_downloads
+    )
+    if auto_contrast and encoding.transfer_function == "pq":
+        assert "accumulate_histogram_converted" in calls
+    assert ("download_float" in calls) is floating_point
+    assert calls[-3:] == ["output_close", "prepared_close", "token_close"]
+    if coverage_path is not None:
+        with Image.open(coverage_path) as coverage:
+            assert np.all(np.asarray(coverage) == 255)
 
 
 def test_native_source_decoder_preserves_png_samples(tmp_path: Path) -> None:
@@ -401,7 +1171,7 @@ def test_native_source_decoder_preserves_png_samples(tmp_path: Path) -> None:
     np.testing.assert_array_equal(actual, pixels)
 
 
-def test_cuda_session_cache_key_tracks_sources_geometry_and_gpu_options(tmp_path: Path) -> None:
+def test_gpu_session_cache_key_tracks_sources_geometry_and_gpu_options(tmp_path: Path) -> None:
     frame = FrameMetadata(0, "frame.png", 0.0, 0.0, 0.0, "captured")
     session = SessionMetadata(
         1, "cache-key", CaptureMode.HORIZONTAL, 90.0, 60.0, 0.08, (frame,), True
@@ -417,53 +1187,31 @@ def test_cuda_session_cache_key_tracks_sources_geometry_and_gpu_options(tmp_path
         "gpu_memory_budget_bytes": 1024,
     }
 
-    original = cuda_session_cache_key(**kwargs)
-    assert original == cuda_session_cache_key(**kwargs)
+    original = gpu_session_cache_key(**kwargs)
+    assert original == gpu_session_cache_key(**kwargs)
+    assert original.backend_identity == ResidentSessionBackendIdentity("gpu", 0, 0)
 
     with source_path.open("ab") as source_file:
         source_file.write(b"\0")
-    assert original != cuda_session_cache_key(**kwargs)
+    assert original != gpu_session_cache_key(**kwargs)
 
     changed_budget = {**kwargs, "gpu_memory_budget_bytes": 2048}
-    assert original != cuda_session_cache_key(**changed_budget)
+    assert original != gpu_session_cache_key(**changed_budget)
     changed_geometry = {
         **kwargs,
         "session": SessionMetadata(
             1, "cache-key", CaptureMode.HORIZONTAL, 91.0, 60.0, 0.08, (frame,), True
         ),
     }
-    assert original != cuda_session_cache_key(**changed_geometry)
+    assert original != gpu_session_cache_key(**changed_geometry)
 
 
-def test_cuda_session_cache_closes_replaced_and_invalidated_sessions_once() -> None:
-    class FakePrepared:
-        def __init__(self) -> None:
-            self.cuda_session = SimpleNamespace(
-                transfer_stats=SimpleNamespace(peak_device_bytes=1234)
-            )
-            self.close_calls = 0
+def test_resident_session_backend_identity_tracks_backend_adapter_and_abi() -> None:
+    original = ResidentSessionBackendIdentity("d3d12", 42, 3)
 
-        def close(self) -> None:
-            self.close_calls += 1
-
-    first_key = CudaSessionCacheKey(
-        "GPU", (9, 0), "session", (), ImageEncoding(), "horizontal", 90.0, 60.0, 0.08, (), None
-    )
-    second_key = CudaSessionCacheKey(
-        "GPU", (9, 0), "session", (), ImageEncoding(), "horizontal", 91.0, 60.0, 0.08, (), None
-    )
-    first = FakePrepared()
-    second = FakePrepared()
-    cache = CudaSessionCache()
-
-    cache.store(first_key, first)  # type: ignore[arg-type]
-    assert cache.get(first_key) is first
-    assert cache.get(second_key) is None
-    cache.store(second_key, second)  # type: ignore[arg-type]
-    assert first.close_calls == 1
-    cache.invalidate("input changed")
-    cache.close()
-    assert second.close_calls == 1
+    assert original != ResidentSessionBackendIdentity("gpu", 42, 3)
+    assert original != ResidentSessionBackendIdentity("d3d12", 43, 3)
+    assert original != ResidentSessionBackendIdentity("d3d12", 42, 4)
 
 
 def test_render_progress_starts_with_compositing(tmp_path: Path) -> None:
@@ -489,54 +1237,6 @@ def test_render_progress_starts_with_compositing(tmp_path: Path) -> None:
     )
 
     assert progress[0][2] == "[1/3] compositing"
-
-
-def test_prepare_cuda_session_reports_each_source_upload(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    frames = tuple(
-        FrameMetadata(index, f"frame-{index}.png", 0.0, 0.0, 0.0, "captured") for index in range(2)
-    )
-    session = SessionMetadata(
-        1, "upload-progress", CaptureMode.FULL_SPHERE, 90.0, 90.0, 0.08, frames, True
-    )
-    for frame in frames:
-        Image.new("RGB", (2, 2), (32, 64, 96)).save(tmp_path / frame.filename)
-
-    class FakeCudaSession:
-        def __init__(self, **_kwargs: object) -> None:
-            self.log_gains = np.zeros(len(frames), dtype=np.float32)
-
-        def pinned_slot(self, _index: int) -> np.ndarray:
-            return np.empty(12, dtype=np.uint8)
-
-        def upload_source(self, _frame: int, _slot: np.ndarray, _slot_index: int) -> None:
-            pass
-
-        def finish_uploads(self) -> None:
-            pass
-
-        def close(self) -> None:
-            pass
-
-    monkeypatch.setattr(compositor, "CudaSession", FakeCudaSession)
-    progress: list[tuple[int, int, str]] = []
-    prepared = prepare_cuda_session(
-        session,
-        tmp_path,
-        SourceInfo(2, 2, ImageEncoding()),
-        CudaMemoryPlan(1, 1, 1, 1, 1, None, 1, 1),
-        progress_callback=lambda completed, total, phase: progress.append(
-            (completed, total, phase)
-        ),
-    )
-    prepared.close()
-
-    assert progress == [
-        (0, 2, "loading from disk"),
-        (1, 2, "loading from disk"),
-        (2, 2, "loading from disk"),
-    ]
 
 
 def test_jpeg_sources_are_supported(tmp_path: Path) -> None:
@@ -910,3 +1610,69 @@ def test_exr_round_trip_preserves_values_above_one(tmp_path: Path) -> None:
         assert str(image.header()["compression"]) == "Compression.PIZ_COMPRESSION"
         result = np.asarray(image.channels()["RGB"].pixels, dtype=np.float32)
     np.testing.assert_allclose(result, source, rtol=1e-6, atol=1e-6)
+
+
+@pytest.mark.gpu_contract
+def test_cpu_hard_and_feather_png_jpeg_outputs_are_deterministic(tmp_path: Path) -> None:
+    session = single_frame_session(session_id="cpu-output-parity")
+    write_gradient_source(tmp_path / session.frames[0].filename)
+
+    for blend in ("hard", "feather"):
+        png_path = tmp_path / f"{blend}.png"
+        jpeg_path = tmp_path / f"{blend}.jpg"
+        render_session(session, tmp_path, png_path, width=32, blend=blend, allow_incomplete=True)
+        render_session(session, tmp_path, jpeg_path, width=32, blend=blend, allow_incomplete=True)
+
+        with Image.open(png_path) as png, Image.open(jpeg_path) as jpeg:
+            assert png.size == jpeg.size == (32, 16)
+            assert png.mode == "RGB"
+            assert jpeg.mode == "RGB"
+            difference = np.abs(np.asarray(png, dtype=np.int16) - np.asarray(jpeg, dtype=np.int16))
+        assert int(difference.max()) <= 20
+
+
+@pytest.mark.gpu_contract
+def test_cpu_pq_rec2020_source_converts_to_sdr_within_one_code_value(tmp_path: Path) -> None:
+    source = np.array([[[0, 32768, 65535]]], dtype=np.uint16)
+    source_path = tmp_path / "pq.png"
+    cv2.imwrite(str(source_path), source[..., ::-1])
+    encoding = ImageEncoding("uint16", "rec2020", "pq", 203.0)
+
+    decoded = _read_native_source(source_path, encoding)
+    actual = _to_sdr_srgb(
+        _pq_to_linear(decoded.astype(np.float32) / 65535.0),
+        encoding,
+    )
+    expected = np.rint(
+        _to_sdr_srgb(_pq_to_linear(source.astype(np.float32) / 65535.0), encoding) * 255.0
+    ).astype(np.uint8)
+    result = np.rint(actual * 255.0).astype(np.uint8)
+    difference = result.astype(np.int16) - expected.astype(np.int16)
+    assert int(np.abs(difference).max()) <= 1
+
+
+@pytest.mark.gpu_contract
+def test_cpu_incomplete_output_marks_uncovered_pixels_magenta_and_writes_coverage(
+    tmp_path: Path,
+) -> None:
+    session = single_frame_session(session_id="incomplete", capture_mode=CaptureMode.HORIZONTAL)
+    Image.new("RGB", (4, 2), (32, 64, 96)).save(tmp_path / session.frames[0].filename)
+    output_path = tmp_path / "incomplete.png"
+    coverage_path = tmp_path / "coverage.png"
+
+    render_session(
+        session,
+        tmp_path,
+        output_path,
+        width=32,
+        allow_incomplete=True,
+        debug_coverage_path=coverage_path,
+        use_gpu=False,
+    )
+
+    with Image.open(output_path) as output, Image.open(coverage_path) as coverage:
+        output_pixels = np.asarray(output)
+        coverage_pixels = np.asarray(coverage)
+    uncovered = coverage_pixels == 0
+    assert np.any(uncovered)
+    assert np.all(output_pixels[uncovered] == np.array((255, 0, 255), dtype=np.uint8))

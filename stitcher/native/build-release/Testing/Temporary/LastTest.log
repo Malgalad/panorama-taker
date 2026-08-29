@@ -1,0 +1,49 @@
+Start testing: Aug 28 19:59 EEST
+----------------------------------------------------------
+1/3 Testing: pano_gpu_contract
+1/3 Test: pano_gpu_contract
+Command: "/home/pogorelov/panorama-taker/stitcher/native/build-release/pano_gpu_contract_test"
+Directory: /home/pogorelov/panorama-taker/stitcher/native/build-release
+"pano_gpu_contract" start time: Aug 28 19:59 EEST
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"pano_gpu_contract" end time: Aug 28 19:59 EEST
+"pano_gpu_contract" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/3 Testing: pano_gpu_contract_check_failure
+2/3 Test: pano_gpu_contract_check_failure
+Command: "/home/pogorelov/panorama-taker/stitcher/native/build-release/pano_gpu_contract_test" "--expect-check-failure"
+Directory: /home/pogorelov/panorama-taker/stitcher/native/build-release
+"pano_gpu_contract_check_failure" start time: Aug 28 19:59 EEST
+Output:
+----------------------------------------------------------
+contract check failed at line 35: false
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"pano_gpu_contract_check_failure" end time: Aug 28 19:59 EEST
+"pano_gpu_contract_check_failure" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/3 Testing: pano_gpu_cancellation_token
+3/3 Test: pano_gpu_cancellation_token
+Command: "/home/pogorelov/panorama-taker/stitcher/native/build-release/pano_gpu_contract_test" "--token-only"
+Directory: /home/pogorelov/panorama-taker/stitcher/native/build-release
+"pano_gpu_cancellation_token" start time: Aug 28 19:59 EEST
+Output:
+----------------------------------------------------------
+<end of output>
+Test time =   0.00 sec
+----------------------------------------------------------
+Test Passed.
+"pano_gpu_cancellation_token" end time: Aug 28 19:59 EEST
+"pano_gpu_cancellation_token" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Aug 28 19:59 EEST

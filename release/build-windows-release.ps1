@@ -1,8 +1,6 @@
 [CmdletBinding()]
 param(
-    [Parameter(Mandatory = $true)]
-    [ValidateScript({ Test-Path $_ -PathType Leaf })]
-    [string]$AddonPath,
+    [string]$AddonPath = "",
 
     [string]$Version = "1.0.4",
     [string]$PythonCommand = "python",
@@ -10,6 +8,47 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$env:PYTHONHASHSEED = "0"
+$env:SOURCE_DATE_EPOCH = "946684800"
+
+function New-DeterministicZip {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourceDirectory,
+
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationPath
+    )
+
+    Add-Type -AssemblyName System.IO.Compression
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $source = [IO.Path]::GetFullPath($SourceDirectory).TrimEnd([IO.Path]::DirectorySeparatorChar)
+    $archive = [IO.Compression.ZipFile]::Open(
+        $DestinationPath,
+        [IO.Compression.ZipArchiveMode]::Create
+    )
+    try {
+        Get-ChildItem -LiteralPath $source -Recurse -File |
+            Sort-Object { $_.FullName.Substring($source.Length + 1) } |
+            ForEach-Object {
+                $relative = $_.FullName.Substring($source.Length + 1).Replace("\", "/")
+                $entry = $archive.CreateEntry($relative, [IO.Compression.CompressionLevel]::Optimal)
+                $entry.LastWriteTime = [DateTimeOffset]::new(2000, 1, 1, 0, 0, 0, [TimeSpan]::Zero)
+                $inputStream = $_.OpenRead()
+                $outputStream = $entry.Open()
+                try {
+                    $inputStream.CopyTo($outputStream)
+                }
+                finally {
+                    $outputStream.Dispose()
+                    $inputStream.Dispose()
+                }
+            }
+    }
+    finally {
+        $archive.Dispose()
+    }
+}
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 if (-not $OutputDirectory) {
@@ -17,7 +56,6 @@ if (-not $OutputDirectory) {
 }
 $outputRoot = [IO.Path]::GetFullPath($OutputDirectory)
 $buildRoot = Join-Path $projectRoot "build\release"
-$addon = (Resolve-Path $AddonPath).Path
 $pyproject = Get-Content -LiteralPath (Join-Path $projectRoot "stitcher\pyproject.toml") -Raw
 $versionMatch = [regex]::Match($pyproject, '(?m)^version\s*=\s*"(?<version>[^"]+)"\s*\r?$')
 
@@ -29,92 +67,70 @@ if ($packageVersion -ne $Version) {
     throw "Release version $Version does not match stitcher package version $packageVersion"
 }
 
-if ([IO.Path]::GetExtension($addon).ToLowerInvariant() -ne ".addon64") {
-    throw "AddonPath must point to PanoramaCaptureReShade.addon64"
-}
-
 Remove-Item -LiteralPath $buildRoot -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $buildRoot, $outputRoot | Out-Null
 
-$modStage = Join-Path $buildRoot "PanoramaCapture-Mod-$Version"
-$cetDestination = Join-Path $modStage "bin\x64\plugins\cyber_engine_tweaks\mods\PanoramaCaptureProbe"
-$reshadeDestination = Join-Path $modStage "bin\x64"
-New-Item -ItemType Directory -Force -Path $cetDestination, $reshadeDestination | Out-Null
-Copy-Item "$projectRoot\mod\cet\PanoramaCaptureProbe\init.lua" $cetDestination
-Copy-Item $addon (Join-Path $reshadeDestination "PanoramaCaptureReShade.addon64")
-Copy-Item "$projectRoot\README.md" (Join-Path $cetDestination "README.md")
+$nativeBuild = Join-Path $buildRoot "stitcher-native"
+& cmake -S (Join-Path $projectRoot "stitcher\native") -B $nativeBuild -A x64
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to configure the native D3D12 stitcher"
+}
+& cmake --build $nativeBuild --config Release
+if ($LASTEXITCODE -ne 0) {
+    throw "Failed to build the native D3D12 stitcher"
+}
+& ctest --test-dir $nativeBuild -C Release --output-on-failure
+if ($LASTEXITCODE -ne 0) {
+    throw "Native D3D12 stitcher tests failed"
+}
+$nativeDll = Join-Path $nativeBuild "Release\pano_gpu.dll"
+if (-not (Test-Path -LiteralPath $nativeDll -PathType Leaf)) {
+    throw "Native build did not produce pano_gpu.dll"
+}
 
-$modArchive = Join-Path $outputRoot "PanoramaCapture-Mod-$Version.zip"
-Remove-Item -LiteralPath $modArchive -Force -ErrorAction SilentlyContinue
-Compress-Archive -Path (Join-Path $modStage "*") -DestinationPath $modArchive
-Write-Host "Created $modArchive"
+if ($AddonPath) {
+    if (-not $AddonPath -or -not (Test-Path -LiteralPath $AddonPath -PathType Leaf)) {
+        throw "AddonPath is required for a full release"
+    }
+    $addon = (Resolve-Path $AddonPath).Path
+    if ([IO.Path]::GetExtension($addon).ToLowerInvariant() -ne ".addon64") {
+        throw "AddonPath must point to PanoramaCaptureReShade.addon64"
+    }
+
+    $modStage = Join-Path $buildRoot "PanoramaCapture-Mod-$Version"
+    $cetDestination = Join-Path $modStage "bin\x64\plugins\cyber_engine_tweaks\mods\PanoramaCaptureProbe"
+    $reshadeDestination = Join-Path $modStage "bin\x64"
+    New-Item -ItemType Directory -Force -Path $cetDestination, $reshadeDestination | Out-Null
+    Copy-Item "$projectRoot\mod\cet\PanoramaCaptureProbe\init.lua" $cetDestination
+    Copy-Item $addon (Join-Path $reshadeDestination "PanoramaCaptureReShade.addon64")
+    Copy-Item "$projectRoot\README.md" (Join-Path $cetDestination "README.md")
+
+    $modArchive = Join-Path $outputRoot "PanoramaCapture-Mod-$Version.zip"
+    Remove-Item -LiteralPath $modArchive -Force -ErrorAction SilentlyContinue
+    Compress-Archive -Path (Join-Path $modStage "*") -DestinationPath $modArchive
+    Write-Host "Created $modArchive"
+}
 
 function New-StitcherArchive {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$Flavor,
-
-        [Parameter(Mandatory = $true)]
-        [bool]$IncludeCuda
-    )
-
-    $venvRoot = Join-Path $projectRoot ".venv-release-$Flavor"
+    $venvRoot = Join-Path $projectRoot ".venv-release"
     $python = Join-Path $venvRoot "Scripts\python.exe"
     Remove-Item -LiteralPath $venvRoot -Recurse -Force -ErrorAction SilentlyContinue
     & $PythonCommand -m venv $venvRoot
     & $python -m pip install --upgrade pip
-    $stitcherExtra = if ($IncludeCuda) { "bundle,gpu" } else { "bundle" }
-    & $python -m pip install "$projectRoot\stitcher[$stitcherExtra]"
-    $installedPackages = @((& $python -m pip list --format=json | ConvertFrom-Json) | ForEach-Object {
-        $_.name.ToLowerInvariant()
-    })
-    $forbiddenCudaPackages = @(
-        "cuda-toolkit",
-        "nvidia-cublas-cu12",
-        "nvidia-cufft-cu12",
-        "nvidia-curand-cu12",
-        "nvidia-cusolver-cu12",
-        "nvidia-cusparse-cu12",
-        "nvidia-nvjitlink-cu12"
-    )
-    $unexpectedCudaPackages = @($forbiddenCudaPackages | Where-Object {
-        $installedPackages -contains $_
-    })
-    if ($unexpectedCudaPackages.Count -gt 0) {
-        throw "Release environment contains forbidden CUDA packages: $($unexpectedCudaPackages -join ', ')"
-    }
-    if (-not $IncludeCuda -and $installedPackages -contains "cupy-cuda12x") {
-        throw "CPU release environment unexpectedly contains CuPy"
-    }
-
-    $pyInstallerWork = Join-Path $buildRoot "pyinstaller-work-$Flavor"
-    $pyInstallerDist = Join-Path $buildRoot "pyinstaller-dist-$Flavor"
-    $pyInstallerSpec = Join-Path $buildRoot "pyinstaller-spec-$Flavor"
-    $runtimeHook = Join-Path $buildRoot "build-flavor-$Flavor.py"
-    Set-Content -LiteralPath $runtimeHook -Value @(
-        "import os"
-        "os.environ[`"PANO_STITCH_BUILD_FLAVOR`"] = `"$Flavor`""
-    )
+    & $python -m pip install "$projectRoot\stitcher[bundle]"
+    $pyInstallerWork = Join-Path $buildRoot "pyinstaller-work"
+    $pyInstallerDist = Join-Path $buildRoot "pyinstaller-dist"
+    $pyInstallerSpec = Join-Path $buildRoot "pyinstaller-spec"
     $pyInstallerArgs = @(
         "--noconfirm", "--clean", "--windowed",
         "--name", "PanoramaCaptureStitcher",
         "--workpath", $pyInstallerWork,
         "--distpath", $pyInstallerDist,
         "--specpath", $pyInstallerSpec,
-        "--runtime-hook", $runtimeHook,
         "--collect-all", "OpenEXR",
         "--collect-all", "Imath"
     )
-    if ($IncludeCuda) {
-        $pyInstallerArgs += @(
-            "--collect-all", "cupy",
-            "--collect-all", "cupy_backends",
-            "--collect-all", "cuda.pathfinder",
-            "--hidden-import", "graphlib",
-            "--collect-all", "nvidia.cuda_runtime",
-            "--collect-all", "nvidia.cuda_nvrtc"
-        )
-    }
+    $pyInstallerArgs += @("--add-binary", "$nativeDll;pano_stitch")
     $pyInstallerArgs += @(
         "--add-data", "$projectRoot\contracts\session.schema.json;contracts",
         "$projectRoot\stitcher\scripts\pano_stitch_gui.py"
@@ -122,63 +138,47 @@ function New-StitcherArchive {
     & $python -m PyInstaller @pyInstallerArgs
 
     $stitcherBundle = Join-Path $pyInstallerDist "PanoramaCaptureStitcher"
-    $unneededCudaDlls = @(
-        Get-ChildItem -LiteralPath $stitcherBundle -Recurse -File | Where-Object {
-            $_.Name -match '^(cublas|cufft|curand|cusolver|cusparse|cutensor|nvjitlink).*\.dll$'
-        }
+    $bundledD3D12Dlls = @(
+        Get-ChildItem -LiteralPath $stitcherBundle -Recurse -File -Filter "pano_gpu.dll"
     )
-    foreach ($dll in $unneededCudaDlls) {
-        Remove-Item -LiteralPath $dll.FullName -Force
-    }
-    if ($unneededCudaDlls.Count -gt 0) {
-        Write-Host "Removed $($unneededCudaDlls.Count) unused CUDA math DLLs from $Flavor stitcher bundle"
-    }
-
-    $nvrtc = Get-ChildItem -LiteralPath $stitcherBundle -Recurse -File -Filter "nvrtc64*.dll"
-    $cudaRuntime = Get-ChildItem -LiteralPath $stitcherBundle -Recurse -File -Filter "cudart64*.dll"
-    $cupyDirectories = Get-ChildItem -LiteralPath $stitcherBundle -Recurse -Directory |
-        Where-Object { $_.Name -eq "cupy" }
-    if ($IncludeCuda -and ($nvrtc.Count -eq 0 -or $cudaRuntime.Count -eq 0 -or $cupyDirectories.Count -eq 0)) {
-        throw "CUDA stitcher bundle is missing CuPy, cudart, or NVRTC"
-    }
-    if (-not $IncludeCuda -and ($nvrtc.Count -gt 0 -or $cudaRuntime.Count -gt 0 -or $cupyDirectories.Count -gt 0)) {
-        throw "CPU stitcher bundle unexpectedly contains CuPy or CUDA runtime files"
+    if ($bundledD3D12Dlls.Count -ne 1) {
+        throw "Stitcher bundle must contain exactly one pano_gpu.dll"
     }
 
     $bundleBytes = (Get-ChildItem -LiteralPath $stitcherBundle -Recurse -File |
         Measure-Object -Property Length -Sum).Sum
-    $maximumBundleBytes = if ($IncludeCuda) { 768MB } else { 512MB }
+    $maximumBundleBytes = 512MB
     if ($bundleBytes -gt $maximumBundleBytes) {
-        throw "$Flavor stitcher bundle is $([math]::Round($bundleBytes / 1MB)) MiB; limit is $([math]::Round($maximumBundleBytes / 1MB)) MiB"
+        throw "Stitcher bundle is $([math]::Round($bundleBytes / 1MB)) MiB; limit is $([math]::Round($maximumBundleBytes / 1MB)) MiB"
     }
-
-    if ($IncludeCuda) {
-        $probeResult = Join-Path $buildRoot "cuda-import-probe.txt"
-        & (Join-Path $stitcherBundle "PanoramaCaptureStitcher.exe") --verify-cupy-import $probeResult
-        if ($LASTEXITCODE -ne 0) {
-            if (Test-Path -LiteralPath $probeResult) {
-                Get-Content -LiteralPath $probeResult | Write-Host
-            }
-            throw "Frozen CUDA stitcher could not import CuPy (exit code $LASTEXITCODE)"
+    $probeResult = Join-Path $buildRoot "gpu-runtime-probe.txt"
+    $probeProcess = Start-Process -FilePath (Join-Path $stitcherBundle "PanoramaCaptureStitcher.exe") -ArgumentList @("--verify-gpu-runtime", $probeResult) -Wait -PassThru
+    if ($probeProcess.ExitCode -notin @(0, 2)) {
+        if (Test-Path -LiteralPath $probeResult) {
+            Get-Content -LiteralPath $probeResult | Write-Host
         }
+        throw "Frozen stitcher GPU runtime verification failed (exit code $($probeProcess.ExitCode))"
+    }
+    if ($probeProcess.ExitCode -eq 2) {
+        Get-Content -LiteralPath $probeResult | Write-Host
+        Write-Host "No compatible hardware adapter is available on the build machine"
     }
 
-    $stitcherStage = Join-Path $buildRoot "PanoramaCapture-Stitcher-$Version-$Flavor-win-x64"
+    $stitcherStage = Join-Path $buildRoot "PanoramaCapture-Stitcher-$Version-win-x64"
     New-Item -ItemType Directory -Force -Path $stitcherStage | Out-Null
     Copy-Item (Join-Path $pyInstallerDist "PanoramaCaptureStitcher") $stitcherStage -Recurse
     Copy-Item "$projectRoot\README.md" (Join-Path $stitcherStage "README.md")
-    $stitcherArchive = Join-Path $outputRoot "PanoramaCapture-Stitcher-$Version-$Flavor-win-x64.zip"
+    $stitcherArchive = Join-Path $outputRoot "PanoramaCapture-Stitcher-$Version-win-x64.zip"
     Remove-Item -LiteralPath $stitcherArchive -Force -ErrorAction SilentlyContinue
-    Compress-Archive -Path (Join-Path $stitcherStage "*") -DestinationPath $stitcherArchive
+    New-DeterministicZip -SourceDirectory $stitcherStage -DestinationPath $stitcherArchive
     $archiveBytes = (Get-Item -LiteralPath $stitcherArchive).Length
-    $maximumArchiveBytes = if ($IncludeCuda) { 512MB } else { 256MB }
+    $maximumArchiveBytes = 256MB
     if ($archiveBytes -gt $maximumArchiveBytes) {
-        throw "$Flavor stitcher archive is $([math]::Round($archiveBytes / 1MB)) MiB; limit is $([math]::Round($maximumArchiveBytes / 1MB)) MiB"
+        throw "Stitcher archive is $([math]::Round($archiveBytes / 1MB)) MiB; limit is $([math]::Round($maximumArchiveBytes / 1MB)) MiB"
     }
     Write-Host "Created $stitcherArchive ($([math]::Round($archiveBytes / 1MB)) MiB; extracted payload $([math]::Round($bundleBytes / 1MB)) MiB)"
 }
 
-New-StitcherArchive -Flavor "cpu" -IncludeCuda $false
-New-StitcherArchive -Flavor "cuda" -IncludeCuda $true
+New-StitcherArchive
 Remove-Item -LiteralPath $buildRoot -Recurse -Force
 Write-Host "Removed temporary release build files from $buildRoot"

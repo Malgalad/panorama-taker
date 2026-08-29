@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import binascii
+import ctypes
 import logging
 import mmap
 import os
 import struct
 import tempfile
-import time
 import zlib
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,18 +25,11 @@ from numpy.typing import NDArray
 from PIL import Image
 
 from pano_stitch.gpu import (
-    CudaBandScheduler,
-    CudaMemoryPlan,
-    CudaOutputJob,
-    CudaPreflightError,
-    CudaPreviewDisplay,
-    CudaRenderDiagnostics,
-    CudaSession,
+    GpuMemoryPlan,
+    GpuPreflightError,
     GpuUnavailableError,
-    compile_cuda_module,
-    cuda_device_info,
-    cuda_preview_display_bytes,
-    select_cuda_backend,
+    gpu_preview_display_bytes,
+    select_gpu_backend,
 )
 from pano_stitch.metadata import FrameMetadata, ImageEncoding, SessionMetadata
 from pano_stitch.projection import (
@@ -124,21 +117,18 @@ def _validated_manual_gains(
     return gains
 
 
-@dataclass
-class PreparedCudaSession:
-    """Reusable resident CUDA inputs."""
+@dataclass(frozen=True)
+class ResidentSessionBackendIdentity:
+    """Immutable native/backend identity required for safe resident-session reuse."""
 
-    cuda_session: CudaSession
-    exposure_report: ExposureReport
-    upload_seconds: float
-
-    def close(self) -> None:
-        self.cuda_session.close()
+    backend_kind: str
+    adapter_luid: int
+    abi_version: int
 
 
 @dataclass(frozen=True)
-class CudaSessionCacheKey:
-    """Every immutable input that permits safe resident-session reuse."""
+class GpuSessionCacheKey:
+    """Every immutable input that permits safe resident GPU-session reuse."""
 
     device_name: str
     compute_capability: tuple[int, int] | None
@@ -151,9 +141,12 @@ class CudaSessionCacheKey:
     overlap_fraction: float
     frames: tuple[FrameMetadata, ...]
     gpu_memory_budget_bytes: int | None
+    backend_identity: ResidentSessionBackendIdentity = field(
+        default_factory=lambda: ResidentSessionBackendIdentity("gpu", 0, 0)
+    )
 
 
-def cuda_session_cache_key(
+def gpu_session_cache_key(
     *,
     device_name: str,
     compute_capability: tuple[int, int] | None,
@@ -161,15 +154,15 @@ def cuda_session_cache_key(
     session: SessionMetadata,
     image_root: Path,
     gpu_memory_budget_bytes: int | None,
-) -> CudaSessionCacheKey:
-    """Fingerprint a validated CUDA session without decoding its source pixels."""
+) -> GpuSessionCacheKey:
+    """Fingerprint a validated GPU session without decoding its source pixels."""
 
     fingerprints = []
     for frame in session.frames:
         source_path = _image_path(image_root, frame.filename).resolve()
         stat = source_path.stat()
         fingerprints.append((str(source_path), stat.st_size, stat.st_mtime_ns))
-    return CudaSessionCacheKey(
+    return GpuSessionCacheKey(
         device_name,
         compute_capability,
         str(session_path.resolve()),
@@ -181,52 +174,103 @@ def cuda_session_cache_key(
         session.overlap_fraction,
         session.frames,
         gpu_memory_budget_bytes,
+        ResidentSessionBackendIdentity("gpu", 0, 0),
     )
 
 
-class CudaSessionCache:
-    """Single-entry owner for GUI reuse of one resident CUDA session."""
+def d3d12_session_cache_key(
+    *,
+    device_name: str,
+    adapter_luid: int,
+    session_path: Path,
+    session: SessionMetadata,
+    image_root: Path,
+    gpu_memory_budget_bytes: int | None,
+) -> GpuSessionCacheKey:
+    """Fingerprint one prepared D3D12 session including immutable adapter identity."""
+
+    from pano_stitch.d3d12_adapter import PANO_GPU_ABI_VERSION
+
+    key = gpu_session_cache_key(
+        device_name=device_name,
+        compute_capability=None,
+        session_path=session_path,
+        session=session,
+        image_root=image_root,
+        gpu_memory_budget_bytes=gpu_memory_budget_bytes,
+    )
+    return replace(
+        key,
+        backend_identity=ResidentSessionBackendIdentity(
+            "d3d12", adapter_luid, PANO_GPU_ABI_VERSION
+        ),
+    )
+
+
+class GpuSessionCache:
+    """Single-entry owner for GUI reuse of one resident GPU session."""
 
     def __init__(self) -> None:
-        self._key: CudaSessionCacheKey | None = None
-        self._prepared: PreparedCudaSession | None = None
+        self._key: GpuSessionCacheKey | None = None
+        self._d3d12_prepared: Any = None
 
-    def get(self, key: CudaSessionCacheKey) -> PreparedCudaSession | None:
-        if self._key == key and self._prepared is not None:
-            stats = self._prepared.cuda_session.transfer_stats
-            LOGGER.info("CUDA session cache hit: %d resident bytes", stats.peak_device_bytes)
-            return self._prepared
-        LOGGER.info("CUDA session cache miss")
+    def get_d3d12(self, key: GpuSessionCacheKey) -> Any:
+        if self._key == key and self._d3d12_prepared is not None:
+            LOGGER.info("D3D12 session cache hit")
+            return self._d3d12_prepared
+        LOGGER.info("D3D12 session cache miss")
         return None
 
-    def store(self, key: CudaSessionCacheKey, prepared: PreparedCudaSession) -> None:
-        if self._key == key and self._prepared is prepared:
+    def store_d3d12(self, key: GpuSessionCacheKey, prepared: Any) -> None:
+        if self._key == key and self._d3d12_prepared is prepared:
             return
         self.invalidate("replaced")
         self._key = key
-        self._prepared = prepared
-        stats = prepared.cuda_session.transfer_stats
-        LOGGER.info("CUDA session cache stored: %d resident bytes", stats.peak_device_bytes)
+        self._d3d12_prepared = prepared
+        LOGGER.info("D3D12 session cache stored")
 
     def invalidate(self, reason: str = "invalidated") -> None:
-        prepared = self._prepared
+        d3d12_prepared = self._d3d12_prepared
         self._key = None
-        self._prepared = None
-        if prepared is not None:
-            LOGGER.info("CUDA session cache cleanup: %s", reason)
-            prepared.close()
+        self._d3d12_prepared = None
+        if d3d12_prepared is not None:
+            LOGGER.info("D3D12 session cache cleanup: %s", reason)
+            d3d12_prepared.close()
 
     def create_preview_display(
         self,
         preview: NDArray[np.uint8],
         overview: NDArray[np.uint8],
         masks: tuple[NDArray[np.bool_], ...],
-    ) -> CudaPreviewDisplay | None:
-        """Create a retained display compositor only for a resident CUDA session."""
+    ) -> Any:
+        """Create a retained display compositor for the resident D3D12 session."""
 
-        if self._prepared is None:
+        if self._d3d12_prepared is None:
             return None
-        return CudaPreviewDisplay(self._prepared.cuda_session, preview, overview, masks)
+        from pano_stitch.d3d12_adapter import D3D12PreviewDisplay
+
+        compact = np.ascontiguousarray(np.stack(masks), dtype=np.uint8)
+        preview_job = self._d3d12_prepared.create_preview(
+            frame_count=len(masks),
+            preview_width=preview.shape[1],
+            preview_height=preview.shape[0],
+            preview_rgb8=memoryview(np.ascontiguousarray(preview)),
+            overview_width=overview.shape[1],
+            overview_height=overview.shape[0],
+            overview_rgb8=memoryview(np.ascontiguousarray(overview)),
+            mask_width=compact.shape[2],
+            mask_height=compact.shape[1],
+            compact_masks=memoryview(compact),
+        )
+        return D3D12PreviewDisplay(
+            preview_job,
+            self._d3d12_prepared.create_cancellation_token(),
+            frame_count=len(masks),
+            preview_width=preview.shape[1],
+            preview_height=preview.shape[0],
+            output_width=overview.shape[1],
+            output_height=overview.shape[0],
+        )
 
     def close(self) -> None:
         self.invalidate("shutdown")
@@ -691,7 +735,7 @@ def _read_source(path: Path, encoding: ImageEncoding) -> FloatImage:
 
 
 def _read_native_source(path: Path, encoding: ImageEncoding) -> NDArray[Any]:
-    """Decode RGB source samples without CPU-side transfer conversion for CUDA."""
+    """Decode RGB source samples without CPU-side transfer conversion for the GPU."""
 
     suffix = path.suffix.lower()
     if suffix == ".png":
@@ -1081,6 +1125,32 @@ def _temporary_output_path(output_path: Path) -> Path:
     path = Path(temporary)
     path.unlink()
     return path
+
+
+def _publish_staged_outputs(outputs: list[tuple[Path, Path]]) -> None:
+    backups: list[tuple[Path, Path]] = []
+    published: list[Path] = []
+    try:
+        for _, destination in outputs:
+            if destination.exists():
+                backup = _temporary_output_path(destination)
+                os.replace(destination, backup)
+                backups.append((backup, destination))
+        for staged, destination in outputs:
+            os.replace(staged, destination)
+            published.append(destination)
+    except Exception:
+        for destination in reversed(published):
+            destination.unlink(missing_ok=True)
+        for backup, destination in reversed(backups):
+            try:
+                os.replace(backup, destination)
+            except OSError:
+                pass
+        raise
+    else:
+        for backup, _ in backups:
+            backup.unlink(missing_ok=True)
 
 
 def thumbnail_output_path(output_path: Path) -> Path:
@@ -1577,10 +1647,10 @@ def _render_cpu(
             del weight_scratch
 
 
-def _write_cuda_sdr_output(
+def _write_gpu_sdr_output(
     path: Path, pixels: NDArray[np.uint8], suffix: str, jpeg_quality: int
 ) -> None:
-    """Encode final CUDA RGB bytes directly, without an intermediate image spool."""
+    """Encode final GPU RGB bytes directly, without an intermediate image spool."""
 
     image = Image.fromarray(pixels, mode="RGB")
     if suffix == ".png":
@@ -1589,215 +1659,70 @@ def _write_cuda_sdr_output(
         image.save(path, format="JPEG", quality=jpeg_quality, subsampling=0)
 
 
-def _render_cuda_thumbnail(
-    cuda_session: CudaSession,
-    session: SessionMetadata,
-    source: SourceInfo,
-    output_path: Path,
-    blend: str,
-    allow_incomplete: bool,
-    output_suffix: str,
-    jpeg_quality: int,
-    auto_contrast: bool,
-    manual_gains: tuple[float, ...],
-) -> None:
-    """Encode the rectilinear thumbnail from already resident CUDA session data."""
-
-    width, height = source.width, source.height
-    vertical_fov = float(np.degrees(2.0 * np.arctan((height / width) * np.tan(np.pi / 4.0))))
-    needs_sdr = output_suffix in {".png", ".jpg", ".jpeg"}
-    with CudaOutputJob(
-        cuda_session,
-        output_width=width,
-        output_height=height,
-        output_sample_bytes=1 if needs_sdr else np.dtype(np.float32).itemsize,
-        needs_sdr_conversion=needs_sdr,
-        rectilinear_output=True,
-        output_vertical_fov=vertical_fov,
-        plan=cuda_session._plan,
-    ) as job:
-        cuda_session.log_gains = cuda_session._cp.asarray(
-            np.log(manual_gains),
-            dtype=cuda_session._cp.float32,
-        )
-        output_dtype = np.dtype(np.uint8 if needs_sdr else np.float32)
-        host_output = cuda_session.pinned_array((height, width, 3), output_dtype)
-        auto_contrast_active = auto_contrast and needs_sdr
-        starts = range(0, height, job.band_rows)
-        if auto_contrast_active:
-            job.reset_auto_contrast_histogram()
-            for row_start in starts:
-                rows = min(job.band_rows, height - row_start)
-                job.compose_band(
-                    row_start=row_start,
-                    rows=rows,
-                    latitude_span=180.0,
-                    horizontal_fov=session.horizontal_fov_deg,
-                    vertical_fov=session.vertical_fov_deg,
-                    transfer_function=source.encoding.transfer_function,
-                    hard_blend=blend == "hard",
-                    incomplete_magenta=allow_incomplete,
-                )
-                if not allow_incomplete and job.uncovered_count(rows):
-                    raise ValueError("capture does not cover every thumbnail pixel")
-                job.build_auto_contrast_histogram(
-                    rows=rows,
-                    transfer_function=source.encoding.transfer_function,
-                    reference_white_nits=source.encoding.reference_white_nits,
-                )
-            job.select_auto_contrast_levels()
-        for row_start in starts:
-            rows = min(job.band_rows, height - row_start)
-            if not auto_contrast_active or job.is_banded:
-                job.compose_band(
-                    row_start=row_start,
-                    rows=rows,
-                    latitude_span=180.0,
-                    horizontal_fov=session.horizontal_fov_deg,
-                    vertical_fov=session.vertical_fov_deg,
-                    transfer_function=source.encoding.transfer_function,
-                    hard_blend=blend == "hard",
-                    incomplete_magenta=allow_incomplete,
-                )
-                if not allow_incomplete and job.uncovered_count(rows):
-                    raise ValueError("capture does not cover every thumbnail pixel")
-            if needs_sdr:
-                job.convert_band(
-                    rows=rows,
-                    transfer_function=source.encoding.transfer_function,
-                    reference_white_nits=source.encoding.reference_white_nits,
-                    apply_auto_contrast=auto_contrast_active,
-                )
-            job.download_band(host_output[row_start : row_start + rows], rows, converted=needs_sdr)
-    temporary_path = _temporary_output_path(output_path)
-    try:
-        if needs_sdr:
-            _write_cuda_sdr_output(temporary_path, host_output, output_suffix, jpeg_quality)
-        else:
-            _write_exr(temporary_path, host_output, source.encoding)
-        os.replace(temporary_path, output_path)
-    except Exception:
-        temporary_path.unlink(missing_ok=True)
-        raise
-
-
-def prepare_cuda_session(
+def _prepare_d3d12_session(
     session: SessionMetadata,
     image_root: Path,
     source: SourceInfo,
-    gpu_plan: CudaMemoryPlan,
-    cancel_event: Event | None = None,
-    progress_callback: Callable[[int, int, str], None] | None = None,
-) -> PreparedCudaSession:
-    """Upload one session for reusable CUDA output jobs."""
+    cancel_event: Event | None,
+    progress_callback: Callable[[int, int, str], None] | None,
+) -> Any:
+    """Stream one source set into a cacheable prepared native session."""
+
+    from pano_stitch.d3d12_adapter import load_d3d12_adapter
 
     rotations = np.stack([_frame_rotation(frame) for frame in session.frames], dtype=np.float32)
-    cuda_session = CudaSession(
-        frame_count=len(session.frames),
-        source_width=source.width,
-        source_height=source.height,
-        sample_type=source.encoding.sample_type,
-        rotations=rotations,
-        plan=gpu_plan,
-    )
-    try:
-        upload_started = time.perf_counter()
-        if progress_callback is not None:
-            progress_callback(0, len(session.frames), "loading from disk")
+    sample_types = {"uint8": 1, "uint16": 2, "float32": 3}
+    transfer_functions = {"srgb": 1, "pq": 2, "linear": 3}
+
+    def native_frames() -> Any:
         for frame_position, frame in enumerate(session.frames):
             if cancel_event is not None and cancel_event.is_set():
                 raise RenderCancelledError("render cancelled")
-            slot_index = frame_position % 2
-            slot = cuda_session.pinned_slot(slot_index).reshape((source.height, source.width, 3))
             decoded = _read_native_source(_image_path(image_root, frame.filename), source.encoding)
-            try:
-                np.copyto(slot, decoded)
-            finally:
-                del decoded
-            cuda_session.upload_source(frame_position, slot, slot_index)
+            yield memoryview(decoded)
             if progress_callback is not None:
-                progress_callback(frame_position + 1, len(session.frames), "loading from disk")
-        cuda_session.finish_uploads()
-        upload_seconds = time.perf_counter() - upload_started
-        return PreparedCudaSession(
-            cuda_session,
-            ExposureReport(0, 0, (1.0,) * len(session.frames)),
-            upload_seconds,
-        )
-    except Exception:
-        cuda_session.close()
-        raise
+                progress_callback(frame_position + 1, len(session.frames), "D3D12 upload")
 
-
-def _cached_or_prepared_cuda_session(
-    *,
-    cache: CudaSessionCache | None,
-    session_path: Path | None,
-    session: SessionMetadata,
-    image_root: Path,
-    source: SourceInfo,
-    gpu_plan: CudaMemoryPlan,
-    gpu_memory_budget_bytes: int | None,
-    cancel_event: Event | None,
-    progress_callback: Callable[[int, int, str], None] | None,
-) -> tuple[PreparedCudaSession, CudaSessionCache | None]:
-    """Return a matching cached session or prepare one for this render."""
-
-    if cache is None or session_path is None:
-        return (
-            prepare_cuda_session(
-                session, image_root, source, gpu_plan, cancel_event, progress_callback
-            ),
-            None,
-        )
-    device = cuda_device_info()
-    key = cuda_session_cache_key(
-        device_name=device.name,
-        compute_capability=device.compute_capability,
-        session_path=session_path,
-        session=session,
-        image_root=image_root,
-        gpu_memory_budget_bytes=gpu_memory_budget_bytes,
-    )
-    prepared = cache.get(key)
-    if prepared is not None:
-        return prepared, cache
+    adapter = load_d3d12_adapter()
+    device = adapter.probe()
+    token = adapter.create_cancellation_token()
     try:
-        prepared = prepare_cuda_session(
-            session, image_root, source, gpu_plan, cancel_event, progress_callback
+        prepared = adapter.prepare_session(
+            adapter_luid=int(device.luid),
+            rotations=rotations.reshape(-1).tolist(),
+            frames=native_frames(),
+            source_width=source.width,
+            source_height=source.height,
+            source_sample_type=sample_types[source.encoding.sample_type],
+            transfer_function=transfer_functions[source.encoding.transfer_function],
+            source_row_stride_bytes=(
+                source.width * 3 * np.dtype(source.encoding.sample_type).itemsize
+            ),
+            cancellation=token,
         )
-    except Exception:
-        cache.invalidate("preparation failed")
-        raise
-    cache.store(key, prepared)
-    return prepared, cache
+        try:
+            sample_width = min(256, source.width)
+            sample_height = max(1, round(source.height * sample_width / source.width))
+            prepared.solve_exposure(
+                sample_width=sample_width,
+                sample_height=sample_height,
+                latitude_span_degrees=(
+                    180.0
+                    if session.capture_mode.value == "full_sphere"
+                    else session.vertical_fov_deg
+                ),
+                horizontal_fov_degrees=session.horizontal_fov_deg,
+                vertical_fov_degrees=session.vertical_fov_deg,
+            )
+            return prepared
+        except Exception:
+            prepared.close()
+            raise
+    finally:
+        token.close()
 
 
-def _run_adaptive_cuda_bands(
-    cuda_session: CudaSession,
-    output_job: CudaOutputJob,
-    output_height: int,
-    render_band: Callable[[int, int], None],
-) -> tuple[tuple[tuple[int, int], ...], float]:
-    """Run watchdog-safe CUDA bands, adapting only at completed GPU checkpoints."""
-
-    scheduler = CudaBandScheduler(output_job.band_rows)
-    completed_rows = 0
-    elapsed_seconds = 0.0
-    bands: list[tuple[int, int]] = []
-    while completed_rows < output_height:
-        rows = scheduler.next_rows(output_height - completed_rows)
-        started = cuda_session.begin_compute_timing()
-        render_band(completed_rows, rows)
-        elapsed = cuda_session.end_compute_timing(started)
-        scheduler.record_elapsed(elapsed)
-        bands.append((completed_rows, rows))
-        completed_rows += rows
-        elapsed_seconds += elapsed
-    return tuple(bands), elapsed_seconds
-
-
-def _render_prepared_cuda(
+def _render_d3d12_resident(
     session: SessionMetadata,
     image_root: Path,
     output_path: Path,
@@ -1809,247 +1734,236 @@ def _render_prepared_cuda(
     output_suffix: str,
     jpeg_quality: int,
     auto_contrast: bool,
-    debug_coverage_path: Path | None,
     cancel_event: Event | None,
     progress_callback: Callable[[int, int, str], None] | None,
-    gpu_plan: CudaMemoryPlan,
-    prepared: PreparedCudaSession,
-    session_thumbnail: bool = False,
+    gpu_plan: GpuMemoryPlan,
+    manual_gains: tuple[float, ...] | None,
     return_preview: bool = False,
-    diagnostics_callback: Callable[[CudaRenderDiagnostics], None] | None = None,
-    manual_gains: tuple[float, ...] | None = None,
+    prepared_session: Any = None,
+    rectilinear_output: bool = False,
+    output_vertical_fov_degrees: float = 0.0,
+    debug_coverage_path: Path | None = None,
 ) -> ExposureReport | PreviewResult:
-    """Render a session through the CUDA-only numerical pipeline."""
+    """Render one resident final output through the retained D3D12 session."""
 
-    latitude_span = (
-        180.0 if session.capture_mode.value == "full_sphere" else session.vertical_fov_deg
+    from pano_stitch.d3d12_adapter import (
+        PANO_GPU_ABI_VERSION,
+        D3D12AdapterUnavailableError,
+        D3D12RenderCancelledError,
+        _OneFrameCompositeRequest,
+        _OutputCreateOptions,
     )
-    needs_sdr_conversion = output_suffix in {".png", ".jpg", ".jpeg"}
-    output_sample_bytes = 1 if needs_sdr_conversion else np.dtype(np.float32).itemsize
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    if debug_coverage_path is not None:
-        debug_coverage_path.parent.mkdir(parents=True, exist_ok=True)
-    phase_count = 4 if auto_contrast and needs_sdr_conversion else 3
-    phases = {
-        "upload": f"[1/{phase_count}] CUDA upload",
-        "compositing": f"[2/{phase_count}] CUDA compositing",
-        "conversion": f"[3/{phase_count}] CUDA conversion",
-        "writing": f"[{phase_count}/{phase_count}] writing",
-    }
-    if auto_contrast and needs_sdr_conversion:
-        phases["conversion"] = f"[3/{phase_count}] CUDA auto contrast"
 
-    phase_seconds: dict[str, float] = {
-        "upload": prepared.upload_seconds,
-    }
-    with nullcontext(prepared.cuda_session) as cuda_session:
-        report = prepared.exposure_report
-        manual_gains = _validated_manual_gains(manual_gains, len(session.frames))
-        if progress_callback is not None:
-            progress_callback(len(session.frames), len(session.frames), phases["upload"])
-
-        with CudaOutputJob(
-            cuda_session,
-            output_width=output_width,
-            output_height=output_height,
-            output_sample_bytes=output_sample_bytes,
-            needs_sdr_conversion=needs_sdr_conversion,
-            plan=gpu_plan,
-        ) as output_job:
-            cuda_session.log_gains = cuda_session._cp.asarray(
-                np.log(manual_gains),
-                dtype=cuda_session._cp.float32,
+    if cancel_event is not None and cancel_event.is_set():
+        raise RenderCancelledError("render cancelled")
+    rotations = np.stack([_frame_rotation(frame) for frame in session.frames], dtype=np.float32)
+    sample_types = {"uint8": 1, "uint16": 2, "float32": 3}
+    needs_sdr = output_suffix in {".png", ".jpg", ".jpeg"}
+    owns_prepared = prepared_session is None
+    token = None
+    prepared = prepared_session
+    output = None
+    dispatched = False
+    try:
+        if prepared is None:
+            prepared = _prepare_d3d12_session(
+                session, image_root, source, cancel_event, progress_callback
             )
-            phase_started = time.perf_counter()
-            output_dtype = np.dtype(np.uint8 if needs_sdr_conversion else np.float32)
-            host_output = cuda_session.pinned_array((output_height, output_width, 3), output_dtype)
-            host_coverage = (
-                cuda_session.pinned_array((output_height, output_width), np.dtype(np.uint8))
-                if debug_coverage_path is not None
-                else None
+        token = prepared.create_cancellation_token()
+        output = prepared.create_output(
+            _OutputCreateOptions(
+                size=ctypes.sizeof(_OutputCreateOptions),
+                abi_version=PANO_GPU_ABI_VERSION,
+                output_width=output_width,
+                output_height=output_height,
+                output_sample_bytes=1 if needs_sdr else 4,
+                output_band_rows=gpu_plan.output_band_rows or 0,
+                descriptor_count=len(session.frames) + 4,
+                output_workspace_bytes=gpu_plan.output_workspace_bytes,
             )
-            auto_contrast_active = auto_contrast and needs_sdr_conversion
-            if auto_contrast_active:
-                output_job.reset_auto_contrast_histogram()
+        )
+    except Exception as error:
+        if output is not None:
+            output.close()
+        if prepared is not None and owns_prepared:
+            prepared.close()
+        if token is not None:
+            token.close()
+        if isinstance(error, (D3D12AdapterUnavailableError, ValueError)):
+            raise GpuPreflightError(str(error)) from error
+        raise
+    try:
+        gains = _validated_manual_gains(manual_gains, len(session.frames))
+        latitude_span = (
+            180.0 if session.capture_mode.value == "full_sphere" else session.vertical_fov_deg
+        )
 
-                def build_histogram_band(row_start: int, rows: int) -> None:
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise RenderCancelledError("render cancelled")
-                    output_job.compose_band(
-                        row_start=row_start,
-                        rows=rows,
-                        latitude_span=latitude_span,
-                        horizontal_fov=session.horizontal_fov_deg,
-                        vertical_fov=session.vertical_fov_deg,
-                        transfer_function=source.encoding.transfer_function,
-                        hard_blend=blend == "hard",
-                        incomplete_magenta=allow_incomplete,
+        def check_cancelled() -> None:
+            if cancel_event is not None and cancel_event.is_set():
+                raise RenderCancelledError("render cancelled")
+
+        def frame_requests(row_start: int, rows: int) -> tuple[Any, ...]:
+            return tuple(
+                _OneFrameCompositeRequest(
+                    size=ctypes.sizeof(_OneFrameCompositeRequest),
+                    abi_version=PANO_GPU_ABI_VERSION,
+                    frame_index=frame_index,
+                    source_sample_type=sample_types[source.encoding.sample_type],
+                    output_width=output_width,
+                    output_height=output_height,
+                    row_start=row_start,
+                    row_count=rows,
+                    latitude_span_degrees=latitude_span,
+                    horizontal_fov_degrees=session.horizontal_fov_deg,
+                    vertical_fov_degrees=session.vertical_fov_deg,
+                    world_to_camera=(ctypes.c_float * 9)(*rotations[frame_index].reshape(-1)),
+                    rectilinear_output=int(rectilinear_output),
+                    output_vertical_fov_degrees=output_vertical_fov_degrees,
+                )
+                for frame_index in range(len(session.frames))
+            )
+
+        workspace_rows = gpu_plan.output_band_rows or output_height
+
+        def bands() -> Any:
+            if gpu_plan.output_band_rows is None:
+                yield 0, output_height
+                return
+            row_start = 0
+            while row_start < output_height:
+                rows = min(workspace_rows, output_height - row_start)
+                yield row_start, rows
+                row_start += rows
+
+        histogram_required = needs_sdr and (auto_contrast or not allow_incomplete)
+        if histogram_required:
+            output.prepare_auto_contrast()
+        dispatched = True
+        if auto_contrast and needs_sdr:
+            for row_start, rows in bands():
+                check_cancelled()
+                output.compose(
+                    frame_requests(row_start, rows),
+                    feather=blend != "hard",
+                    mark_incomplete=allow_incomplete,
+                    global_gains=gains,
+                )
+                if source.encoding.transfer_function == "pq":
+                    output.tone_map_rec2020(source.encoding.reference_white_nits)
+                    output.convert_tone_mapped_rec2020_to_linear_srgb()
+                    output.accumulate_auto_contrast_srgb(converted=True)
+                else:
+                    output.accumulate_auto_contrast_srgb()
+                if progress_callback is not None:
+                    progress_callback(row_start + rows, output_height, "D3D12 compositing")
+            levels = output.select_auto_contrast_levels()
+            if not allow_incomplete and levels.processed_pixels != output_width * output_height:
+                raise ValueError("capture does not cover every output pixel")
+
+        host_output: NDArray[Any]
+        if needs_sdr:
+            host_output = np.empty((output_height, output_width, 3), dtype=np.uint8)
+        else:
+            host_output = np.empty((output_height, output_width, 3), dtype=np.float32)
+        temporary_coverage_path = (
+            _temporary_output_path(debug_coverage_path) if debug_coverage_path is not None else None
+        )
+        coverage_writer = (
+            _CoverageWriter(temporary_coverage_path, output_width, output_height)
+            if temporary_coverage_path is not None
+            else None
+        )
+        coverage_context = coverage_writer if coverage_writer is not None else nullcontext()
+        try:
+            with coverage_context:
+                for row_start, rows in bands():
+                    check_cancelled()
+                    output.compose(
+                        frame_requests(row_start, rows),
+                        feather=blend != "hard",
+                        mark_incomplete=allow_incomplete,
+                        global_gains=gains,
                     )
-                    if not allow_incomplete and output_job.uncovered_count(rows):
-                        raise ValueError("capture does not cover every output pixel")
-                    output_job.build_auto_contrast_histogram(
-                        rows=rows,
-                        transfer_function=source.encoding.transfer_function,
-                        reference_white_nits=source.encoding.reference_white_nits,
+                    if histogram_required and not auto_contrast:
+                        output.accumulate_auto_contrast_srgb()
+                    if coverage_writer is not None:
+                        coverage = np.empty((rows, output_width), dtype=np.uint8)
+                        output.download_coverage(
+                            memoryview(coverage),
+                            output_width=output_width,
+                            row_start=row_start,
+                            row_count=rows,
+                            cancellation=token,
+                        )
+                        coverage_writer.write(coverage != 0)
+                    if needs_sdr:
+                        if source.encoding.transfer_function == "pq":
+                            output.tone_map_rec2020(source.encoding.reference_white_nits)
+                            output.convert_tone_mapped_rec2020_to_linear_srgb()
+                            output.apply_auto_contrast_srgb(
+                                apply_levels=auto_contrast, converted=True
+                            )
+                        else:
+                            output.apply_auto_contrast_srgb(apply_levels=auto_contrast)
+                        output.quantize_srgb8()
+                    else:
+                        output.copy_linear_float()
+                    check_cancelled()
+                    assert token is not None
+                    output.download(
+                        memoryview(host_output[row_start : row_start + rows]),
+                        output_width=output_width,
+                        row_start=row_start,
+                        row_count=rows,
+                        floating_point=not needs_sdr,
+                        cancellation=token,
                     )
                     if progress_callback is not None:
-                        progress_callback(row_start + rows, output_height, phases["compositing"])
-
-                _histogram_bands, compositing_seconds = _run_adaptive_cuda_bands(
-                    cuda_session, output_job, output_height, build_histogram_band
-                )
-                output_job.select_auto_contrast_levels()
-                phase_seconds["compositing"] = compositing_seconds
+                        progress_callback(row_start + rows, output_height, "D3D12 conversion")
+        except Exception:
+            if temporary_coverage_path is not None:
+                temporary_coverage_path.unlink(missing_ok=True)
+            raise
+        if histogram_required and not auto_contrast:
+            levels = output.select_auto_contrast_levels()
+            if levels.processed_pixels != output_width * output_height:
+                raise ValueError("capture does not cover every output pixel")
+        if return_preview:
+            if not needs_sdr:
+                raise RuntimeError("D3D12 previews require an SDR output buffer")
+            return PreviewResult(host_output, ExposureReport(0, 0, gains))
+        temporary_path = _temporary_output_path(output_path)
+        try:
+            if cancel_event is not None and cancel_event.is_set():
+                raise RenderCancelledError("render cancelled")
+            if needs_sdr:
+                _write_gpu_sdr_output(temporary_path, host_output, output_suffix, jpeg_quality)
             else:
-                phase_seconds["compositing"] = 0.0
-
-            phase_started = time.perf_counter()
-
-            def convert_output_band(row_start: int, rows: int) -> None:
-                if cancel_event is not None and cancel_event.is_set():
-                    raise RenderCancelledError("render cancelled")
-                output_job.compose_band(
-                    row_start=row_start,
-                    rows=rows,
-                    latitude_span=latitude_span,
-                    horizontal_fov=session.horizontal_fov_deg,
-                    vertical_fov=session.vertical_fov_deg,
-                    transfer_function=source.encoding.transfer_function,
-                    hard_blend=blend == "hard",
-                    incomplete_magenta=allow_incomplete,
-                )
-                if not allow_incomplete and output_job.uncovered_count(rows):
-                    raise ValueError("capture does not cover every output pixel")
-                if needs_sdr_conversion:
-                    output_job.convert_band(
-                        rows=rows,
-                        transfer_function=source.encoding.transfer_function,
-                        reference_white_nits=source.encoding.reference_white_nits,
-                        apply_auto_contrast=auto_contrast_active,
-                    )
-                output_job.download_band(
-                    host_output[row_start : row_start + rows], rows, converted=needs_sdr_conversion
-                )
-                if host_coverage is not None:
-                    output_job.download_coverage(host_coverage[row_start : row_start + rows], rows)
-                if progress_callback is not None:
-                    progress_callback(row_start + rows, output_height, phases["conversion"])
-
-            _output_bands, output_seconds = _run_adaptive_cuda_bands(
-                cuda_session, output_job, output_height, convert_output_band
-            )
-            if not auto_contrast_active:
-                phase_seconds["compositing"] = output_seconds
-            phase_seconds["conversion_download"] = time.perf_counter() - phase_started
-
-            if return_preview:
-                if not needs_sdr_conversion:
-                    raise RuntimeError("CUDA previews require an SDR conversion buffer")
-                if diagnostics_callback is not None:
-                    diagnostics_callback(
-                        CudaRenderDiagnostics(
-                            cuda_session.transfer_stats, tuple(phase_seconds.items())
-                        )
-                    )
-                return PreviewResult(host_output, report)
-            temporary_path = _temporary_output_path(output_path)
-            temporary_coverage_path = (
-                _temporary_output_path(debug_coverage_path)
-                if debug_coverage_path is not None
-                else None
-            )
-            phase_started = time.perf_counter()
-            try:
-                if needs_sdr_conversion:
-                    _write_cuda_sdr_output(temporary_path, host_output, output_suffix, jpeg_quality)
-                else:
-                    _write_exr(temporary_path, host_output, source.encoding)
-                if temporary_coverage_path is not None and host_coverage is not None:
-                    Image.fromarray(host_coverage, mode="L").save(
-                        temporary_coverage_path, format="PNG"
-                    )
-                os.replace(temporary_path, output_path)
-                if temporary_coverage_path is not None and debug_coverage_path is not None:
-                    os.replace(temporary_coverage_path, debug_coverage_path)
-                if progress_callback is not None:
-                    progress_callback(1, 1, phases["writing"])
-            except Exception:
-                temporary_path.unlink(missing_ok=True)
-                if temporary_coverage_path is not None:
-                    temporary_coverage_path.unlink(missing_ok=True)
-                raise
-            phase_seconds["encode"] = time.perf_counter() - phase_started
-            if session_thumbnail:
-                _render_cuda_thumbnail(
-                    cuda_session,
-                    session,
-                    source,
-                    thumbnail_output_path(output_path),
-                    blend,
-                    allow_incomplete,
-                    output_suffix,
-                    jpeg_quality,
-                    auto_contrast,
-                    manual_gains,
-                )
-            if diagnostics_callback is not None:
-                diagnostics_callback(
-                    CudaRenderDiagnostics(cuda_session.transfer_stats, tuple(phase_seconds.items()))
-                )
-        return report
-
-
-def _render_cuda(
-    session: SessionMetadata,
-    image_root: Path,
-    output_path: Path,
-    source: SourceInfo,
-    output_width: int,
-    output_height: int,
-    blend: str,
-    allow_incomplete: bool,
-    output_suffix: str,
-    jpeg_quality: int,
-    auto_contrast: bool,
-    debug_coverage_path: Path | None,
-    cancel_event: Event | None,
-    progress_callback: Callable[[int, int, str], None] | None,
-    gpu_plan: CudaMemoryPlan,
-    session_thumbnail: bool = False,
-    return_preview: bool = False,
-    diagnostics_callback: Callable[[CudaRenderDiagnostics], None] | None = None,
-    manual_gains: tuple[float, ...] | None = None,
-) -> ExposureReport | PreviewResult:
-    """Prepare one CUDA session, render it once, and release its device ownership."""
-
-    prepared = prepare_cuda_session(
-        session, image_root, source, gpu_plan, cancel_event, progress_callback
-    )
-    try:
-        return _render_prepared_cuda(
-            session,
-            image_root,
-            output_path,
-            source,
-            output_width,
-            output_height,
-            blend,
-            allow_incomplete,
-            output_suffix,
-            jpeg_quality,
-            auto_contrast,
-            debug_coverage_path,
-            cancel_event,
-            progress_callback,
-            gpu_plan,
-            prepared,
-            session_thumbnail,
-            return_preview,
-            diagnostics_callback,
-            manual_gains,
-        )
+                _write_exr(temporary_path, host_output, source.encoding)
+            if cancel_event is not None and cancel_event.is_set():
+                raise RenderCancelledError("render cancelled")
+            if temporary_coverage_path is not None and debug_coverage_path is not None:
+                os.replace(temporary_coverage_path, debug_coverage_path)
+            os.replace(temporary_path, output_path)
+        except Exception:
+            temporary_path.unlink(missing_ok=True)
+            raise
+        if progress_callback is not None:
+            progress_callback(1, 1, "writing")
+        return ExposureReport(0, 0, gains)
+    except D3D12RenderCancelledError as error:
+        raise RenderCancelledError(str(error)) from error
+    except D3D12AdapterUnavailableError as error:
+        if not dispatched:
+            raise GpuPreflightError(str(error)) from error
+        raise
     finally:
-        prepared.close()
+        if output is not None:
+            output.close()
+        if prepared is not None and owns_prepared:
+            prepared.close()
+        if token is not None:
+            token.close()
 
 
 def render_session(
@@ -2072,12 +1986,11 @@ def render_session(
     gpu_memory_budget_bytes: int | None = None,
     backend_callback: Callable[[str, str], None] | None = None,
     strict_gpu: bool = False,
-    gpu_diagnostics_callback: Callable[[CudaRenderDiagnostics], None] | None = None,
-    cuda_session_cache: CudaSessionCache | None = None,
-    cuda_session_path: Path | None = None,
+    gpu_session_cache: GpuSessionCache | None = None,
+    gpu_session_path: Path | None = None,
     manual_gains: tuple[float, ...] | None = None,
 ) -> ExposureReport:
-    """Dispatch one render to the CUDA-only or bounded CPU pipeline."""
+    """Dispatch one render to the D3D12 or bounded CPU pipeline."""
 
     cpu_arguments = (
         session,
@@ -2115,7 +2028,7 @@ def render_session(
         output_width, output_height = _output_dimensions(renderable, source.width, width)
         plan_width = max(output_width, source.width) if session_thumbnail else output_width
         plan_height = max(output_height, source.height) if session_thumbnail else output_height
-        selection, gpu_plan = select_cuda_backend(
+        selection, gpu_plan = select_gpu_backend(
             frame_count=len(renderable.frames),
             source_width=source.width,
             source_height=source.height,
@@ -2127,8 +2040,6 @@ def render_session(
             gpu_budget_bytes=gpu_memory_budget_bytes,
             strict=strict_gpu,
         )
-        if selection.backend == "cuda":
-            compile_cuda_module()
     except GpuUnavailableError as error:
         if strict_gpu:
             raise
@@ -2145,17 +2056,48 @@ def render_session(
         if backend_callback is not None:
             backend_callback("cpu", detail)
         return _render_cpu(*cpu_arguments, None, manual_gains)
-    LOGGER.info("render backend selected: CUDA %s (%s)", selection.memory_mode, detail)
-    if backend_callback is not None:
-        backend_callback(f"cuda {selection.memory_mode}", detail)
-    prepared: PreparedCudaSession | None = None
-    cache_owner: CudaSessionCache | None = None
-    try:
-        if cuda_session_cache is None or cuda_session_path is None:
-            cuda_result = _render_cuda(
+    if selection.backend == "gpu":
+        LOGGER.info("render backend selected: D3D12 %s (%s)", selection.memory_mode, detail)
+        if backend_callback is not None:
+            backend_callback(f"gpu {selection.memory_mode}", detail)
+        staged_output_path = _temporary_output_path(output_path) if session_thumbnail else None
+        staged_thumbnail_path = (
+            _temporary_output_path(thumbnail_output_path(output_path))
+            if session_thumbnail
+            else None
+        )
+        staged_coverage_path = (
+            _temporary_output_path(debug_coverage_path)
+            if session_thumbnail and debug_coverage_path is not None
+            else None
+        )
+        try:
+            d3d12_prepared = None
+            if gpu_session_cache is not None and gpu_session_path is not None:
+                from pano_stitch.d3d12_adapter import load_d3d12_adapter
+
+                device = load_d3d12_adapter().probe()
+                device_name = (
+                    bytes(device.name).split(b"\0", 1)[0].decode("utf-8", errors="replace")
+                )
+                key = d3d12_session_cache_key(
+                    device_name=device_name,
+                    adapter_luid=int(device.luid),
+                    session_path=gpu_session_path,
+                    session=renderable,
+                    image_root=image_root,
+                    gpu_memory_budget_bytes=gpu_memory_budget_bytes,
+                )
+                d3d12_prepared = gpu_session_cache.get_d3d12(key)
+                if d3d12_prepared is None:
+                    d3d12_prepared = _prepare_d3d12_session(
+                        renderable, image_root, source, cancel_event, progress_callback
+                    )
+                    gpu_session_cache.store_d3d12(key, d3d12_prepared)
+            d3d12_result = _render_d3d12_resident(
                 renderable,
                 image_root,
-                output_path,
+                staged_output_path or output_path,
                 source,
                 output_width,
                 output_height,
@@ -2164,64 +2106,85 @@ def render_session(
                 output_suffix,
                 jpeg_quality,
                 auto_contrast,
-                debug_coverage_path,
                 cancel_event,
                 progress_callback,
                 gpu_plan,
-                session_thumbnail=session_thumbnail,
-                diagnostics_callback=gpu_diagnostics_callback,
-                manual_gains=manual_gains,
+                manual_gains,
+                prepared_session=d3d12_prepared,
+                debug_coverage_path=staged_coverage_path or debug_coverage_path,
             )
-        else:
-            prepared, cache_owner = _cached_or_prepared_cuda_session(
-                cache=cuda_session_cache,
-                session_path=cuda_session_path,
-                session=renderable,
-                image_root=image_root,
-                source=source,
-                gpu_plan=gpu_plan,
-                gpu_memory_budget_bytes=gpu_memory_budget_bytes,
-                cancel_event=cancel_event,
-                progress_callback=progress_callback,
-            )
-            cuda_result = _render_prepared_cuda(
-                renderable,
-                image_root,
-                output_path,
-                source,
-                output_width,
-                output_height,
-                blend,
-                allow_incomplete,
-                output_suffix,
-                jpeg_quality,
-                auto_contrast,
-                debug_coverage_path,
-                cancel_event,
-                progress_callback,
-                gpu_plan,
-                prepared,
-                session_thumbnail=session_thumbnail,
-                diagnostics_callback=gpu_diagnostics_callback,
-                manual_gains=manual_gains,
-            )
-    except CudaPreflightError as error:
-        if strict_gpu:
+            assert isinstance(d3d12_result, ExposureReport)
+            if staged_thumbnail_path is not None:
+                thumbnail_vertical_fov = float(
+                    np.degrees(
+                        2.0 * np.arctan((source.height / source.width) * np.tan(np.pi / 4.0))
+                    )
+                )
+                try:
+                    _render_d3d12_resident(
+                        renderable,
+                        image_root,
+                        staged_thumbnail_path,
+                        source,
+                        source.width,
+                        source.height,
+                        blend,
+                        allow_incomplete,
+                        output_suffix,
+                        jpeg_quality,
+                        auto_contrast,
+                        cancel_event,
+                        progress_callback,
+                        gpu_plan,
+                        manual_gains,
+                        prepared_session=d3d12_prepared,
+                        rectilinear_output=True,
+                        output_vertical_fov_degrees=thumbnail_vertical_fov,
+                    )
+                except GpuPreflightError as error:
+                    from pano_stitch.d3d12_adapter import D3D12AdapterUnavailableError
+
+                    raise D3D12AdapterUnavailableError(str(error)) from error
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RenderCancelledError("render cancelled")
+                assert staged_output_path is not None
+                publications: list[tuple[Path, Path]] = []
+                if staged_coverage_path is not None and debug_coverage_path is not None:
+                    publications.append((staged_coverage_path, debug_coverage_path))
+                publications.extend(
+                    (
+                        (staged_thumbnail_path, thumbnail_output_path(output_path)),
+                        (staged_output_path, output_path),
+                    )
+                )
+                _publish_staged_outputs(publications)
+            return d3d12_result
+        except GpuPreflightError as error:
+            if gpu_session_cache is not None:
+                gpu_session_cache.invalidate("render failed")
+            if strict_gpu:
+                raise
+            detail = str(error)
+            LOGGER.info("render backend selected: CPU (%s)", detail)
+        except RenderCancelledError:
+            if gpu_session_cache is not None:
+                gpu_session_cache.invalidate("render cancelled")
             raise
-        detail = str(error)
-        LOGGER.info("render backend selected: CPU (%s)", detail)
+        except Exception:
+            if gpu_session_cache is not None:
+                gpu_session_cache.invalidate("render failed")
+            raise
+        finally:
+            if staged_output_path is not None:
+                staged_output_path.unlink(missing_ok=True)
+            if staged_thumbnail_path is not None:
+                staged_thumbnail_path.unlink(missing_ok=True)
+            if staged_coverage_path is not None:
+                staged_coverage_path.unlink(missing_ok=True)
         if backend_callback is not None:
             backend_callback("cpu", detail)
         return _render_cpu(*cpu_arguments, None, manual_gains)
-    except Exception:
-        if cache_owner is not None:
-            cache_owner.invalidate("render failed")
-        raise
-    finally:
-        if prepared is not None and cache_owner is None:
-            prepared.close()
-    assert isinstance(cuda_result, ExposureReport)
-    return cuda_result
+    raise AssertionError(f"unexpected GPU backend: {selection.backend}")
 
 
 def validate_images(
@@ -2272,11 +2235,10 @@ def render_preview(
     use_gpu: bool | None = True,
     backend_callback: Callable[[str, str], None] | None = None,
     strict_gpu: bool = False,
-    gpu_diagnostics_callback: Callable[[CudaRenderDiagnostics], None] | None = None,
-    cuda_session_cache: CudaSessionCache | None = None,
-    cuda_session_path: Path | None = None,
+    gpu_session_cache: GpuSessionCache | None = None,
+    gpu_session_path: Path | None = None,
     gpu_memory_budget_bytes: int | None = None,
-    cuda_width_multiplier: int = 1,
+    gpu_width_multiplier: int = 1,
     manual_gains: tuple[float, ...] | None = None,
     exposure_report: ExposureReport | None = None,
 ) -> PreviewResult:
@@ -2284,8 +2246,8 @@ def render_preview(
 
     if width < 1:
         raise ValueError("preview width must be positive")
-    if cuda_width_multiplier < 1:
-        raise ValueError("CUDA preview width multiplier must be positive")
+    if gpu_width_multiplier < 1:
+        raise ValueError("GPU preview width multiplier must be positive")
     if output_suffix.lower() not in {".exr", ".jpg", ".jpeg", ".png"}:
         raise ValueError("output extension must be .exr, .jpg, .jpeg, or .png")
     image_root = image_root.resolve()
@@ -2300,17 +2262,17 @@ def render_preview(
         renderable = renderable_session(session, image_root, allow_incomplete)
         try:
             source = _source_info_for_session(renderable, image_root)
-            cuda_width = width * cuda_width_multiplier
-            output_width, output_height = _output_dimensions(renderable, source.width, cuda_width)
+            gpu_width = width * gpu_width_multiplier
+            output_width, output_height = _output_dimensions(renderable, source.width, gpu_width)
             viewport_height = max(1, round(width * output_height / output_width))
-            preview_cache_bytes = cuda_preview_display_bytes(
+            preview_cache_bytes = gpu_preview_display_bytes(
                 frame_count=len(renderable.frames),
                 preview_width=output_width,
                 preview_height=output_height,
                 viewport_width=width,
                 viewport_height=viewport_height,
             )
-            selection, gpu_plan = select_cuda_backend(
+            selection, gpu_plan = select_gpu_backend(
                 frame_count=len(renderable.frames),
                 source_width=source.width,
                 source_height=source.height,
@@ -2323,8 +2285,6 @@ def render_preview(
                 preview_cache_bytes=preview_cache_bytes,
                 strict=strict_gpu,
             )
-            if selection.backend == "cuda":
-                compile_cuda_module()
         except GpuUnavailableError as error:
             if strict_gpu:
                 raise
@@ -2334,71 +2294,55 @@ def render_preview(
         else:
             assert selection is not None
             detail = selection.reason
-        if selection is not None and selection.backend == "cuda" and gpu_plan is not None:
-            LOGGER.info("preview backend selected: CUDA %s (%s)", selection.memory_mode, detail)
+        if selection is not None and selection.backend == "gpu" and gpu_plan is not None:
+            LOGGER.info("preview backend selected: D3D12 %s (%s)", selection.memory_mode, detail)
             if backend_callback is not None:
-                backend_callback(f"cuda {selection.memory_mode}", detail)
+                backend_callback(f"gpu {selection.memory_mode}", detail)
             try:
-                if cuda_session_cache is None or cuda_session_path is None:
-                    preview = _render_cuda(
-                        renderable,
-                        image_root,
-                        image_root / "preview.png",
-                        source,
-                        output_width,
-                        output_height,
-                        blend,
-                        allow_incomplete,
-                        ".png",
-                        95,
-                        auto_contrast and output_suffix.lower() != ".exr",
-                        None,
-                        cancel_event,
-                        progress_callback,
-                        gpu_plan,
-                        return_preview=True,
-                        diagnostics_callback=gpu_diagnostics_callback,
-                        manual_gains=manual_gains,
+                d3d12_prepared = None
+                if gpu_session_cache is not None and gpu_session_path is not None:
+                    from pano_stitch.d3d12_adapter import load_d3d12_adapter
+
+                    device = load_d3d12_adapter().probe()
+                    device_name = (
+                        bytes(device.name).split(b"\0", 1)[0].decode("utf-8", errors="replace")
                     )
-                else:
-                    prepared, cache_owner = _cached_or_prepared_cuda_session(
-                        cache=cuda_session_cache,
-                        session_path=cuda_session_path,
+                    key = d3d12_session_cache_key(
+                        device_name=device_name,
+                        adapter_luid=int(device.luid),
+                        session_path=gpu_session_path,
                         session=renderable,
                         image_root=image_root,
-                        source=source,
-                        gpu_plan=gpu_plan,
                         gpu_memory_budget_bytes=gpu_memory_budget_bytes,
-                        cancel_event=cancel_event,
-                        progress_callback=progress_callback,
                     )
-                    assert cache_owner is not None
-                    try:
-                        preview = _render_prepared_cuda(
-                            renderable,
-                            image_root,
-                            image_root / "preview.png",
-                            source,
-                            output_width,
-                            output_height,
-                            blend,
-                            allow_incomplete,
-                            ".png",
-                            95,
-                            auto_contrast and output_suffix.lower() != ".exr",
-                            None,
-                            cancel_event,
-                            progress_callback,
-                            gpu_plan,
-                            prepared,
-                            return_preview=True,
-                            diagnostics_callback=gpu_diagnostics_callback,
-                            manual_gains=manual_gains,
+                    d3d12_prepared = gpu_session_cache.get_d3d12(key)
+                    if d3d12_prepared is None:
+                        d3d12_prepared = _prepare_d3d12_session(
+                            renderable, image_root, source, cancel_event, progress_callback
                         )
-                    except Exception:
-                        cache_owner.invalidate("preview failed")
-                        raise
-            except CudaPreflightError:
+                        gpu_session_cache.store_d3d12(key, d3d12_prepared)
+                preview = _render_d3d12_resident(
+                    renderable,
+                    image_root,
+                    image_root / "preview.png",
+                    source,
+                    output_width,
+                    output_height,
+                    blend,
+                    allow_incomplete,
+                    ".png",
+                    95,
+                    auto_contrast and output_suffix.lower() != ".exr",
+                    cancel_event,
+                    progress_callback,
+                    gpu_plan,
+                    manual_gains,
+                    return_preview=True,
+                    prepared_session=d3d12_prepared,
+                )
+            except GpuPreflightError:
+                if gpu_session_cache is not None:
+                    gpu_session_cache.invalidate("preview failed")
                 if strict_gpu:
                     raise
                 use_gpu = False

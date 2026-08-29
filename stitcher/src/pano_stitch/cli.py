@@ -105,7 +105,7 @@ def _parser() -> argparse.ArgumentParser:
         "--gpu",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="use CUDA when available and the panorama fits VRAM (default: enabled)",
+        help="use D3D12 when available and the panorama fits VRAM (default: enabled)",
     )
     render.add_argument(
         "--gpu-memory-budget-mib",
@@ -115,7 +115,7 @@ def _parser() -> argparse.ArgumentParser:
     render.add_argument(
         "--gpu-strict",
         action="store_true",
-        help="fail instead of falling back to CPU when CUDA cannot be selected",
+        help="fail instead of falling back to CPU when D3D12 cannot be selected",
     )
     render.add_argument("--allow-incomplete", action="store_true")
     return parser

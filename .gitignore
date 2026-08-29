@@ -9,6 +9,7 @@ dist/
 .venv/
 .venv-win/
 .venv-release/
+/.local/
 
 # Local game-development inputs and third-party checkout; release builds fetch/package
 # only the source-controlled payload.

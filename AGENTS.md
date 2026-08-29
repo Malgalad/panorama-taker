@@ -8,6 +8,7 @@
 - Keep changes narrow; preserve unrelated user work and public behavior.
 - Prefer existing types/helpers. Comment only non-obvious invariants. Add focused regression tests.
 - Report only checks actually run.
+- If `.local/windows-d3d12-runbook.md` exists, read it before invoking Windows build or test tools.
 - Never launch/deploy to the game, delete captures, or overwrite user output without permission.
 
 ## Project map

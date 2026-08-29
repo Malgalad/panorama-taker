@@ -1,5 +1,131 @@
 # Current implementation state
 
+## D3D12 stitcher migration
+
+- Native review rewind (2026-08-28): review found Release-disabled native assertions,
+  non-idempotent cancellation-token destruction, exception leakage on allocation failure,
+  first-hardware-adapter selection before capability checks, falsely successful missing memory
+  budgets, and skipped aligned 32-row band candidates. These findings reopen steps 3, 4, and 6;
+  the earliest incomplete substep is 3a. Step 5 must be rerun after the Release harness/ABI repair,
+  and 7a must not start until every reopened gate passes.
+- Step 3a repair (2026-08-28): replaced native-test `assert` calls with an always-evaluated check
+  helper and added an expected-failure CTest. Portable Debug/Release CTests and the Windows MSVC
+  Release expected-failure test now prove checks execute under `NDEBUG`; the regular Windows WARP
+  dispatch test remains reopened separately after exposing a device-removal failure.
+- Step 3c/3d repair (2026-08-28): made cancellation-token creation clear its out-handle and
+  translate allocation failures to `PANO_GPU_OUT_OF_MEMORY`; test-only allocation injection proves
+  that path. Destroy APIs now consume pointer-to-handle slots and null them before releasing, so
+  repeated cleanup is harmless. Portable Debug/Release CTests and the focused MSVC Release token
+  test pass.
+- Step 4b/4c repair (2026-08-28): adapter enumeration now attempts device/capability/budget
+  admission for every non-software candidate instead of accepting the first hardware adapter.
+  Failed `IDXGIAdapter3` conversion or local-memory query rejects the candidate; probe output is
+  initialized deterministically before fallible work. The poisoned portable unavailable-path test
+  and MSVC Release WARP preflight pass.
+- Step 6b repair (2026-08-28): band planning begins at the largest 32-row-aligned candidate and
+  stops safely at 32 rows. The native regression proves a 40-row output selects a 32-row band when
+  the resident output does not fit. Portable Debug/Release CTests, 109 available Python tests,
+  Ruff, formatting, mypy, and focused MSVC Release native tests pass.
+- Step 5 repair and Step 6 rerun (2026-08-28): the WARP self-test output resource now declares
+  `D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS`, separate from the plain upload/readback buffers.
+  This fixes the prior device-removal failure at command-allocator creation; deterministic WARP
+  dispatch/readback passes. All portable Debug/Release CTests and all four MSVC Release CTests now
+  pass, including WARP preflight and dispatch.
+- Step 7a.1–7a.3 (2026-08-28): added versioned live-object diagnostics, an explicit-test WARP
+  device handle owning adapter/device/queue/fence, idempotent handle destruction, and handle-based
+  fill dispatch. The compatibility self-test now creates, dispatches, and destroys that handle.
+  Portable Debug/Release CTests and all MSVC Release CTests pass; the WARP contract proves direct
+  and wrapper dispatch return device, queue, and fence counts to zero.
+- Step 7a.4 (2026-08-28): extracted the fully compatible adapter-selection factory for both
+  preflight and persistent device creation, enabled product hardware creation through it, and added
+  device-scoped identity/usable-memory diagnostics. Product creation continues past incompatible
+  adapters and rejects software; WARP remains opt-in. Portable Debug/Release CTests and all MSVC
+  Release CTests pass. Physical-adapter identity acceptance remains a manual hardware matrix item.
+- Step 7b.1/7b.2 (2026-08-28): declared the fixed-width 72-byte x64 empty-session ABI and native
+  sample types, then added non-allocating validation of the parent LUID, dimensions, native sample
+  type, packed RGB stride, and coherent optional metadata buffers. Native and ctypes ABI-layout
+  tests pass; portable Debug/Release and MSVC Release CTests pass.
+- Step 7b.3 (2026-08-28): moved device ownership behind an internal reference-counted core, then
+  added empty sessions that retain it without source resources. The native C ABI is now version 2
+  to reject old diagnostics layouts. WARP tests cover session-before-device and device-before-
+  session destruction plus injected session-allocation failure; all live device, queue, fence, and
+  session counters return to zero. Portable Debug/Release and MSVC Release CTests pass.
+- Step 7c.1 (2026-08-28): added an explicit, checked, 64 KiB-aligned default-heap allocation for
+  one native-precision source buffer. A test-only byte query and allocation-failure hook prove a
+  tiny RGB8 source allocates exactly 64 KiB, failure leaves zero bytes, and repeat allocation is
+  rejected. Portable Debug/Release and MSVC Release CTests pass.
+- Step 7c.2 (2026-08-28): extended the resident source buffer to all validated frames before
+  alignment. WARP verifies a two-frame RGB8 fixture reserves ten 64 KiB blocks, distinct from the
+  one-frame allocation; portable Debug/Release and MSVC Release CTests pass.
+- Step 7c.3.1 (2026-08-28): added immutable default-heap rotation storage with independent
+  requested-versus-allocated byte tracking and injected allocation failure. WARP proves failed
+  allocation reports zero bytes, successful one-frame matrices reserve 64 KiB, and repeated
+  allocation is rejected. Portable Debug/Release and MSVC Release CTests pass.
+- Step 7c.3.2 (2026-08-28): added one validated rotation upload through a temporary mapped upload
+  resource, command list, and monotonic persistent-device fence. The staging object is released
+  after completion and repeat upload is rejected. Portable Debug/Release and MSVC Release CTests
+  pass; the WARP sequence also covers upload followed by direct dispatch.
+- Step 7c.3.3 (2026-08-28): added test-only temporary readback of uploaded rotation matrices.
+  Deterministic nonzero matrices round-trip byte-for-byte on WARP; no readback object is retained.
+  Portable Debug/Release and MSVC Release CTests pass.
+- Step 7c.4.1 (2026-08-28): added optional immutable encoding-metadata storage. Null metadata
+  creates no resource; present metadata uses checked 64 KiB-aligned default-heap storage and has an
+  independent allocation-failure hook. Portable Debug/Release and MSVC Release CTests pass.
+- Step 7c.4.2 (2026-08-28): added one validated optional encoding-metadata upload through a
+  temporary staging resource and monotonic persistent-device fence. Repeat upload is rejected and
+  staging does not persist. Portable Debug/Release and MSVC Release CTests pass.
+- Step 7c.4.3 (2026-08-28): added test-only temporary encoding-metadata readback. The present
+  five-byte fixture round-trips exactly on WARP, while absent metadata retains no bytes. Portable
+  Debug/Release and MSVC Release CTests pass.
+- Step 7c.5 (2026-08-28): added versioned session allocation diagnostics for planned and actual
+  source, rotation, and encoding-metadata bytes. WARP verifies plans match allocations, including
+  absent metadata. Portable Debug/Release and MSVC Release CTests pass.
+- Step 7d.1 (2026-08-28): added the versioned caller-buffer source-upload ABI and pure validation
+  against session frame index, sample type, row stride, and exact frame byte count. WARP contract
+  tests cover valid input and invalid index/byte-count/sample-type cases; portable Debug/Release
+  and MSVC Release CTests pass.
+- Step 7d.2 (2026-08-28): added one persistent mapped upload-heap slot, sized to a checked aligned
+  native source frame and explicitly unmapped during session destruction. WARP verifies one 64 KiB
+  slot for the RGB8 fixture and safely rejects repeat allocation. Portable Debug/Release and MSVC
+  Release CTests pass.
+- Step 7d.3.1 (2026-08-28): added a validated frame-zero source copy through the persistent slot,
+  command list, and monotonic fence. The WARP contract submits a deterministic nonzero RGB8 frame
+  after validation; portable Debug/Release and MSVC Release CTests pass.
+- Step 7d.3.2 (2026-08-28): added test-only temporary frame-zero source readback. WARP proves the
+  deterministic RGB8 upload is byte-exact; portable Debug/Release and MSVC Release CTests pass.
+- Step 7d.4/7d.5 (2026-08-28): generalized source copy/readback internals while preserving strict
+  frame-zero wrappers, then verified two distinct frames reuse one 64 KiB persistent slot and
+  round-trip in order on WARP. Session diagnostics now report checked upload count, raw byte total,
+  and last completed fence. Portable Debug/Release and MSVC Release CTests pass; the ABI is v3.
+
+- Step 1 (2026-08-28): added platform-independent `gpu_contract`, future Windows WARP, and
+  hardware-acceptance pytest markers; extracted deterministic renderer-test builders; added CPU
+  regression coverage for output formats, PQ conversion, and incomplete coverage/magenta pixels.
+- Step 2 (2026-08-28): added backend-neutral GPU contract names and a `"gpu"` selector while
+  preserving the temporary CUDA compatibility surface.
+- Step 3 (2026-08-28): added the standalone native C ABI skeleton, idempotent destroy entry points,
+  cancellation token, controlled unavailable probe, native CTest, and Linux-safe ctypes loader.
+  Linux verification passed: native CMake/CTest plus Ruff, formatting, mypy, and 109 Python tests
+  excluding CUDA hardware runtime tests. Windows DLL loading and WARP validation remain pending.
+- Step 4 (2026-08-28): added versioned probe options and adapter diagnostics plus DXGI
+  high-performance hardware enumeration, software-adapter rejection, explicit test-only WARP,
+  feature-level 11_0 device creation, and local-memory budget/usage query. The portable contract
+  path passes locally; the required Windows WARP build/probe and physical-adapter acceptance remain
+  pending, so later D3D12 dispatch work must not yet proceed.
+- Step 4 Windows gate (2026-08-28): staged the native source under `C:\dev` for MSVC because
+  Windows cannot use the WSL UNC working directory. MSVC 19.51/Windows SDK 10.0.26100 built the
+  DLL and CTest successfully performed explicit WARP preflight.
+- Step 5 (2026-08-28): added a committed SM 5.1 fill shader compiled by `fxc.exe` at CMake build
+  time and embedded into the DLL. The WARP CTest creates the root signature, pipeline, descriptor
+  heap, upload/default/readback resources, direct queue, command list, and fence, then verifies
+  deterministic readback. `dumpbin /dependents` confirms the release DLL depends on D3D12/DXGI and
+  standard Windows/MSVC runtime libraries only; it has no runtime shader compiler, CUDA, or vendor
+  library dependency.
+- Step 6 (2026-08-28): added the native checked-arithmetic D3D12 memory planner with 64 KiB
+  resource alignment, the existing reserve/minimum-banded policy, descriptor accounting, and a
+  `uint32` histogram-population admission guard. Portable and MSVC CTests cover resident admission
+  and histogram overflow; MSVC's Windows `max` macro collision was fixed with `NOMINMAX`.
+
 Last verified: 2026-08-20.
 
 ## Working now
@@ -501,3 +627,1254 @@ newer queued requests. Tk still applies the downloaded viewport image. CPU
 fallback retains the background Pillow compositor. Focused CPU tests and the
 elevated 13-test CUDA runtime suite pass; packaged Windows responsiveness and
 visual hit testing remain part of the clean-machine release gate.
+
+D3D12 migration 7e.1 (2026-08-28): sessions now allocate a second bounded,
+persistent mapped upload slot only after the proven first slot exists. Each slot
+has distinct mapping and fence state, duplicate second-slot allocation is
+rejected, and session destruction explicitly unmaps both. Native Debug/Release
+contract suites and the Windows MSVC Release/WARP suite pass.
+
+D3D12 migration 7e.2-7e.3 (2026-08-28): source uploads now use an explicit
+local slot selection, preserving the first-slot-only path when no second slot
+exists and selecting resident slots round-robin when it does. The WARP
+readback test verifies both frame byte sequences and test-only slot-fence
+diagnostics prove both slots were selected. Native Debug/Release contract
+suites and the Windows MSVC Release/WARP suite pass.
+
+D3D12 migration 7e.4-7e.6 (2026-08-28): source upload waiting is isolated in
+a fence helper, uploads defer completion until their selected persistent slot
+is reused, and diagnostics report only fences observed complete. The WARP
+fixture uploads three frame payloads, proves first-slot fence advancement on
+reuse, and reads every frame back byte-for-byte. Native Debug/Release contract
+suites and the Windows MSVC Release/WARP suite pass.
+
+D3D12 migration 7e.7-7e.9 (2026-08-28): a new ABI-compatible cancellable
+upload entry point preserves the legacy uncancelled entry point. Uploads reject
+pre-cancelled tokens before a slot wait or command submission, and recheck
+cancellation after a reuse wait but before overwriting mapped bytes. A
+test-only hook forces that boundary and proves frame-zero bytes and slot fence
+state survive cancellation. Native Debug/Release contract suites and the
+Windows MSVC Release/WARP suite pass.
+
+D3D12 migration 7e.10 (2026-08-28): an explicit idle-safe upload finish entry
+waits the submitted first-slot fence without allocating or submitting further
+work. Native Debug/Release contract suites and the Windows MSVC Release/WARP
+suite pass.
+
+D3D12 migration 7e.11 (2026-08-28): finishing now waits each distinct submitted
+persistent upload-slot fence without allocating or submitting further work. The
+alternating three-frame fixture checks the final completion diagnostic. Native
+Debug/Release contract suites and the Windows MSVC Release/WARP suite pass.
+
+D3D12 migration 7e.12 (2026-08-28): upload finishing has an optional
+cancellation token with checks around each wait; the forced first-wait
+cancellation test leaves the ordinary finish path to complete both slots.
+Native Debug/Release contract suites and the Windows MSVC Release/WARP suite
+pass.
+
+D3D12 migration 7f.1 (2026-08-28): the C ABI now states that successfully
+uploaded source data remains resident until session destruction, establishing
+the ownership rule required before output and preview jobs can retain sessions.
+
+D3D12 migration 7f.2 (2026-08-28): a backend-neutral resident-session
+identity now includes backend kind, adapter LUID, and ABI version. Focused
+cache-key equality regressions prove every identity component affects reuse;
+Ruff, formatting, mypy, and focused pytest pass.
+
+D3D12 migration 7f.3 (2026-08-28): the existing CUDA key builder now carries
+a defaulted backend-neutral CUDA compatibility identity without changing its
+source, geometry, budget, cache-hit, replacement, or invalidation behavior.
+Ruff, formatting, mypy, and focused pytest pass.
+
+D3D12 migration 7f.4-7f.5 (2026-08-28): ctypes now declares native retained
+device/session lifecycle calls and a closeable prepared-session owner releases
+the session before its device, exactly once. Fake-library ABI and ownership
+tests, Ruff, formatting, and mypy pass.
+
+D3D12 migration 8a.1 (2026-08-28): versioned output-job options and a
+validation-only ABI now reject malformed resident/banded plan inputs before
+any job or GPU resource exists. Native Debug/Release contract suites and the
+Windows MSVC Release/WARP suite pass.
+
+D3D12 migration 8a.2.1 (2026-08-28): opaque native sessions now use an
+internal reference count, preserving all existing creation, upload,
+diagnostic, and pointer-to-handle destruction behavior while permitting a
+future child output handle to retain the session safely. Native Debug/Release
+contract suites and the Windows MSVC Release/WARP suite pass.
+
+D3D12 migration 8a.2.2 (2026-08-28): an empty native output handle now
+retains its session after caller-handle destruction and releases that final
+reference exactly once on output destruction. Native Debug/Release contract
+suites and the Windows MSVC Release/WARP suite pass.
+
+D3D12 migration 8a.2.3 (2026-08-28): resident output handles now calculate
+and allocate one aligned float32 linear-RGB resource exactly once, and expose
+planned/actual allocation diagnostics. The portable Debug/Release contract
+suites and the Windows MSVC Release/WARP suite pass.
+
+D3D12 migration 8a.2.4 (2026-08-28): resident output handles now separately
+plan and allocate their full-resolution coverage buffer, reporting exact
+planned/actual RGB and coverage bytes. The portable Debug/Release contract
+suites and the Windows MSVC Release/WARP suite pass.
+
+D3D12 migration 8a.3.1 (2026-08-28): output diagnostics now retain and
+report the accepted resident-versus-banded mode without allocating a resource.
+The portable Debug/Release contract suites and the Windows MSVC Release/WARP
+suite pass.
+
+D3D12 migration 8a.3.2 (2026-08-28): a banded output now plans only its
+initial `[0, band_rows)` RGB and coverage storage range. A large forced-banded
+contract fixture proves those plans are bounded below resident output size;
+portable Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8a.3.3 (2026-08-28): the existing output allocators now have
+WARP coverage for a large forced-banded job, proving they create only the
+initial RGB and coverage band sizes. Portable Debug/Release and Windows MSVC
+Release/WARP suites pass.
+
+D3D12 migration 8a.4.1 (2026-08-28): native diagnostics now report live
+output-job handles, registered only after construction succeeds and released
+once with the handle. Resident, banded, and parent-release contract paths
+pass in portable Debug/Release and Windows MSVC Release/WARP suites.
+
+D3D12 migration 8a.4.2 (2026-08-28): focused output-handle allocation
+failure injection now returns ABI-safe out-of-memory, preserves a null
+out-handle, and leaves all live diagnostics unchanged. Portable Debug/Release
+and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8a.4.3 (2026-08-28): output teardown now releases its RGB
+and coverage resources before its retained session. Allocated resident output
+survives parent session/device-handle release and repeated destroy; all live
+counts return to zero in portable Debug/Release and Windows MSVC Release/WARP
+suites.
+
+D3D12 migration 8b.1 (2026-08-28): a test-only versioned projection contract
+now validates output geometry, row ranges, latitude/FoVs, and finite row-major
+rotation values without allocating D3D12 resources. It returns exact world-ray,
+camera-ray, projected-coordinate, and validity buffer sizes. Portable
+Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8b.2.1 (2026-08-28): the dedicated `cs_5_1` ray-only shader
+now compiles to an embedded header independently of the existing fill self-test
+shader. Portable CMake Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8b.2.2 (2026-08-28): a test-only D3D12 ray dispatch now binds
+validated row-range constants and a temporary float3 UAV, then waits for its
+fence without sampling sources or projecting cameras. Portable Debug/Release
+and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8b.2.3 (2026-08-28): the ray dispatch now optionally copies
+its temporary float3 UAV to an exact-size caller-owned buffer after fence
+completion. WARP results match the independent pixel-center 4x2 CPU oracle,
+and invalid readback buffers are rejected. Portable Debug/Release and Windows
+MSVC Release/WARP suites pass.
+
+D3D12 migration 8b.3.1-8b.3.2 (2026-08-28): ray dispatch now uploads a
+16-byte-aligned row-major world-to-camera matrix and returns camera rays.
+Identity and 90-degree Y-axis WARP readbacks match independent CPU row-vector
+multiplication. Windows MSVC Release/WARP suite passes.
+
+D3D12 migration 8b.4.1 (2026-08-28): the ray test shader and dispatch now
+bind source dimensions plus focal lengths in a 16-byte-aligned constant block,
+without changing camera-ray generation or requiring a projected-coordinate
+readback. Portable Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8b.4.2 (2026-08-28): the ray test dispatch now writes a
+second float2 UAV and optionally reads its exact validated byte count back to
+the caller. WARP center and unclamped edge/behind-camera coordinates match an
+independent CPU projection oracle; portable Debug/Release and Windows MSVC
+Release/WARP suites pass.
+
+D3D12 migration 8b.4.3.1 (2026-08-28): the ray test shader now produces a
+cleared packed validity-bit UAV using `z > 0` and half-pixel bounds, which the
+test hook expands into its one-byte-per-pixel caller layout. WARP center,
+edge, and behind-camera masks match the CPU oracle; portable Debug/Release and
+Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8b.4.3.2 (2026-08-28): projected coordinates are now
+clamped to source pixel centers only after their raw half-pixel validity
+decision. WARP center, boundary, and behind-camera coordinate/mask readbacks
+match the CPU oracle; portable Debug/Release and Windows MSVC Release/WARP
+suites pass.
+
+D3D12 migration 8c.1 (2026-08-28): a versioned test-only `uint8` sampling
+contract now validates exact coordinate/result byte counts and source-frame
+readiness. Session uploads retain a per-frame completion fence so a completed
+but different frame cannot be sampled; portable Debug/Release and Windows
+MSVC Release/WARP suites pass.
+
+D3D12 migration 8c.2.1 (2026-08-28): resident source buffers now transition
+from upload `COPY_DEST` to the combined non-pixel-shader/copy-source read
+state only after `finish_uploads`, then transition back before later uploads.
+Repeated upload/finish/readback cycles and the strengthened completion-fence
+diagnostic pass in portable Debug/Release and Windows MSVC Release/WARP suites.
+
+D3D12 migration 8c.2.2 (2026-08-28): a dedicated embedded `cs_5_1` shader
+now binds completed resident `R8_UINT` source data, a caller coordinate SRV,
+and a temporary float3 result UAV. Exact corner loads match direct CPU bytes
+normalized by 255; portable Debug/Release and Windows MSVC Release/WARP suites
+pass.
+
+D3D12 migration 8c.3 (2026-08-28): the `uint8` sampling shader now performs
+four interleaved-RGB loads and float bilinear interpolation. Exact corners and
+an interior half-pixel match an independent CPU four-tap oracle; portable
+Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8c.4 (2026-08-28): finite `uint8` sampling coordinates now
+clamp to source centers in the shader before manual bilinear loads, while
+non-finite coordinates remain rejected at the ABI boundary. Corner, interior,
+and clipped-coordinate CPU fixtures pass in portable Debug/Release and Windows
+MSVC Release/WARP suites.
+
+D3D12 migration 8d.1 (2026-08-28): `uint16` sampling now has its own
+test-only admission function while reusing the established coordinate/result
+layout. An isolated resident `uint16` fixture proves unready and wrong-type
+calls are rejected and a finished frame returns exact layouts; portable
+Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8d.2.1 (2026-08-28): the Windows build now independently
+compiles and embeds a `cs_5_1` `uint16` sampling shader with typed native-value
+loads and `/65535` normalization. Portable Debug/Release and Windows MSVC
+Release/WARP suites pass.
+
+D3D12 migration 8d.2.2 (2026-08-28): the sampling dispatch now selects the
+resident session's typed `R8_UINT` or `R16_UINT` SRV, corresponding bytecode,
+and element stride/offset without duplicating resource lifecycle code. `uint16`
+exact-corner readbacks match direct CPU `/65535` loads; portable Debug/Release
+and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8d.3 (2026-08-28): the native `uint16` shader now performs
+four-tap bilinear interpolation; an interior half-pixel matches the independent
+CPU oracle alongside direct corners. Portable Debug/Release and Windows MSVC
+Release/WARP suites pass.
+
+D3D12 migration 8d.4 (2026-08-28): finite `uint16` coordinates now clamp to
+source centers before sampling, preserving the existing non-finite rejection.
+Corner, interior, and clipped-coordinate fixtures pass in portable Debug/Release
+and Windows MSVC Release/WARP suites.
+
+D3D12 migration 8e.1 (2026-08-28): float32 sampling admission now has an
+explicit test-only layout contract. It rejects malformed, unready, wrong-type,
+and non-finite-coordinate requests, while an uploaded resident NaN/±∞ EXR-like
+source is deliberately admitted so the later sampling/compositing pipeline keeps
+the CPU's IEEE propagation boundary. Portable Debug/Release and Windows MSVC
+Release/WARP suites pass.
+
+D3D12 migration 8e.2 (2026-08-28): the Windows build independently compiles
+and embeds a `cs_5_1` float32 sampler. Its typed `R32_FLOAT` SRV direct loads
+preserve finite corner and interior values without source expansion or integer
+normalization; portable Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8e.3.1 (2026-08-28): the float32 sampler now uses four native
+float taps and bilinear interpolation for interior coordinates. A finite
+half-pixel fixture matches an independent CPU four-tap oracle; portable
+Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8e.3.2 (2026-08-28): finite float32 coordinates now clamp to
+source centers before four-tap sampling. Corner and out-of-range fixtures match
+the CPU interpolation oracle; portable Debug/Release and Windows MSVC
+Release/WARP suites pass.
+
+D3D12 migration 8e.4 (2026-08-28): the admitted float32 NaN/±∞ fixture now
+has a WARP sampling regression. Native IEEE interpolation produces the same
+NaN result category as CPU `cv2.remap`, with no divergent source sanitization;
+portable Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8f.1 (2026-08-28): one-frame composite bands now have a
+test-only ABI contract that validates frame/source type, finite projection
+geometry, output row bounds, finished residency, and exact caller-buffer byte
+layouts before dispatch. Focused malformed/unready/wrong-type/out-of-band tests
+pass in portable Debug/Release and Windows MSVC Release/WARP suites.
+
+D3D12 migration 8f.2.1 (2026-08-28): one-frame bands now reuse the proven
+projection shader through their composite contract. A nonzero-offset 8×2 WARP
+band verifies every clipped source coordinate and packed validity bit against
+the CPU equations; portable Debug/Release and Windows MSVC Release/WARP suites
+pass.
+
+D3D12 migration 8f.2.2.1 (2026-08-28): the Windows build independently
+compiles and embeds a `cs_5_1` uint8 one-frame candidate shader. It combines
+the proven projection, validity, source-center clipping, and native `R8_UINT`
+bilinear equations; portable Debug/Release and Windows MSVC Release/WARP suites
+pass.
+
+D3D12 migration 8f.2.2.2 (2026-08-28): finished resident `R8_UINT` sources
+now bind to the one-frame candidate shader through a correctly partitioned
+SRV/UAV descriptor table. An 8×2 nonzero-offset band round-trips candidate RGB
+and validity against the independent CPU projection/bilinear oracle; portable
+Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8f.2.3.1 (2026-08-28): the Windows build independently
+compiles and embeds a `cs_5_1` uint16 one-frame candidate shader, preserving
+the projection/validity/clipping path with typed `R16_UINT` `/65535` loads.
+Portable Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8f.2.3.2 (2026-08-28): one shared integer candidate dispatch
+now binds `R8_UINT` or `R16_UINT` sources through strict public type wrappers,
+with element-based offsets for uint16. A finished uint16 8×2 band matches the
+independent CPU projection/bilinear `/65535` RGB and validity oracle; portable
+Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8f.2.4.1 (2026-08-28): the Windows build independently
+compiles and embeds a `cs_5_1` float32 one-frame candidate shader, preserving
+projection/validity/clipping with typed `R32_FLOAT` four-tap loads and no
+non-finite sanitization. Portable Debug/Release and Windows MSVC Release/WARP
+suites pass.
+
+D3D12 migration 8f.2.4.2 (2026-08-28): the shared typed candidate dispatch
+now binds strict `R32_FLOAT` sources. A finished float32 8×2 band matches the
+independent CPU projection/bilinear RGB and validity oracle; portable
+Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8f.2.5 (2026-08-28): all typed one-frame candidate shaders
+and their shared band-sized readback now surface the clipped source-edge
+distance used by hard blending. Uint8, uint16, and float32 fixtures match the
+CPU edge-distance oracle at interior, edge, and invalid pixels; portable
+Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8f.3.1 (2026-08-28): hard selection now has a test-only ABI
+contract for candidate RGB/validity/edge distance and prior RGB/weight
+accumulators. It rejects malformed layouts, non-binary validity, and
+non-finite or negative weights before dispatch; portable Debug/Release and
+Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8f.3.2 (2026-08-28): the Windows build independently compiles
+and embeds a `cs_5_1` hard-selection shader. It derives the established valid
+candidate weight, retains prior RGB on equal weights through strict `>`, and
+writes coverage from the resulting weight; portable Debug/Release and Windows
+MSVC Release/WARP suites pass.
+
+D3D12 migration 8f.3.3 (2026-08-28): hard selection now binds five input
+SRVs and three selected-band UAVs, then reads selected RGB/weight/coverage
+after a fence. Its WARP fixture proves replacement, invalid-candidate and
+lower-weight retention, strict equal-weight ties, and coverage; portable
+Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8f.3.4 prerequisite (2026-08-28): hard selection now consumes
+the same packed GPU validity bits produced by candidate generation. Its host
+test fixture packs the ABI byte mask before upload, eliminating a hidden
+representation conversion from the forthcoming GPU-to-GPU command sequence;
+portable Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8f.3.4.1 (2026-08-28): uint8 candidate generation and hard
+selection now execute as two GPU passes in one command list. Candidate RGB,
+packed validity, and edge distance transition from UAV to non-pixel SRV state
+between passes; only final selected RGB/weight/coverage are read back. The WARP
+fixture matches the separately CPU-verified candidate band and zeroed prior
+accumulator; portable Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8f.3.4.2 (2026-08-28): the same GPU-resident command sequence
+now supports typed `R16_UINT` candidate generation with element-based source
+offsets. A zero-prior uint16 band reaches selected RGB/weight/coverage without
+host candidate copies and matches the independently verified candidate results;
+portable Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 8f.3.4.3 (2026-08-28): the GPU-resident command sequence now
+also supports typed `R32_FLOAT` candidate generation with raw float element
+offsets and established IEEE sample behavior. A zero-prior float32 band reaches
+selected RGB/weight/coverage without host candidate copies and matches the
+independently verified candidate results; portable Debug/Release and Windows
+MSVC Release/WARP suites pass.
+
+D3D12 migration 8f.4 (2026-08-28): the first complete one-frame native band
+checkpoint is verified. Uint8, uint16, and float32 WARP paths each read back
+only final selected linear RGB, weight, and coverage after GPU-resident
+candidate generation and hard selection; the type-specific candidate results
+were independently compared with the CPU projection/bilinear oracle. SDR
+conversion and production adapter routing remain out of scope for this stage.
+
+D3D12 migration 9a.1 (2026-08-28): a test-only ordered hard-composition band
+contract now admits two or more finished, strictly capture-ordered frame
+requests only when they share one source type and output-band geometry. It
+returns the final selected RGB, weight, and coverage layouts before any GPU
+work; empty, reversed, mixed-band, and out-of-range lists fail. Portable
+Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 9a.2.1 (2026-08-28): the first two-frame hard-composition
+unit now narrows that ordered contract to exactly two finished uint8 frames.
+It returns the existing final selected RGB, weight, and coverage layouts and
+rejects non-uint8 or wrong-count requests before GPU resource allocation.
+Portable Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 9a.2 (2026-08-28): two finished uint8 candidates now remain
+GPU-resident through a ping-pong hard-selection accumulator. The two-pass
+WARP fixture checks overlapping output, strict equal-weight ties, and a single
+final RGB/weight/coverage readback. Candidate constants now preserve the
+shader's padded float4 rotation rows. Windows MSVC Release/WARP passes all
+native CTest cases.
+
+D3D12 migration 9a.3 (2026-08-28): the ordered uint8 hard-selection sequence
+now admits an explicit three-frame test dispatch. It retains only two selected
+RGB/weight accumulator pairs by ping-ponging them, keeps all candidate and
+prior data resident between passes, and reads back just the final band. The
+three-frame WARP oracle verifies capture order, lower-weight retention, and
+strict equal-weight retention; portable Debug/Release and Windows MSVC
+Release/WARP suites pass.
+
+D3D12 migration 9a.4.1 (2026-08-28): a test-only two-frame uint16 ordered
+hard-composition contract now shares the established final-band layout while
+requiring two finished uint16 sources. A WARP fixture admits a finished
+two-frame uint16 session and rejects a mixed-type list before dispatch;
+portable Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 9a.4.2 (2026-08-28): the bounded resident hard-composition
+loop now selects the existing uint16 candidate shader and `R16_UINT` source
+view, with element-based row/frame offsets. Its two-frame uint16 WARP oracle
+matches independently generated candidates and reads back only final
+RGB/weight/coverage; portable Debug/Release and Windows MSVC Release/WARP
+suites pass.
+
+D3D12 migration 9a.4.3 (2026-08-28): the uint16 hard-composition entry point
+now also runs three capture-ordered frames through the same two-pair ping-pong
+accumulator. The WARP oracle verifies final RGB, weight, and coverage against
+independent three-frame candidates; portable Debug/Release and Windows MSVC
+Release/WARP suites pass.
+
+D3D12 migration 9a.5.1-9a.5.2 (2026-08-28): two-frame float32 ordered
+hard-composition now has a type-specific admission contract and a resident
+dispatch using `R32_FLOAT`, the existing float32 candidate shader, and
+element-based source offsets. A finite-source WARP oracle matches independent
+float32 candidates with a single final RGB/weight/coverage readback; portable
+Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 9a.5.3 (2026-08-28): float32 now also runs three
+capture-ordered frames through the existing typed ping-pong accumulator. The
+finite-source WARP oracle verifies final RGB, weight, and coverage against
+independent three-frame candidates; portable Debug/Release and Windows MSVC
+Release/WARP suites pass.
+
+D3D12 migration 9a.6.1 (2026-08-28): a test-only output hard-composition
+admission contract now requires exact output dimensions/current storage range,
+an ordered request against the output's retained session, and allocated linear
+and coverage resources. WARP verifies missing storage and mismatched geometry
+fail before dispatch, while matching full-height storage is admitted; portable
+Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 9a.6.2 (2026-08-28): the typed hard-composition recorder can
+now write an ordered uint8 result directly into an allocated output handle.
+It copies only final selected RGB and coverage into existing `COPY_DEST`
+storage, with no candidate/prior host intermediates or scheduling changes.
+Portable Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 9a.6.3 (2026-08-28): a test-only output-band readback copies
+stored linear RGB and coverage through bounded readback resources, restores
+the output buffers to `COPY_DEST`, and exposes only logical bytes rather than
+alignment padding. The WARP output-handle result matches the independent
+three-frame uint8 hard-selection oracle; portable Debug/Release and Windows
+MSVC Release/WARP suites pass.
+
+D3D12 migration 9b.1 (2026-08-28): a test-only feather-accumulation ABI
+contract now validates source dimensions, exact candidate/accumulator layouts,
+binary validity, finite nonnegative edge distances, and finite nonnegative
+accumulated weights before any dispatch. Portable Debug/Release and Windows
+MSVC Release/WARP suites pass.
+
+D3D12 migration 9b.2 (2026-08-28): an SM 5.1 feather-weight shader now packs
+the binary validity mask for a raw SRV, computes the existing clamped feather
+width on WARP, and reads back only one scalar-weight buffer. Interior, edge,
+invalid, and minimum-dimension weights match the CPU rule; portable
+Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 9b.3 (2026-08-28): an SM 5.1 feather-accumulation shader now
+adds one resident candidate RGB/weight pair to independent RGB and scalar
+weight accumulators, then reads back only the final pair. A WARP fixture covers
+nonzero prior accumulators and a zero-weight candidate; portable Debug/Release
+and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 9b.4.1 (2026-08-28): a two-frame feather test dispatch now
+runs both weighted candidate passes in one command list. It transitions the
+first RGB/weight accumulator pair directly into SRVs for the second pass and
+reads back only the final pair. The overlapping-seam WARP fixture matches CPU
+accumulated RGB and weights; portable Debug/Release and Windows MSVC
+Release/WARP suites pass.
+
+D3D12 migration 9b.4.2-9b.4.3 (2026-08-28): the bounded feather chain now
+accepts exactly two or three ordered weighted inputs while retaining only two
+ping-pong RGB/weight accumulator pairs. The three-frame pole fixture matches
+CPU RGB and weights, and an order-sensitive `(1e20 + -1e20) + 1` fixture
+returns `1` on WARP, proving sequential float32 pass ordering. Portable
+Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 9b.5 (2026-08-28): an SM 5.1 normalization pass now divides
+accumulated RGB only for positive scalar weights and preserves zero-weight RGB
+unchanged for incomplete-output handling. WARP covers whole, fractional, and
+uncovered weights; portable Debug/Release and Windows MSVC Release/WARP suites
+pass.
+
+D3D12 migration 9c.1 (2026-08-28): a test-only exposure ABI contract now
+requires one finite positive supplied gain per session frame and one finite
+quarter-resolution local field using exact ceil-divided output dimensions.
+Mismatched counts, non-finite gains/field values, and malformed dimensions fail
+before dispatch; portable Debug/Release and Windows MSVC Release/WARP suites
+pass.
+
+D3D12 migration 9c.2 (2026-08-28): an SM 5.1 global-gain pass now multiplies
+one linear candidate RGB buffer by a finite positive supplied gain before any
+composition. Identity and non-identity WARP fixtures match CPU linear RGB;
+portable Debug/Release and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 9c.3 (2026-08-28): the three typed candidate shaders now
+receive an explicitly padded per-frame global gain, defaulting to one for all
+existing paths. A gain-aware two-frame uint8 hard-composition hook applies each
+frame's own gain before selection while retaining strict weight ties; its WARP
+overlap fixture matches CPU RGB, weight, and coverage. Portable Debug/Release
+and Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 9c.4.1 (2026-08-28): ABI version 5 appends explicit
+rectilinear-output metadata and a vertical output FOV to the one-frame output
+geometry request. Zero-valued metadata retains the existing equirectangular
+path; all three typed candidate shaders implement the established 90-degree
+horizontal rectilinear ray convention. Native contract checks reject malformed
+mode/FOV pairs, while portable Debug/Release and Windows MSVC Release/WARP
+suites pass.
+
+D3D12 migration 9c.4.2 (2026-08-28): an SM 5.1 equirectangular
+quarter-resolution local-exposure dispatch now uses the existing center-sample
+projection and validity convention, writes a bounded field, and reads it back
+through the normal fence lifecycle. The one-frame WARP fixture verifies the
+valid center value equals the supplied log gain; portable Debug/Release and
+Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 9c.4.3 (2026-08-28): the same bounded local-exposure dispatch
+now accepts the ABI-v5 rectilinear output mode and vertical-FOV convention.
+Its WARP thumbnail-center fixture verifies the valid one-frame field equals
+the supplied log gain; portable Debug/Release and Windows MSVC Release/WARP
+suites pass.
+
+D3D12 migration 9c.5 (2026-08-28): an SM 5.1 local-exposure pass now samples
+the ceil-quarter field with the existing half-pixel, clamp, and bilinear
+conventions, then applies its exponential to candidate linear RGB. WARP
+interior and clipped samples match the CPU oracle; portable Release and
+Windows MSVC Release/WARP suites pass.
+
+D3D12 migration 9c.6 (2026-08-28): ordered hard composition now accepts one
+bounded ceil-quarter local field per frame, applies it after each frame's
+global gain and before strict hard selection, and retains the existing
+selection/coverage rules. Identity, global-only, and spatial-field WARP
+fixtures match the CPU oracle; portable Debug/Release and Windows MSVC
+Release/WARP suites pass.
+
+D3D12 migration prerequisite (2026-08-28): synchronized the ctypes adapter's
+native ABI declaration and fake-DLL contract from version 3 to the native
+header's version 4. This prevents a valid current DLL from being rejected at
+load time; focused adapter pytest, Ruff, and mypy pass.
+
+D3D12 migration 8f.2.4.2 (2026-08-28): the shared typed candidate dispatch
+now binds strict `R32_FLOAT` sources. A finished float32 8×2 band matches the
+independent CPU projection/bilinear RGB and validity oracle; portable
+Debug/Release and Windows MSVC Release/WARP suites pass.
+D3D12 migration 9d.1 (2026-08-28): added a GPU post-hard-selection incomplete-output pass that writes linear magenta only for zero final weight and leaves coverage unbound. The focused WARP contract fixture verifies uncovered marking, covered RGB preservation, and unchanged coverage; portable Debug/Release and Windows MSVC Release/WARP suites pass.
+D3D12 migration 9d.2 (2026-08-28): the same final-weight marker is now covered after feather normalization: only the zero-weight pixel becomes linear magenta and normalized covered pixels remain unchanged. Portable Debug/Release and Windows MSVC Release/WARP suites pass.
+D3D12 migration 9e.1 (2026-08-28): added the bounded output-band range binding required to execute a later 32-row band. The WARP fixture dispatches rows 32–63 of a 64-row output and matches the direct GPU hard-composition oracle while allocating only the requested band. Portable Debug/Release and Windows MSVC Release/WARP suites pass.
+D3D12 migration 9e.2 (2026-08-28): the bounded hard-composition output job now has a two-adjacent-band regression. Rows 0–31 and 32–63 are dispatched separately, and their concatenated RGB and coverage match one resident 64-row GPU composition across the boundary. Portable Debug/Release and Windows MSVC Release/WARP suites pass.
+D3D12 migration 9e.3 (2026-08-28): added a two-band feather regression using the resident two-frame accumulator and normalizer independently on adjacent 32-row slices. Their concatenated normalized pixels match a resident 64-row feather result. Portable Debug/Release and Windows MSVC Release/WARP suites pass.
+D3D12 migration 9f.1 (2026-08-28): added a D3D12 output-band scheduler boundary that delegates unchanged to the existing backend-neutral 64–1024-row watchdog policy and accepts elapsed time only for completed bands. Focused ruff, format, mypy, and 28 GPU/adapter contract tests pass.
+D3D12 migration 9f.2–9f.3 (2026-08-28): added the native output-band runner. It publishes each completed row count only after the completed-band callback returns, records its elapsed time into the unchanged scheduler policy, rejects cancellation before another submission, and invokes bounded-output cleanup. Focused ruff, format, mypy, and 7 D3D12 adapter contract tests pass.
+D3D12 migration 10a.1 (2026-08-28): added an allocation-free retained exposure-proxy layout contract. It preserves CUDA's `min(256, width)` width and ties-to-even rounded proportional height, plus float32 RGB frame offsets and total-byte overflow validation. Odd/even source fixtures pass; portable Debug/Release and Windows MSVC Release/WARP suites pass.
+D3D12 migration 10a.2 (2026-08-28): added a uint8 native-precision exposure-proxy dispatch using the existing fractional area footprint. It requires all source uploads to have completed and the source to be shader-readable, respects padded row/frame strides, and reads back only the bounded float32 proxy result for the test hook. Padded odd/even WARP sources match the independent CPU area oracle; portable Debug/Release and Windows MSVC Release/WARP suites pass.
+D3D12 migration 10a.3 (2026-08-28): extended the same proxy footprint and readiness contract to native `R16_UINT` and `R32_FLOAT` source bindings. Finished uint16 values match normalized CPU pixels, while float32 proxy pixels preserve permitted NaN and signed-infinity values; portable Debug/Release and Windows MSVC Release/WARP suites pass.
+D3D12 migration 10a.4 (2026-08-28): added a one-shot session-owned proxy build operation. It retains the completed bounded float32 GPU proxy in shader-readable state for downstream exposure work, rejects duplicate builds, and releases it through normal session destruction; padded odd/even WARP fixtures verify retained sizing alongside the CPU proxy oracle. Portable Debug/Release and Windows MSVC Release/WARP suites pass.
+D3D12 migration 10b.1 (2026-08-28): added the one-pair exposure-grid admission contract. It requires two distinct completed frames from a session with retained proxies and uploaded rotations, finite established projection geometry, and exact caller-owned `float4` pair-coordinate plus byte-overlap layouts. Two-frame WARP fixtures verify valid admission and malformed/same-frame rejection; portable Debug/Release and Windows MSVC Release/WARP suites pass.
+D3D12 migration 10b.2 (2026-08-28): added the SM 5.1 retained-rotation pair-grid projection dispatch. It projects equirectangular sample centers with the established camera convention, clamps stored proxy coordinates, and returns a byte overlap mask only when both views are visible. Identity-rotation WARP fixtures cover front-facing and clipped samples against the CPU equations; portable Debug/Release and Windows MSVC Release/WARP suites pass.
+D3D12 migration 10b.3 (2026-08-28): added the SM 5.1 retained-proxy pair sampler. It uploads only the bounded projected-coordinate grid, manually bilinearly samples each frame's resident float32 proxy slice, and leaves the caller-owned geometric overlap mask unchanged. The WARP fixture matches both known source slices at every projected coordinate; portable Debug/Release and Windows MSVC Release/WARP suites pass.
+D3D12 migration 10c.1 (2026-08-28): added the SM 5.1 finite/luminance pair classifier. It produces independent Rec.709 luminance values and accepts only geometrically shared, finite, positive (`> 1e-5`) pair samples; it contains no clipping or gradient filtering. WARP cases cover valid high luminance, low luminance, NaN, infinity, and geometry exclusion; portable Debug/Release and Windows MSVC Release/WARP suites pass.
+D3D12 migration 10c.2 (2026-08-28): bumped the native/ctypes ABI to v6 and added an explicit session transfer-function enum (`sRGB`, `PQ`, `linear`). Exposure proxies now decode the declared transfer before downsampling. The pair classifier rejects samples with any channel at or above `0.995` for sRGB/PQ only; linear sources remain unbounded. WARP fixtures verify decoded sRGB pair samples, clipped SDR rejection, and above-one linear acceptance; portable Debug/Release, Windows MSVC Release/WARP, Ruff, mypy, and focused ctypes pytest pass.
+D3D12 migration 10c.3 (2026-08-28): verified the established linear-HDR category is the explicit v6 `linear` transfer path introduced for 10c.2: it retains finite/positive and geometry checks but never applies SDR saturation rejection. The above-one linear WARP case passes while the same saturated SDR input is rejected; all 10c.2 gates pass.
+D3D12 migration 10d.1 (2026-08-28): added a separate D3D12 exposure-pair gradient pass over classified luminance, matching the existing CUDA log-luminance Sobel stencil and edge policy. WARP contract fixtures compare flat, textured, and edge grids against a CPU oracle; acceptance remains unchanged for 10d.2.
+D3D12 migration 10d.2 (2026-08-28): added a D3D12 pair-quality filter that combines the existing category mask with finite per-frame gradients and their established p90 limits. WARP fixtures verify independent frame limits, category preservation, and non-finite gradient rejection; portable Debug/Release and Windows MSVC Release/WARP suites pass.
+D3D12 migration 10e.1 (2026-08-28): added the SM 5.1 accepted-pair log-ratio pass. It retains the accepted mask and float ratio scratch in default-heap session resources for trimming, while the focused test reads back only its small oracle fixture. Accepted samples match the established `log(first / second)` CPU ratio; portable Debug/Release and Windows MSVC Release/WARP suites pass.
+D3D12 migration 10e.2.1–10e.2.4 (2026-08-28): added a fully device-resident one-pair trimming path. An SM 5.1 initializer writes accepted ratios plus infinity sentinels into power-of-two session scratch, staged bitonic dispatches order it in place, exact integer-tenths rank arithmetic extracts CUDA-compatible 0.1/0.9 interpolated bounds, and an inclusive mask pass retains only in-range accepted samples for reduction. Odd/even accepted-count and exact-boundary fixtures match CPU oracles. MSVC AddressSanitizer also exposed and fixed a negative validation test that had zeroed the shared valid layout and silently skipped later loop assertions. Portable Debug/Release and Windows MSVC Release/WARP suites pass.
+D3D12 migration audit repair (2026-08-28): reopened completion claims after reviewing Steps 1–10e. Step 1 now has an explicit regression proving a failure after CUDA dispatch begins propagates without restarting on CPU. The full current NVIDIA hardware suite passes (13 tests) on an RTX 5090 with driver 610.88.
+
+D3D12 migration Step 4d NVIDIA acceptance (2026-08-28): product-mode D3D12 preflight admitted the current NVIDIA GeForce RTX 5090 (vendor `10de`, device `2b85`, LUID `14331`) with 33,750,515,712 dedicated bytes, 32,945,209,344 local-budget bytes, 11,796,480 usage bytes, and 32,933,412,864 usable bytes. The native contract executable now provides an opt-in `--hardware-probe-only` record; WARP CI behavior is unchanged. AMD and Intel acceptance are intentionally deferred until the remaining migration is complete.
+
+D3D12 migration Step 6a repair (2026-08-28): bumped the synchronized native/ctypes ABI to 7 and made memory requests explicitly declare session workspace, per-pixel/fixed output workspace, upload, per-pixel/fixed readback, and descriptor requirements. Admission now aligns and sums all coexisting source, session, upload, retained-preview, output, and readback categories for both resident and banded modes, rejects under-accounted requests, and reports charged values. Portable Debug/Release CTests and Windows MSVC Release/WARP CTests pass.
+
+D3D12 migration Step 10d.2 repair (2026-08-28): replaced caller-invented gradient thresholds with an SM 5.1 finite-gradient p90 operation. Each pair channel is padded with positive infinity, ordered independently by device bitonic passes, and evaluated with the CUDA-compatible `(count - 1) * 0.9` linear interpolation rule; only the final two limits are read back. The acceptance fixture now obtains its limits from D3D12 and compares them to a CPU oracle before filtering. Windows MSVC Release/WARP CTests pass without FXC warnings.
+
+D3D12 migration Step 7f.6 output ownership (2026-08-28): bound empty-output creation/destruction in ctypes and added a closeable D3D12 output owner retained by its prepared session. Explicit child closure is idempotent; prepared-session closure drains every output before destroying session and device and refuses new children afterward. Focused adapter tests, Ruff, formatting, and mypy pass. Preview-child ownership remains deferred to the Step 12 native preview creation API rather than inventing an unbacked handle.
+
+D3D12 migration Step 7f.8 (2026-08-28): completed one-shot native failure injection for the first and second source upload-slot allocations, encoding-metadata submission, source-upload fence signaling, and the existing upload-slot/finish wait cancellation points. Each fixture verifies unchanged partial accounting, retries safely, and reaches the suite's final zero device/queue/fence/session/output counters. A `BUILD_TESTING=OFF` production build, portable CTests, and Windows MSVC Release/WARP CTests pass.
+
+D3D12 migration Step 10e.3 (2026-08-28): added a device-resident one-pair reducer. It derives valid/inlier counts and the inlier median from retained sorted ratios, builds and bitonically orders padded absolute deviations for MAD, and downloads one 32-byte packet containing rejection reason, counts, difference, MAD, and weight. Explicit insufficient-valid/nonfinite/excessive-dispersion reasons preserve the CUDA thresholds (24 valid, 12 inliers, MAD at most 0.5). Accepted and low-sample WARP fixtures match CPU scalar oracles; production, portable, and MSVC Release/WARP builds pass.
+
+D3D12 migration Step 1 repair (2026-08-28): completed phase-specific CUDA cancellation coverage on the current RTX 5090. Upload now observes cancellation after the final per-frame callback and before synchronization; encoding checks cancellation before writing and again before atomic publication. Hardware regressions cancel during upload, compositing, conversion/download, and encoding, preserve an existing destination byte-for-byte, and leave no staged artifact. A separate dispatch-failure regression proves numerical failures never restart on CPU. All four cancellation cases pass on hardware.
+
+CUDA baseline race repair (2026-08-28): the complete hardware gate exposed nondeterministic resident output caused by writing `log_gains` on CuPy's default stream and consuming it from the session's non-blocking compute stream. Gain allocation/upload now occurs on the compute stream. Forced-banded output again matches resident and CPU output exactly, and all 17 CUDA hardware tests pass on the RTX 5090.
+
+D3D12 physical numerical acceptance (2026-08-28): the native contract executable now accepts `--hardware-full`, retains the product-selected physical device, and runs the complete numerical/lifecycle suite without switching to WARP. The full contract passes on the RTX 5090. Physical memory assertions compare stable identity and each snapshot's internal budget/usage arithmetic rather than incorrectly requiring usage to remain equal across separate DXGI queries.
+
+D3D12 migration Step 10f.1.1 (2026-08-28): added versioned reduced-equation, scalar pair-report, and exposure-graph diagnostic layouts plus session-owned replacement-safe storage. Preparation reserves temporary equation/report vectors and swaps only after both succeed; injected allocation failure preserves the previous graph. One/two-frame, zero-capacity, invalid-capacity, replacement, clear-idempotence, and layout fixtures pass in production, portable, and Windows MSVC Release/WARP builds.
+
+D3D12 migration Step 10f.1.2 (2026-08-28): added checked `uint32` pair-count planning and deterministic session enumeration in upper-triangle order (`left < right`). Reports begin in an explicit pending state rather than masquerading as numerical rejection, and caller-owned copies expose only scalar report records. Zero/one/two/many-frame order, overflow, byte-count, and empty-copy fixtures pass in production, portable, and Windows MSVC Release/WARP builds.
+## 2026-08-28 — D3D12 migration 10f.1.3.1
+
+- Split the resident one-pair chain into four independently gated implementation steps.
+- Added session-owned, transactionally replaced device scratch for all fifteen projection-through-reduction intermediates.
+- Added checked sample/sort-capacity byte accounting and diagnostics proving the scratch owns 15 device resources and zero readback bytes.
+- Added focused lifecycle, exact-accounting, allocation-failure preservation, replacement, and idempotent-clear coverage.
+- Verified portable Debug and Release CTest (3/3 each), production native build, and Windows MSVC Release CTest/WARP (4/4).
+## 2026-08-28 — D3D12 migration 10f.1.3.2
+
+- Added a production projection-plus-proxy-sampling dispatch over retained one-pair device scratch.
+- Kept coordinates, overlap, and both RGB sample buffers device-resident with no production upload/readback heap.
+- Added a test-only readback hook that restores resource states after inspection.
+- Verified retained coordinates, overlap, and all sampled channels against the established staged GPU oracles.
+- Verified portable Debug and Release CTest (3/3 each), production native build, and Windows MSVC Release CTest/WARP (4/4).
+## 2026-08-28 — D3D12 migration 10f.1.3.3.1
+
+- Split classification-through-ratio construction into three independently gated resident stages.
+- Added a resident classifier that consumes the two device `float3` sample buffers directly and preserves the existing transfer-function clipping rule.
+- Added an ordered production classification dispatch with no intermediate CPU transfer and a state-restoring test-only readback.
+- Verified all retained luminance and candidate-mask values against the established staged GPU classifier.
+- Verified portable Debug and Release CTest (3/3 each), production native build, FXC compilation without warnings, and Windows MSVC Release CTest/WARP (4/4).
+## 2026-08-28 — D3D12 migration 10f.1.3.3.2
+
+- Added an ordered production gradient, padded two-channel bitonic sort, and exact finite-p90 dispatch over retained device scratch.
+- Kept luminance, gradients, sortable values, and the two percentile limits device-resident with no production readback.
+- Added a state-restoring test-only gradient/limit readback.
+- Verified every retained gradient and both limits against the established staged GPU oracles.
+- Verified portable Debug and Release CTest (3/3 each), production native build, and Windows MSVC Release CTest/WARP (4/4).
+## 2026-08-28 — D3D12 migration 10f.1.3.3.3
+
+- Added a resident-only filter shader that reads p90 limits directly from device memory.
+- Reused the obsolete overlap buffer as filtered-mask output while retaining the classification categories separately.
+- Added ordered production filter and log-ratio dispatches with no intermediate CPU transfer plus a state-restoring test hook.
+- Verified the retained filtered mask and every ratio against the established staged GPU oracles.
+- Verified portable Debug and Release CTest (3/3 each), production native build, and Windows MSVC Release CTest/WARP (4/4).
+## 2026-08-28 — D3D12 migration 10f.1.3.4.1
+
+- Split resident trim/reduction into independently gated trim and scalar-reduction stages.
+- Added production ratio preparation, in-place bitonic sort, percentile-bound extraction, and inlier-mask dispatches over retained scratch.
+- Reused the obsolete classification-category buffer for the trimmed mask without increasing memory.
+- Added a state-restoring test hook and verified sorted ratios, bounds, and every inlier flag against CPU/staged oracles.
+- Verified portable Debug and Release CTest (3/3 each), production native build, and Windows MSVC Release CTest/WARP (4/4).
+## 2026-08-28 — D3D12 migration 10f.1.3.4.2
+
+- Added retained summary, median/MAD deviation sort, and final-result dispatches using the existing reduction shaders.
+- Kept every sample-sized reduction buffer on the device and allocated only one 32-byte readback packet.
+- Verified rejection reason, valid/inlier counts, median difference, MAD, weight, and exact downloaded byte count against a CPU oracle.
+- Completed the full resident one-pair projection-through-reduction chain.
+- Verified portable Debug and Release CTest (3/3 each), production native build, and Windows MSVC Release CTest/WARP (4/4).
+## 2026-08-28 — D3D12 migration 10f.1.4
+
+- Added transactional all-edge graph reduction using the proven resident one-pair scratch chain.
+- Added retained-equation copying and committed only scalar pair reports/equations after every enumerated edge succeeds.
+- Verified a rejected direct edge and a three-frame accepted graph containing all upper-triangle pairs `(0,1)`, `(0,2)`, `(1,2)`.
+- Verified retained reports and equations match the direct scalar reduction and deterministic enumeration order.
+- Verified portable Debug and Release CTest (3/3 each), production native build, and Windows MSVC Release CTest/WARP (4/4).
+
+## 2026-08-28 — D3D12 migration 10f.2.1
+
+- Reused the scalar pair report's reserved word for the geometric-overlap count and retained that
+  count on-device while the resident classification mask is repurposed by later stages.
+- Expanded scalar scratch by 16 bytes and carried the count in the existing 32-byte final reduction
+  packet; production still performs no image-sized exposure readback.
+- Verified portable Debug and Release CTest (3/3 each), the production native build, and Windows
+  MSVC Release/WARP CTest (4/4).
+
+## 2026-08-28 — D3D12 migration 10f.2.2
+
+- Added separately retained solve equations so measured reductions remain immutable.
+- Reproduced CUDA's measured-edge transitive reachability and simultaneous lowest-index geometric
+  bridge selection, retaining bridges as symmetric weight-1, zero-difference constraints.
+- Verified empty single-frame, measured-chain plus bridge, and geometrically disconnected fixtures;
+  measured weights remain unchanged and diagnostic edge counts match.
+- Verified portable Debug and Release CTest (3/3 each), the production native build, and Windows
+  MSVC Release/WARP CTest (4/4).
+
+## 2026-08-28 — D3D12 migration 10f.3
+
+- Added a retained native exposure result with float log gains plus anchor, edge-count, and frame-count
+  scalars.
+- Reproduced CUDA's weighted double-precision Laplacian, frame-0 numerical anchor, pivoted
+  Gauss-Jordan singular-row handling, median centering, `[-ln(2), ln(2)]` clamp, and first
+  nearest-median anchor selection.
+- Added single-frame, neutral-bridge, disconnected, and overdetermined weighted fixtures; the
+  weighted fixture deliberately differs from weight-ignoring propagation.
+- Verified portable Debug and Release CTest (3/3 each), the production native build, and Windows
+  MSVC Release/WARP CTest (4/4).
+
+## 2026-08-28 — D3D12 migration 10g.1
+
+- Added a one-shot session gain upload that converts retained clamped log gains to finite positive
+  multiplicative gains and rejects duplicate upload.
+- Bound those retained gains to the established hard-composite candidate constants without
+  re-uploading source pixels.
+- Verified a three-frame solved `(0.5, 1, 2)` gain fixture changes every selected output pixel by
+  the correct frame gain while preserving selection weights and coverage.
+- Verified portable Debug and Release CTest (3/3 each), the production native build, and Windows
+  MSVC Release/WARP CTest (4/4).
+
+## 2026-08-28 — D3D12 migration 10g.2
+
+- Added a versioned retained exposure report with anchor, edge count, frame count, gain-binding
+  state, and monotonic solve/upload generation counters.
+- Verified two consecutive preview/final-style session-gain compositions reuse the same completed
+  solve and gain upload without changing either generation.
+- Verified portable Debug and Release CTest (3/3 each), the production native build, and Windows
+  MSVC Release/WARP CTest (4/4).
+
+## 2026-08-28 — D3D12 migration 10g.3
+
+- Added explicit idempotent invalidation reasons for manual gains and exposure geometry.
+- Manual-gain invalidation clears only bound multiplicative gains while retaining the solved report;
+  geometry invalidation clears pair scratch, graph, solve, and report while preserving source and
+  decoded exposure-proxy residency.
+- Verified invalid bound-gain use is rejected, re-upload after manual invalidation succeeds, unknown
+  reasons are rejected, and later output allocation/composition remains valid after geometry cleanup.
+- Verified portable Debug and Release CTest (3/3 each), the production native build, and Windows
+  MSVC Release/WARP CTest (4/4).
+
+## 2026-08-28 — D3D12 migration 11a.1
+
+- Added a versioned 4096-bin `uint32` histogram layout with exact 16 KiB storage and checked
+  maximum output population.
+- Admitted populations through `UINT32_MAX` and rejected any larger job before allocation or
+  dispatch, proving no single bin can overflow.
+- Verified one-pixel, `65535²`, exact-maximum, zero, and first-overflow boundary fixtures in portable
+  Debug/Release, production native, and Windows MSVC Release/WARP builds.
+
+## 2026-08-28 — D3D12 migration 11c.1 prerequisite
+
+- Implemented the CUDA-authoritative negative clamp and sRGB transfer as a reusable HLSL helper,
+  with normalized output clamped to `[0, 1]`.
+- Added a real D3D12 test dispatch covering negative, zero, transfer-breakpoint, one, highlight, and
+  non-finite rejection cases against a double-precision oracle.
+- Verified portable Debug and Release CTest (3/3 each), the production native build, FXC shader
+  compilation, and Windows MSVC Release/WARP CTest (4/4).
+
+## 2026-08-28 — D3D12 migration 11a.2
+
+- Added a 4096-bin `uint32` D3D12 histogram shader that reuses the verified sRGB transfer helper,
+  excludes uncovered and non-finite RGB, clamps encoded luminance, and uses SM 5.1 atomics.
+- Added a bounded one-band clear/dispatch/readback harness and verified empty, sparse with a covered
+  NaN, and full finite histograms against every CPU-oracle bin.
+- Verified portable Debug and Release CTest (3/3 each), the production native build, FXC shader
+  compilation, and Windows MSVC Release/WARP CTest (4/4).
+
+## 2026-08-28 — D3D12 migration 11a.3
+
+- Added output-job ownership for one fixed histogram, with one-shot clear and retained accumulation
+  diagnostics.
+- Added production accumulation from current resident/banded linear and coverage buffers, enforcing
+  sequential non-overlapping bands, restoring both inputs to `COPY_DEST`, and never clearing between
+  bands.
+- Verified exact resident 4×4 and two-band 2×64 histograms, one clear, exact band/pixel counts, and
+  duplicate accumulation rejection on WARP.
+- Verified portable Debug and Release CTest (3/3 each), the production native build, and Windows
+  MSVC Release/WARP CTest (4/4).
+
+## 2026-08-28 — D3D12 migration 11b.1
+
+- Added a warning-clean one-thread selector over the retained `uint32` histogram, reproducing
+  CUDA's 0.5%/99.5% ranks, within-bin interpolation, empty `(0,1)`, and flat `(0,0)` sentinel.
+- Retained the two-float levels resource on the output job and downloaded only its eight scalar
+  bytes for the report.
+- Verified empty, flat, and two-level percentile fixtures plus duplicate-selection rejection in
+  portable Debug/Release, production native, FXC, and Windows MSVC Release/WARP gates.
+
+## 2026-08-28 — D3D12 migration 11b.2
+
+- Added output-job-owned normalized-sRGB storage and an encoded-space auto-contrast application
+  shader consuming retained levels.
+- Preserved CUDA behavior: apply `(value - black) / (white - black)` only when enabled and
+  `white > black`; disabled and flat-sentinel paths leave transferred values unchanged.
+- Restored the linear band to `COPY_DEST`, reused bounded normalized storage, and read back only the
+  current band with `CopyBufferRegion`.
+- Verified enabled/disabled two-level output against CPU formulas in portable Debug/Release,
+  production native, warning-clean FXC, and Windows MSVC Release/WARP gates.
+
+## 2026-08-28 — D3D12 migration 11c.2
+
+- Added output-job-owned 8-bit sRGB storage and a bounded quantization dispatch over the current
+  resident or banded normalized-sRGB buffer.
+- Matched CUDA/NumPy nearest-even conversion explicitly, including saturation before scaling, and
+  restored reusable input/output resource states after dispatch and test readback.
+- Verified every resident channel exactly and every banded channel within the planned one-code
+  tolerance in portable Debug/Release, production native, warning-clean FXC, and Windows MSVC
+  Release/WARP gates.
+
+## 2026-08-28 — D3D12 migration 11d.1
+
+- Added an output-job-owned Rec.2020 tone-mapped linear intermediate bounded to the resident or
+  current band allocation.
+- Preserved CUDA's exact operation order: per-channel negative clamp, explicit
+  `10000/reference_white_nits` scaling, Rec.2020 luminance, and shared `L/(1+L)` scale.
+- Verified invalid reference white plus neutral, negative-channel, and unequal-highlight fixtures
+  against the CUDA-authoritative CPU formula in portable Debug/Release, production native,
+  warning-clean FXC, and Windows MSVC Release/WARP gates.
+
+## 2026-08-28 — D3D12 migration 11d.2
+
+- Added the CUDA-authoritative Rec.2020-to-linear-sRGB matrix as an isolated reusable HLSL helper
+  and output-job dispatch over the retained tone-mapped intermediate.
+- Retained a bounded linear-sRGB intermediate, rejected conversion before its matching active-band
+  prerequisite, and restored both resources for reuse.
+- Verified every matrix channel for negative-clamped, neutral, and unequal-highlight fixtures in
+  portable Debug/Release, production native, warning-clean FXC, and Windows MSVC Release/WARP
+  gates.
+
+## 2026-08-28 — D3D12 migration 11d.3
+
+- Reused the proven auto-contrast/sRGB shader implementation with the retained converted
+  linear-sRGB input, preserving the original linear-sRGB entry point and resource states.
+- Fed the result through the existing nearest-even 8-bit quantizer without introducing a PQ-only
+  transfer or quantization variant.
+- Verified negative gamut excursions, neutral pixels, and saturated highlights end-to-end within
+  one code value in portable Debug/Release, production native, and Windows MSVC Release/WARP
+  gates.
+
+## 2026-08-28 — D3D12 migration 11e.1–11e.2
+
+- Added an output-job-owned float output buffer and exact active-band `CopyBufferRegion` path,
+  preserving values above one without SDR conversion or arithmetic.
+- Matched the current CUDA/EXR policy for non-finite composed values: NaN and positive/negative
+  infinity are preserved byte-for-byte rather than clamped or rejected at download time.
+- Verified exact resident and banded float copies, including above-one and non-finite fixtures, in
+  portable Debug/Release, production native, and Windows MSVC Release/WARP gates.
+
+## 2026-08-28 — D3D12 migration 11f.1–11f.3
+
+- Added versioned caller-owned download layouts and separate integer/float production entry points
+  that reject wrong width, row range, or byte count before submission.
+- Added one output-job-owned, 64 KiB-aligned readback buffer reused across formats and bands, with
+  cancellation checks before submission and after fence completion.
+- Added transfer diagnostics and verified cancelled calls leave destinations/counters unchanged,
+  while successful integer and float calls produce exact payload counts and no disk scratch.
+- Verified portable Debug/Release, production native, and Windows MSVC Release/WARP gates.
+
+## 2026-08-28 — D3D12 migration 12a
+
+- Replaced the preview destroy stub with a session-retaining opaque preview owner for RGB8 full
+  preview, overview, and compact per-pose masks.
+- Added exact overflow-safe creation layouts, all-or-nothing publication, idempotent destruction,
+  retained-byte/dimension/live-count diagnostics, and shader-readable resource states.
+- Verified malformed creation leaves a null handle and byte-for-byte retained buffers return from
+  WARP, with portable Debug/Release and production native gates also passing.
+
+## 2026-08-28 — D3D12 migration 12b
+
+- Added fixed-viewport overview/crop rendering over retained RGB8 buffers with a versioned,
+  caller-owned request and reusable viewport/readback allocations.
+- Preserved CUDA's exact overview pixels and integer crop coordinates; viewport-sized crops at the
+  exact lower/right boundary succeed while oversized or out-of-range crops fail before dispatch.
+- Verified overview, center crop, boundary crop, and untouched rejection destinations in portable
+  Debug/Release, production native, warning-clean FXC, and Windows MSVC Release/WARP gates.
+
+## 2026-08-28 — D3D12 migration 12c–12e
+
+- Ported CUDA's single preview-overlay kernel over retained RGB8 images and compact masks, mapping
+  mask coordinates directly instead of retaining CUDA's expanded-mask cache.
+- Preserved hover tint/outline, target color and target-mode behavior, boundary composition,
+  horizontal wrap, and overlay priority.
+- Verified no-overlay identity, hovered/uncovered pixels, target hover, and boundary-only target
+  fixtures in portable Debug/Release, production native, warning-clean FXC, and Windows MSVC
+  Release/WARP gates.
+
+## 2026-08-28 — D3D12 migration 12f
+
+- Added monotonic preview generations, pre-submit/post-fence stale rejection, token cancellation,
+  and atomic concurrent-render rejection without moving Tk ownership into native code.
+- Retained the existing GUI worker's one-pending-request coalescing and event-generation publication
+  filter for Step 13 binding.
+- Ran the full native contract on the installed NVIDIA GeForce RTX 5090; 31 generation-aware
+  preview requests measured 0.851 ms median and 1.324 ms p95 request-to-caller-buffer latency.
+
+## 2026-08-28 — D3D12 migration 13a
+
+- Replaced neutral product selection's temporary CUDA translation with native D3D12 adapter probe
+  and checked memory admission; explicit CUDA selection remains available only to oracle tests.
+- Preserved strict-GPU errors and pre-dispatch CPU fallback, returned the existing transitional
+  plan shape without changing render routing, and conservatively charged the peak conversion chain
+  plus committed-resource alignment.
+- Verified mocked D3D12 selection/fallback/strict behavior, no CUDA probe invocation, full Python
+  Ruff/format/mypy gates, and 137 passing tests; physical NVIDIA native probe/admission remained
+  covered by the RTX 5090 hardware-full contract.
+
+## 2026-08-28 — D3D12 migration 13b.1
+
+- Promoted ordered hard composition to a production output-job entry point for the session's
+  source type and frame count, replacing fixed three-frame resource-owner arrays with bounded
+  dynamic ownership.
+- Restored ping-pong accumulators to UAV state before their next write, enabling the fourth and
+  subsequent ordered passes without changing strict-greater winner or tie arithmetic.
+- Switched existing resident and repeated-band fixtures to the production entry point and added a
+  four-frame WARP regression checked against independently dispatched per-frame candidates.
+- Verified portable Debug/Release native contracts and Windows MSVC Release/WARP CTest (4/4).
+
+## 2026-08-28 — D3D12 migration 13b.2a
+
+- Generalized the existing feather accumulation chain from fixed two/three-frame resource arrays
+  to any positive frame count with allocation-safe dynamic resource ownership.
+- Restored reused ping-pong accumulation targets from SRV to UAV state before the third and later
+  ordered writes, preserving sequential floating-point addition.
+- Added an array-form test hook and explicit one-/four-frame regressions alongside the existing
+  two-/three-frame fixtures; the four-frame case verifies order-sensitive arithmetic.
+- Verified portable Debug/Release contracts, the production native build, and Windows MSVC
+  Release/WARP CTest (4/4).
+
+## 2026-08-28 — D3D12 migration 13b.2b
+
+- Added an output-only feather normalization shader that writes normalized linear RGB and exact
+  byte coverage while preserving the standalone zero-weight RGB rule.
+- Kept final feather accumulators on-device and optionally normalized them directly into reusable
+  resident/banded output storage; legacy test calls retain their independent readback behavior.
+- Enabled UAV access on output-owned linear/coverage buffers without changing allocation sizes or
+  their established idle `COPY_DEST` state.
+- Verified resident and both repeated 32-row band positions against standalone accumulation and
+  normalization fixtures in portable Debug/Release, production native, warning-clean FXC, and
+  Windows MSVC Release/WARP CTest (4/4).
+
+## 2026-08-28 — D3D12 migration 13b.2c
+
+- Promoted retained-source feather composition behind a production output-job entry point while
+  sharing the proven typed candidate generation, band validation, and exposure hooks with hard
+  composition.
+- Added GPU-only feather-weight, ordered accumulation, and output normalization/coverage branches;
+  no image-sized candidate or accumulator crosses to CPU.
+- Verified three-frame UINT8/UINT16/FLOAT32 output against independent candidate-weight oracles,
+  four-frame UINT8 ordered composition, and full-resident versus two reused 32-row bands.
+- Passed portable Debug/Release contracts, production native, MSVC `/W4 /WX`, warning-clean FXC,
+  and Windows Release/WARP CTest (4/4).
+
+## 2026-08-28 — D3D12 migration 13b.3
+
+- Added versioned production composite inputs with mutually exclusive identity, explicit
+  manual/combined gains, or already-uploaded retained session gains plus optional packed local
+  fields and explicit incomplete-magenta behavior.
+- Applied the same gain/local-field inputs in shared candidate generation for hard and feather
+  modes; retained automatic gains match equivalent explicit gains without another solve/upload.
+- Added an in-place output-owned incomplete shader over byte coverage, preserving coverage while
+  writing magenta only for uncovered pixels and avoiding another image-sized RGB allocation.
+- Verified identity/manual/local/retained and complete/incomplete fixtures for both blend modes in
+  portable Debug/Release, production native, warning-clean FXC, and Windows MSVC Release/WARP
+  CTest (4/4).
+
+## 2026-08-28 — D3D12 migration 13b.4
+
+- Declared the complete native preparation ABI in ctypes: device/session construction, retained
+  rotations and optional metadata, source allocation, exactly two upload slots, frame-zero and
+  cancellable later uploads, cancellable finish, and pointer-to-handle destruction.
+- Added a transactional prepared-session factory that publishes ownership only after uploads finish
+  and otherwise destroys session before device; one native cancellation token spans all waits.
+- Verified exact structure/declaration layouts, upload order/indices/bytes, token propagation,
+  cancellation translation, idempotent owner close, and injected mid-upload reverse cleanup with
+  12 focused tests, Ruff/format, and mypy. Native two-slot/WARP behavior remains covered by CTest.
+
+## 2026-08-28 — D3D12 migration 13b.5
+
+- Bound the retained native exposure proxy, pair reduction, solve, gain-upload, and scalar-report
+  workflow to the prepared ctypes session without downloading image-sized intermediates.
+- Cached the completed scalar report so repeated consumers reuse the single retained solve and
+  gain upload; failures before upload remain retryable and preserve orderly session teardown.
+- Verified exact ctypes declarations, native call order and geometry/FOV inputs, one-upload reuse,
+  and reduction-failure behavior with 14 focused adapter tests; Ruff/format and mypy pass.
+
+## 2026-08-28 — D3D12 migration 13b.6
+
+- Bound transactional resident/banded output creation, hard/feather composition with retained or
+  explicit exposure inputs, auto-contrast operations, SDR/PQ/float conversions, and cancellable
+  downloads to exact versioned ctypes layouts.
+- Kept output children owned by their prepared session, destroyed unpublished partial allocations,
+  and rejected readonly, non-contiguous, or incorrectly sized download buffers before submission.
+- Verified declarations, allocation order/cleanup, composition inputs, all conversion families,
+  exact download ranges/bytes, and cancellation-token forwarding with 17 focused adapter tests;
+  Ruff/format and mypy pass.
+
+## 2026-08-28 — D3D12 migration 13b.7
+
+- Switched final product selection from the legacy CUDA selector to the neutral D3D12 admission
+  path and routed resident, non-auto-contrast PNG/JPEG/EXR outputs through native composition.
+- Streamed decoded source frames into the native two-slot uploader, preserved staged publication
+  and existing encoders, applied explicit sRGB/PQ/linear conversions, and enforced complete
+  coverage through the fixed-size native histogram reduction.
+- Kept CUDA reachable only through explicit oracle-test injection, added PNG/JPEG-PQ/EXR-linear
+  resident routing fixtures, and fixed 3x3 rotation marshaling and preflight token cleanup found by
+  them. Ruff/format, mypy, 85 focused Python tests, portable Debug/Release contracts, and Windows
+  MSVC Release/WARP CTest (4/4) pass.
+
+## 2026-08-28 — D3D12 migration 13b.8
+
+- Generalized final D3D12 output jobs over resident or memory-planned band rows using the shared
+  adaptive watchdog scheduler and exact completed-band downloads into the existing host output.
+- Added the required two-pass SDR auto-contrast route: contiguous histogram bands and retained
+  levels first, followed by recomposition, transfer-specific conversion, and staged publication.
+- Kept non-auto renders single-pass, used the same fixed histogram reduction for strict coverage,
+  and checked cancellation before every composition and download boundary.
+- Verified resident/banded call counts, one-/two-pass behavior, PNG/JPEG-PQ/EXR conversion routes,
+  exact download counts, Ruff/format, mypy, and 69 focused adapter/compositor tests; the underlying
+  native operations pass portable Debug/Release and Windows MSVC Release/WARP CTest (4/4).
+
+## 2026-08-28 — D3D12 migration 13b.9
+
+- Enforced the product fallback boundary around D3D12 final rendering: adapter/session/output
+  failures before the first composition may restart once on CPU, while strict mode propagates.
+- Kept numerical and later conversion/download failures outside the fallback handler so a native
+  render can never double-render or publish results from a restarted CPU path.
+- Verified non-strict fallback, strict rejection, and injected post-dispatch propagation with 72
+  focused adapter/compositor tests; Ruff/format and mypy pass.
+
+## 2026-08-28 — D3D12 migration 13c
+
+- Bound exact native preview creation, session-retaining ownership, base crop/overview rendering,
+  cancellation forwarding, and child-before-parent destruction in ctypes.
+- Switched product preview selection to the neutral D3D12 path and returned completed SDR preview
+  pixels directly from native output downloads without a temporary preview file or Tk ownership.
+- Kept CUDA available only through explicit oracle injection and verified retained byte counts,
+  crop metadata, cleanup order, and D3D12 in-memory routing with 74 focused tests; Ruff/format and
+  mypy pass. Native base-preview pixels remain covered by Windows WARP CTest (4/4).
+
+## 2026-08-28 — D3D12 migration 13d
+
+- Bound generation-aware preview overlays and added a D3D12 display object matching the GUI
+  worker's existing render/close interface without moving image or Tk work onto the main thread.
+- Extended the single-entry session cache with immutable D3D12 adapter-LUID/ABI identity,
+  retained preview ownership, generation/hover/target requests, and child-before-parent cleanup.
+- Extracted streaming session preparation so preview and final output reuse one native upload and
+  one retained exposure solve; cache misses prepare transactionally and failures invalidate.
+- Verified generation advancement, base/overlay selection, hovered/target propagation, cache hit
+  and cleanup behavior, plus the full Python gate: Ruff/format, mypy, and 157 passing tests.
+
+## 2026-08-28 — D3D12 migration 13.5
+
+- Added a Windows `gpu` PyInstaller archive that embeds exactly one Release `pano_gpu.dll` beside
+  the frozen ctypes adapter, while the CPU and transitional CUDA-oracle archives contain no native
+  D3D12 DLL.
+- Made the release workflow configure, build, and test the native backend before packaging, then
+  run a non-GUI frozen ABI-load probe before publishing the GPU archive. A selected stitcher flavor
+  can now be built without an unrelated ReShade add-on artifact.
+- Kept the packaged GUI's existing GPU checkbox enabled by the `gpu` flavor so preview selects the
+  D3D12 product path by default; CUDA remains reachable only through explicit test-oracle injection.
+- Built `PanoramaCapture-Stitcher-1.0.4-gpu-win-x64.zip` on Windows with MSVC 19.51.36256.0. Native
+  Release/WARP CTest passed 4/4, the frozen ABI probe passed, and the archive is ready for the manual
+  NVIDIA preview/status smoke test.
+- The first NVIDIA GUI smoke test reached D3D12 admission and exposed an unaligned Python session
+  workspace estimate. Aligned that estimate to the native allocator's 64 KiB committed-resource
+  boundary, added an exact request regression assertion, and rebuilt the GPU archive with native
+  Release/WARP CTest 4/4 and the frozen ABI probe passing. The same smoke test confirmed CPU
+  fallback preview still works.
+- The next NVIDIA smoke test completed native session upload and cache insertion, then exposed the
+  Python adaptive scheduler incorrectly subdividing a resident output at 1024 rows. Resident output
+  now emits one exact full-height composition request while only banded outputs use the adaptive
+  scheduler. A 2048-row regression covers the native row-range contract; the full Python gate,
+  Windows Release/WARP CTest 4/4, frozen ABI probe, and rebuilt GPU archive pass.
+- The first rendered NVIDIA preview and interactive crop succeeded but revealed severe SDR
+  overexposure. Native candidate shaders had normalized encoded samples without applying the
+  session's explicit transfer function, then the correct output stage encoded those values to sRGB
+  a second time. All uint8/uint16/float candidate paths now decode sRGB/PQ/linear per texel before
+  interpolation and gains, matching the authoritative CUDA pipeline without inferring from sample
+  type. The WARP sRGB candidate oracle now expects decoded-linear values.
+- Audited the remaining CUDA/D3D12 color sequence: projection, per-texel decode, bilinear sampling,
+  linear gain, hard/feather weighting and normalization, PQ tone mapping, Rec.2020 conversion,
+  auto-contrast, and quantization are ordered equivalently. The 17-test CUDA fixture suite passed,
+  but a direct WSL device render reported an insufficient CUDA driver/runtime pairing and therefore
+  was not physical-device evidence. Windows CUDA-oracle packaging completed for an explicit native
+  NVIDIA comparison.
+- A same-session Windows NVIDIA oracle isolated the remaining PQ preview overexposure to D3D12
+  auto-contrast: non-auto CUDA/D3D12 output differed by at most one code value, but D3D12 built its
+  histogram from decoded PQ Rec.2020 before the SDR tone-map/gamut conversion. Bumped the synchronized
+  native/ctypes ABI to 8, added converted-linear-sRGB histogram accumulation, and routed PQ histogram
+  passes through the same tone-map and Rec.2020-to-sRGB sequence as CUDA. The final 4184x2092 CUDA and
+  D3D12 previews have channel means `[66.4032, 52.8418, 32.7798]` on both paths; 99% of channel deltas
+  are zero and the maximum delta is one. Ruff/format, mypy, all 158 Python tests, portable
+  Debug/Release CTest, and Windows Release/WARP CTest pass. Rebuilt the 71 MiB ABI-8 GPU GUI archive
+  at `C:\dev\panorama-taker-gui-dist\PanoramaCapture-Stitcher-1.0.4-gpu-win-x64.zip`.
+
+## 2026-08-28 — D3D12 migration 14a.1 and 14d.2–14d.3
+
+- Replaced the optimistic final-output admission estimate with a conservative peak that charges
+  per-frame hard/feather candidate resources, retained output/conversion buffers, alignment, and
+  descriptors. The real 17552x8776 session now selects a 1024-row band instead of admitting an
+  impossible resident allocation; a strict 512-wide NVIDIA D3D12 render succeeds.
+- Routed the optional session thumbnail through a second rectilinear render on the retained D3D12
+  session, preserving the established 90-degree horizontal thumbnail projection. Panorama and
+  thumbnail are staged and published only after both renders complete; post-dispatch thumbnail
+  failures preserve existing outputs, clean staging files, and never restart on CPU.
+- Session `1787897185-2` rendered both artifacts on the current NVIDIA device without CPU fallback:
+  `C:\dev\panorama-step14-output\session-1787897185-2-thumbnail-test.png` (261513 bytes) and its
+  3840x2160 thumbnail (12054341 bytes). Ruff/format, mypy, and 82 focused compositor/GPU tests pass.
+
+## 2026-08-28 — D3D12 migration 14d.1 and ABI 9
+
+- Added the versioned native `pano_gpu_output_download_coverage` operation and synchronized ctypes
+  ABI 9. It enforces the same exact completed-band, cancellation, reusable-readback, and transfer
+  diagnostic contracts as color downloads; the WARP oracle verifies coverage byte-for-byte.
+- Removed the D3D12 coverage fallback and stream each completed native coverage band through the
+  existing bounded grayscale PNG writer. Final, coverage, and thumbnail files remain staged; the
+  main panorama is published last as the successful-render commit marker.
+- The authorized real session rendered panorama (261513 bytes), 3840x2160 thumbnail (12054341
+  bytes), and coverage PNG (512 bytes) on the current NVIDIA device with no CPU fallback, under
+  `C:\dev\panorama-step14-output\session-1787897185-2-coverage-test*`.
+- Full Python verification passes: Ruff, format, mypy, 143 tests passed and 17 CUDA-runtime tests
+  skipped. Portable Debug/Release native contracts pass; Windows MSVC Release builds cleanly and
+  all four CTest/WARP tests pass.
+
+## 2026-08-28 — D3D12 migration 14 GUI/manual hardening follow-up
+
+- Fixed the native band-row contract exposed by the full-size GUI render. Python had reused the
+  adaptive CUDA watchdog scheduler after allocating a fixed 1024-row native output, so its first
+  256-row request was correctly rejected. D3D12 now submits exactly the planned row count and only
+  shortens the final remainder; a 2500-row regression verifies 1024/1024/452 requests.
+- Kept the retained preview alive while final rendering starts, preserve it after final-render
+  failure, restore controls before showing the error dialog, immediately restore the overview on
+  pointer leave, and grow (never shrink) the window when the completed overview is installed.
+- Added focused tests for preview ownership, hover restoration, window sizing, failure-state
+  recovery, and fixed native bands. The full Python gate passes with 148 tests and 17 intentional
+  CUDA-runtime skips; Ruff, format, and mypy pass.
+- Real-session 4096x2048 and 8192x4096 NVIDIA D3D12 resident renders succeeded. Artificial 3 GiB
+  and 5 GiB caps were rejected during admission because they are below the retained-session plus
+  reserve floor; no numerical dispatch occurred. Native-size manual validation remains the direct
+  proof of the repaired 1024-row product path.
+- A subsequent native-size manual render proved the error persisted after the Python fixed-band
+  change. The native output retained its initial band-zero range forever; only test hooks had ever
+  advanced `band_row_start`/`band_row_count`, masking the production defect. Production composition
+  now validates and selects each planned band, accepts the shortened final band, and permits a
+  validated rewind to row zero for auto-contrast's second pass. The WARP oracle composes the later
+  band first and rewinds without either test-only setter.
+- Final-render failure now fully discards the invalidated retained preview and resets progress after
+  enabling controls, while active rendering itself leaves the preview visible. Full Python checks
+  still pass (148 passed, 17 CUDA-runtime skips); MSVC Release/WARP CTest passes 4/4. The approved
+  in-place `r2` GPU archive was rebuilt, frozen-probed, and its temporary release tree removed.
+- Manual NVIDIA GUI validation now confirms correct full-size panorama output for hard and feather
+  blending, with and without thumbnail, with and without coverage, and confirms preview exposure
+  corrections carry through to the full render. D3D12 is marginally slower than the CUDA oracle in
+  this session but completes correctly.
+- The generated thumbnail was still a squeezed equirectangular panorama. Native code had copied the
+  integer bit pattern `1` into an HLSL `float` projection flag, producing a denormal that the GPU
+  flushed to zero. All candidate/local-exposure marshaling sites now provide actual `1.0f/0.0f`
+  constants. The strengthened WARP oracle requires rectilinear and equirectangular candidate and
+  validity fields to differ; Windows CTest passes 4/4. The same approved `r2` archive was rebuilt in
+  place, frozen-probed, and cleaned for thumbnail revalidation.
+- Manual validation of the rebuilt archive confirms the session thumbnail now uses the intended
+  centered 90-degree rectilinear projection rather than squeezing the equirectangular panorama.
+
+## 2026-08-29 — D3D12 migration 14a.2
+
+- Injected the identical `cannot create D3D12 hard-composite frame buffers` failure on each side of
+  the first numerical-dispatch boundary. Preflight restarts once on CPU in non-strict mode;
+  post-dispatch propagates and never double-renders, independent of matching error wording.
+- Ruff/format and all 61 focused compositor tests pass.
+## 2026-08-29 — D3D12 migration 14a.3
+
+- Added test-only one-shot failure injection for device, pipeline, descriptor, resource, and retained-preview construction; existing session and output allocation hooks complete the planned construction boundary set.
+- The compact device self-test owns pipeline, descriptor, and resource failure coverage, avoiding production-path refactoring while proving local COM cleanup and one-shot recovery.
+- Added native contract assertions for null failed out-handles, preserved live-parent counts, and successful operation immediately after each injected failure.
+- Verified Linux Release native build and CTest: 3/3 passed.
+- Verified Windows x64 MSVC Release build and CTest/WARP: 4/4 passed.
+## 2026-08-29 — D3D12 migration 14a.4
+
+- Added test-only retained-preview live-count observability without changing the production ABI.
+- Verified failed preview construction leaves no live preview, repeated preview destruction returns the count to zero, transient pipeline/resource/descriptor failures preserve only the live parent device, and existing child-before-parent ownership tests release device, queue, fence, session, and output counts to zero.
+- Verified Linux Release native build and CTest: 3/3 passed.
+- Verified Windows x64 MSVC Release build and CTest/WARP: 4/4 passed.
+## 2026-08-29 — D3D12 migration 14b.1
+
+- Audited the native upload failure matrix: source, upload-slot, second-slot, and encoding-metadata allocation; metadata-upload rejection; alternating slot reuse; upload-fence signal failure; cancellation after slot wait; and cancellation after upload-finish wait all have focused contract assertions.
+- Existing assertions prove failed attempts do not advance upload counts or overwrite completed frames and that retry succeeds. D3D12 queue execution itself is void; the following fence signal is the first reportable submission failure.
+- Reverified the matrix in the Windows x64 MSVC Release CTest/WARP gate: 4/4 passed.
+## 2026-08-29 — D3D12 migration 14b.2
+
+- Added test-only one-shot failures immediately before and after the production `*_with_inputs` numerical compositor used by the Python D3D12 adapter.
+- Native errors identify whether the failure occurred before or after the first D3D12 numerical dispatch; focused WARP assertions prove each hook is one-shot and the output remains reusable.
+- Verified Linux Release native build and CTest: 3/3 passed.
+- Verified Windows x64 MSVC Release build and CTest/WARP: 4/4 passed.
+## 2026-08-29 — D3D12 migration 14b.3
+
+- Added test-only one-shot failures for production output-download readback allocation, pre-submit rejection, post-fence-wait failure, and readback mapping.
+- Each native failure reports its phase, leaves the caller's destination buffer untouched, does not advance transfer accounting, and permits the following real download to succeed.
+- Verified Linux Release native build and CTest: 3/3 passed.
+- Verified Windows x64 MSVC Release build and CTest/WARP: 4/4 passed.
+## 2026-08-29 — D3D12 migration 14b.4
+
+- Added WARP-safe device-removal injection before and after the production numerical compose boundary. Errors retain both `DXGI_ERROR_DEVICE_REMOVED` (`0x887a0005`) and the injected removal reason (`0x887a0007`) plus the dispatch phase.
+- Extended the compositor regression matrix to prove both allocation and device-removal messages fall back to CPU only when raised as pre-dispatch failures; post-dispatch failures always propagate without double-rendering.
+- Verified focused Python ruff, format, and compositor tests: 63 passed.
+- Verified Linux Release native build and CTest: 3/3 passed.
+- Verified Windows x64 MSVC Release build and CTest/WARP: 4/4 passed.
+## 2026-08-29 — D3D12 migration 14c.1
+
+- Audited existing cancellation checkpoints: pre-upload, post-slot-wait, post-upload-finish-wait, pre-download, post-download-fence-wait, and pre-next-band cancellation all have focused native or adapter regressions.
+- The tests preserve completed frame/upload accounting, leave cancelled download destinations untouched, close output jobs, and prevent the next band submission.
+- Verified focused Python D3D12 adapter ruff, format, and tests: 20 passed.
+- Reused today's Windows x64 MSVC Release CTest/WARP result covering native checkpoints: 4/4 passed.
+## 2026-08-29 — D3D12 migration 14c.2
+
+- Added a shared test-only fence-timeout injection point that waits for the real GPU fence before reporting the operation-specific timeout, avoiding in-flight resource lifetime hazards.
+- The output-download regression bounds the injected path below five seconds, preserves the destination sentinel, and proves the same output remains reusable on the following operations.
+- Verified Linux Release native build and CTest: 3/3 passed.
+- Verified Windows x64 MSVC Release build and CTest/WARP: 4/4 passed in 2.02 seconds total.
+## 2026-08-29 — D3D12 migration 14c.3
+
+- Added test-only retained-preview guard claim/release helpers to deterministically exercise the real concurrent-render rejection branch.
+- WARP coverage now proves stale generation and cancellation leave the destination sentinel untouched, a concurrent call is rejected without publishing pixels, and five successive generations render successfully after the guard is released. The physical-adapter latency loop remains 31 renders.
+- Verified Linux Release native build and CTest: 3/3 passed.
+- Verified Windows x64 MSVC Release build and CTest/WARP: 4/4 passed.
+## 2026-08-29 — D3D12 migration 14c.4
+
+- Added an exactly-once GUI shutdown latch. Closing during active work requests cancellation once and waits; after the worker exits, repeated close calls can no longer repeat preview cleanup, session-cache close, settings save, or root destruction.
+- Added a focused lifecycle regression that verifies preview cleanup precedes cache/session cleanup and the full finish sequence runs once. Existing adapter tests cover output/preview children closing before their prepared session/device parent.
+- Verified focused GUI ruff and format checks, GUI cache tests: 22 passed, and mypy: no issues in 12 source files.
+## 2026-08-29 — D3D12 migration 14d.3
+
+- Replaced sequential D3D12 panorama/coverage/thumbnail publication with a rollback transaction: existing destinations move to unique backups, staged files publish as a set, and any failure removes new publications and restores old files in reverse order.
+- Failed backup restoration is left recoverable on disk rather than deleted. Non-preflight D3D12/runtime/publication failures now invalidate the retained session cache before propagating.
+- Added coverage-, thumbnail-, and panorama-publication failure cases; each preserves all three existing outputs, removes staged debris, forbids CPU double-rendering, and records one cache invalidation.
+- Verified focused compositor ruff and format checks, compositor tests: 66 passed, and mypy: no issues in 12 source files.
+## 2026-08-29 — D3D12 migration 14d.4
+
+- Added cancellation coverage after panorama, coverage, and thumbnail staging but before publication. Every existing output remains byte-for-byte unchanged and all `.partial` stages are removed.
+- D3D12 cancellation now invalidates retained cache state as `render cancelled`; other propagated runtime/publication failures use `render failed`. Existing cache-display tests verify preview then token then prepared-session teardown.
+- Together with the successful three-output publication and 14d.3 failure matrix, this completes Step 14 staged-file/cache cleanup.
+- Verified focused compositor ruff and format checks, compositor tests: 67 passed, and mypy: no issues in 12 source files.
+## 2026-08-29 — D3D12 migration 15a
+
+- Promoted the shared memory plan, band scheduler, preflight error, session-cache key/owner, cache-key builder, preview-display fields, and public render arguments to real backend-neutral `Gpu*`/`gpu_*` definitions; removed all temporary `Gpu* = Cuda*` aliases.
+- Removed the CUDA backend literal and hidden CUDA branches from product `render_session`/`render_preview` orchestration. Width scaling and pre/post-dispatch fallback behavioral tests now run through D3D12 with unchanged assertions.
+- The explicit CUDA oracle implementation remains directly callable only for the implementation-test replacement/removal steps 15b–15d.
+- Verified the full Python gate: ruff and format clean, mypy clean, 157 passed and 17 intentional CUDA-oracle skips.
+
+## 2026-08-29 — D3D12 migration 15b–15d
+
+- Replaced implementation-specific kernel assertions with fixed HLSL source/entry-point hashes for
+  candidate projection, exposure projection/classification, hard selection, feather accumulation,
+  and retained-preview overlay. Native WARP contracts and adapter/compositor failure matrices now
+  own driver, allocation, lifetime, banding, output, exposure, cancellation, and retry coverage.
+- Replaced the three-flavor release contract with one cross-vendor archive containing exactly one
+  `pano_gpu.dll` and one frozen D3D12 ABI-load probe. CI now runs the complete Python suite rather
+  than excluding a hardware-oracle module.
+- Removed the optional vendor-compute dependencies and regenerated `uv.lock`; eleven CuPy/vendor
+  runtime packages were removed. Removed frozen-runtime probes, collection hooks, archive flavor
+  switches, environment switches, and release-workflow flavor assumptions.
+- Deleted the dormant CUDA kernel and Python implementation, its direct tests, and the unreachable
+  compositor path. The surviving GPU module contains only neutral scheduling/accounting and D3D12
+  admission; the benchmark now compares strict D3D12 with CPU.
+- Updated README and CLI text to the single archive and D3D12 backend. A focused current-source
+  search contains no CUDA, CuPy, NVRTC, or CUDA-runtime names.
+- Verified the full Python gate: Ruff lint and format clean, mypy clean, 145 passed. Regenerated the
+  lock with normal `uv lock`; package metadata and lock contain no vendor-compute dependency.
+- Verified a clean temporary install from current project metadata: eleven ordinary runtime
+  packages plus `pano-stitch`, with no vendor compute runtime; removed the temporary environment.
+- Verified Linux native CTest 3/3 and the existing Windows x64 MSVC Release/WARP gate 4/4.
+
+## 2026-08-29 — D3D12 migration 16a–16d
+
+- Built the single transitional `PanoramaCapture-Stitcher-1.0.4-win-x64.zip` with the Python GUI,
+  ABI-9 native DLL, and embedded shaders. Fixed Python inputs, MSVC `/Brepro`, sorted entries, and
+  fixed ZIP timestamps made two clean builds byte-identical at SHA-256 `20878f3155f86c5c55174b4c8409fa449aad0740318a7e268f0b1abf23756c7a`.
+- Added `--verify-gpu-runtime` with stable exits 0 verified, 2 unavailable, and 3 failure. The command
+  validates ABI, product hardware admission, pipeline creation, dispatch, readback, and cleanup.
+  Release probes now synchronously wait for the windowed executable; this fixed premature cleanup
+  and stale-exit behavior exposed by the extracted-path audit.
+- Added an automated archive audit for paths containing spaces, payload/runtime/compiler rejection,
+  PE dependencies, compressed/extracted sizes, archive/EXE/DLL hashes, all shader-source hashes,
+  physical adapter details, and a corrupted-DLL exit-3 check. The final RTX 5090 audit passed.
+- Ran the authorized real 30-frame 4K SDR PNG session on the RTX 5090 through strict D3D12:
+  resident preview, hard panorama, projected thumbnail, coverage, feather JPEG, linear EXR, and a
+  4096-wide forced 32-row-banded panorama passed. Cancellation after the first source upload
+  published no output and left no partial. Temporary outputs and verifier copies were removed.
+- The available Windows 11/NVIDIA run is the approved physical-hardware completion gate for Step
+  16. Windows 10, AMD, Intel, CPU-only clean-machine, known JPEG/PQ/EXR input-session, and
+  per-target GUI checks are retained as a non-blocking deferred checklist in
+  `docs/d3d12-stitcher-acceptance.md` for completion when suitable systems and sessions become
+  available.

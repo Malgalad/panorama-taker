@@ -86,11 +86,26 @@ class _StatusVariable:
 
 
 class _Root:
+    def __init__(self) -> None:
+        self.geometry_value = ""
+
     def after(self, _milliseconds: int, _callback: object) -> str:
         return "after-id"
 
     def after_cancel(self, _identifier: str) -> None:
         pass
+
+    def update_idletasks(self) -> None:
+        pass
+
+    def winfo_width(self) -> int:
+        return 680
+
+    def winfo_height(self) -> int:
+        return 600
+
+    def geometry(self, value: str) -> None:
+        self.geometry_value = value
 
 
 def test_magnified_crop_tracks_pointer_and_clamps_at_edges() -> None:
@@ -122,10 +137,46 @@ def test_render_operation_is_driven_by_ui_state() -> None:
     )
 
 
+def test_close_cancels_active_worker_and_finishes_exactly_once() -> None:
+    calls: list[str] = []
+
+    class Worker:
+        alive = True
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+    app = StitcherApp.__new__(StitcherApp)
+    worker = Worker()
+    app._state = UiState.BUSY
+    app._worker = worker  # type: ignore[assignment]
+    app._close_when_idle = False
+    app._close_finished = False
+    app.status_var = _StatusVariable()  # type: ignore[assignment]
+    app.cancel = lambda: calls.append("cancel")  # type: ignore[method-assign]
+    app._close_gpu_preview_display = lambda: calls.append("preview_close")  # type: ignore[method-assign]
+    app._gpu_session_cache = SimpleNamespace(close=lambda: calls.append("cache_close"))
+    app._save_settings = lambda: calls.append("save")  # type: ignore[method-assign]
+    app.root = SimpleNamespace(destroy=lambda: calls.append("destroy"))
+
+    app._close()
+    app._close()
+
+    assert app._state is UiState.CLOSING
+    assert app._close_when_idle is True
+    assert calls == ["cancel"]
+    worker.alive = False
+
+    app._close()
+    app._close()
+
+    assert calls == ["cancel", "preview_close", "cache_close", "save", "destroy"]
+
+
 def test_gui_cache_invalidates_for_discard_and_input_change() -> None:
     app = StitcherApp.__new__(StitcherApp)
     cache = _Cache()
-    app._cuda_session_cache = cache  # type: ignore[assignment]
+    app._gpu_session_cache = cache  # type: ignore[assignment]
     app._preview_report = None
     app._preview_photo = None
     app._display_lock = threading.Lock()
@@ -154,7 +205,7 @@ def test_gui_cache_invalidates_for_discard_and_input_change() -> None:
 def test_gui_preview_option_change_does_not_revalidate_session() -> None:
     app = StitcherApp.__new__(StitcherApp)
     cache = _Cache()
-    app._cuda_session_cache = cache  # type: ignore[assignment]
+    app._gpu_session_cache = cache  # type: ignore[assignment]
     app._state = UiState.READY
     app._preview_image = None
     app._preview_report = None
@@ -293,6 +344,97 @@ def test_magnified_preview_hover_marks_click_candidates_and_pose_border() -> Non
     assert requested == [(150, 75, 250, 125)]
 
 
+def test_preview_leave_immediately_restores_overview_photo() -> None:
+    app = StitcherApp.__new__(StitcherApp)
+    app._preview_magnified_photo = object()
+    overview_photo = object()
+    app._preview_photo = overview_photo
+    app._hovered_poses = {0}
+    app.preview_label = _Widget()  # type: ignore[assignment]
+    app._refresh_pose_grid = lambda: None  # type: ignore[method-assign]
+    requested: list[object] = []
+    app._refresh_preview_display = lambda crop=None: requested.append(crop)  # type: ignore[method-assign]
+
+    app._restore_preview_overview()
+
+    assert app._preview_magnified_photo is None
+    assert app._hovered_poses == set()
+    assert app.preview_label.configuration["image"] is overview_photo
+    assert requested == [None]
+
+
+def test_preview_ready_expands_window_without_shrinking_height() -> None:
+    class Content:
+        def winfo_reqwidth(self) -> int:
+            return 920
+
+        def winfo_reqheight(self) -> int:
+            return 500
+
+    app = StitcherApp.__new__(StitcherApp)
+    app.root = _Root()  # type: ignore[assignment]
+    app.main_content = Content()  # type: ignore[assignment]
+
+    app._expand_window_for_preview()
+
+    assert app.root.geometry_value == "920x600"  # type: ignore[attr-defined]
+
+
+def test_starting_final_render_retains_preview_display(monkeypatch: object) -> None:
+    class Thread:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+    monkeypatch.setattr(gui_module.threading, "Thread", Thread)  # type: ignore[attr-defined]
+    app = StitcherApp.__new__(StitcherApp)
+    app._state = UiState.PREVIEW
+    app._active_operation = None
+    app._set_busy = lambda _busy: None  # type: ignore[method-assign]
+    app._close_gpu_preview_display = lambda: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("preview display must be retained")
+    )
+
+    app._start_worker("render")
+
+    assert app._state is UiState.BUSY
+    assert app._state_before_busy is UiState.PREVIEW
+
+
+def test_render_error_discards_invalidated_preview(monkeypatch: object) -> None:
+    app = StitcherApp.__new__(StitcherApp)
+    app._events = gui_module.queue.Queue()
+    app._events.put(("render_error", "native failed"))
+    app._state = UiState.BUSY
+    app._state_before_busy = UiState.PREVIEW
+    app._active_operation = "render"
+    app._close_when_idle = False
+    app.root = _Root()  # type: ignore[assignment]
+    app.status_var = _StatusVariable()  # type: ignore[assignment]
+    app.progress = {"value": 50}  # type: ignore[assignment]
+    busy: list[bool] = []
+    app._set_busy = busy.append  # type: ignore[method-assign]
+    discarded: list[bool] = []
+
+    def discard_preview() -> None:
+        discarded.append(True)
+        app._state = UiState.READY
+
+    app.discard_preview = discard_preview  # type: ignore[method-assign]
+    monkeypatch.setattr(gui_module.messagebox, "showerror", lambda *_args, **_kwargs: None)  # type: ignore[attr-defined]
+
+    app._drain_events()
+
+    assert app._state is UiState.READY
+    assert app._active_operation is None
+    assert busy == [False]
+    assert discarded == [True]
+    assert app.progress["value"] == 0
+    assert app.status_var.value.startswith("Render failed:")
+
+
 def test_preview_overlay_composes_compact_mask_for_magnified_crop() -> None:
     source = Image.new("RGB", (400, 200), "black")
     mask = np.zeros((50, 100), dtype=bool)
@@ -405,35 +547,35 @@ def test_output_directory_change_only_checks_writability(tmp_path: Path) -> None
     assert app._validation_after is None
 
 
-def test_cuda_backend_status_formats_reserve_size(tmp_path: Path) -> None:
+def test_gpu_backend_status_formats_reserve_size(tmp_path: Path) -> None:
     assert (
         _backend_status(
-            "cuda resident",
-            "CUDA resident; reserve=402653184 bytes",
-            cuda_requested=True,
+            "gpu resident",
+            "D3D12 resident; reserve=402653184 bytes",
+            gpu_requested=True,
             log_directory=tmp_path,
         )
-        == "CUDA (reserved 384 MB VRAM)"
+        == "D3D12 (reserved 384 MB VRAM)"
     )
     assert (
         _backend_status(
-            "cuda banded",
-            "CUDA banded; reserve=4992899482 bytes",
-            cuda_requested=True,
+            "gpu banded",
+            "D3D12 banded; reserve=4992899482 bytes",
+            gpu_requested=True,
             log_directory=tmp_path,
         )
-        == "CUDA (reserved 4.65 GB VRAM)"
+        == "D3D12 (reserved 4.65 GB VRAM)"
     )
 
 
-def test_cuda_fallback_status_points_to_log_directory(tmp_path: Path) -> None:
+def test_gpu_fallback_status_points_to_log_directory(tmp_path: Path) -> None:
     assert (
-        _backend_status("cpu", "driver failed", cuda_requested=True, log_directory=tmp_path)
-        == f"CPU (failed to initialize CUDA; see error log in {tmp_path})"
+        _backend_status("cpu", "driver failed", gpu_requested=True, log_directory=tmp_path)
+        == f"CPU (failed to initialize GPU; see error log in {tmp_path})"
     )
     assert (
         _backend_status(
-            "cpu", "GPU acceleration disabled", cuda_requested=False, log_directory=tmp_path
+            "cpu", "GPU acceleration disabled", gpu_requested=False, log_directory=tmp_path
         )
         == "CPU"
     )

@@ -25,9 +25,7 @@ Keep each generated `PanoramaCaptureBridge.pano-<session-id>.json` with its scre
 
 ## Stitcher
 
-1. Extract one stitcher archive outside the game directory:
-   - `PanoramaCapture-Stitcher-<version>-cpu-win-x64.zip` for any supported Windows x64 system;
-   - `PanoramaCapture-Stitcher-<version>-cuda-win-x64.zip` only for NVIDIA GPUs with a supported driver.
+1. Extract `PanoramaCapture-Stitcher-<version>-win-x64.zip` outside the game directory.
 2. Run `PanoramaCaptureStitcher.exe`.
 3. Choose the Cyberpunk 2077 game directory.
 4. Select a session from the list. Sessions are read from:
@@ -37,6 +35,21 @@ Keep each generated `PanoramaCaptureBridge.pano-<session-id>.json` with its scre
    ```
 
 5. Choose an output directory and format, then click Render.
+
+For a D3D12 smoke test, leave **Use GPU acceleration** enabled, select a
+completed session, and render a preview. The status must identify the D3D12 adapter rather than a
+CPU fallback.
+
+Release diagnostics can be written without opening the GUI:
+
+```text
+PanoramaCaptureStitcher.exe --verify-gpu-runtime gpu-runtime.txt
+```
+
+Exit `0` verifies ABI loading, hardware adapter admission, embedded-pipeline creation, dispatch,
+readback, and cleanup. Exit `2` means no compatible hardware adapter is available; exit `3` means
+the native runtime, ABI, pipeline, dispatch, or readback failed. Details are written to the supplied
+file because the release executable uses the Windows GUI subsystem.
 
 The stitcher does not alter pose exposure unless requested. If the game changed exposure during a
 capture, render a preview, open **Correct exposure**, choose the desired baseline pose with **Target
