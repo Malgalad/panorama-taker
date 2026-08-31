@@ -1878,3 +1878,935 @@ D3D12 migration Step 10f.1.2 (2026-08-28): added checked `uint32` pair-count pla
   per-target GUI checks are retained as a non-blocking deferred checklist in
   `docs/d3d12-stitcher-acceptance.md` for completion when suitable systems and sessions become
   available.
+
+## 2026-08-29 — Native application plan decomposition
+
+- Reviewed Steps 17–22 before implementation and split metadata, option, headless-core, native CLI,
+  JSON, codec, CPU, Win32 UI, and release work into independently gated leaf increments.
+- Clarified that Step 17 extracts a Python headless reference interface while Step 18 introduces a
+  separate widget-free C++ application core over the existing `pano_gpu` ABI.
+- Moved dependency decisions before production integration, split codec/CPU work at allocation and
+  failure boundaries, and kept unavailable Windows 10/AMD/Intel/physical-CPU-only validation on the
+  non-blocking deferred checklist.
+- No Step 17 implementation was retained. The earliest incomplete implementation unit is 17a.1.
+
+## 2026-08-29 — Native application migration Step 17
+
+- Added a reusable shared/CET metadata fixture corpus covering schema validity, completed and
+  incomplete sessions, invalid CET state, canonical camera basis, moved Windows screenshot paths,
+  discovery ordering/error rows, history, and deletion-target decisions.
+- Added the Tk-independent Python application reference boundary with stable operations, events,
+  error categories, settings normalization, output/overwrite plans, exposure edits, validation,
+  and worker start/cancel/finish transitions.
+- Routed the transitional Tk frontend through the headless settings, output, validation, exposure,
+  and workflow helpers without moving image work onto the UI thread or changing compositor calls.
+- Verified Ruff lint and formatting, strict mypy, 48 focused application/GUI/session tests, and the
+  full Python suite: 166 passed.
+
+## 2026-08-29 — Native application migration Step 18a
+
+- Added the widget-free `pano_app_core` static library and thin `pano-stitch-native` host without
+  loading images, JSON, or D3D12.
+- Added stable success/invalid-input/unavailable/failure exit categories, help/version/unknown
+  dispatch, and UTF-16 Windows argument conversion.
+- Portable Release CTest passed 4/4. Windows x64 MSVC Release CTest passed 5/5, including WARP.
+
+## 2026-08-29 — Native application migration Steps 18b–18d
+
+- Added strict native render-option parsing for Unicode session/image/output paths; width or
+  fractional scaling; PNG/JPEG/EXR, quality, blend, thumbnail, and coverage; CPU/D3D12 admission,
+  host/VRAM budgets, workers, and incomplete sessions; final auto contrast; and mutually exclusive
+  automatic or target/source manual exposure intent.
+- Selected and vendored yyjson 0.12.0 at upstream commit
+  `8b4a38dc994a110abaec8a400615567bd996105f` under its MIT license. The application core links it
+  statically; `docs/native-application-dependencies.md` records the candidate comparison and
+  integration decision.
+- Added strict UTF-8 shared-session validation for root/scalar, nested schema, frame, optional
+  vector/matrix/timing, and image-encoding fields. Added CET completed/incomplete/error parsing,
+  canonical yaw-zero camera bases, and direct/moved/sibling/basename/Windows-style path inference.
+  Windows tests exposed and fixed preferred-separator normalization for resolved paths.
+- Added plain validated session summaries, normalized panorama/coverage/thumbnail destinations,
+  atomic-stage patterns and overwrite requirements, incomplete/exposure admission, explicit-width
+  dimensions, and backend-neutral render plans. The `render` command validates and prints a plan;
+  it still performs no codec or GPU dispatch before Step 19.
+- Added a frozen legacy shared-session fixture proving the Python/native default sRGB encoding and
+  field values remain aligned. Native contracts also cover malformed/non-object/invalid-UTF-8 JSON,
+  unknown schema fields, numeric edge cases, option conflicts, Unicode paths, plan output, and the
+  guarantee that plan dispatch creates no user output.
+- Verified portable Release build and CTest 4/4; Ruff format/lint, mypy, and the full Python suite
+  (167 passed); and Windows x64 MSVC Release `/W4 /WX` build plus CTest/WARP 5/5.
+
+## 2026-08-29 — Native application migration Step 19a.1
+
+- Added a reproducible synthetic codec corpus: 4:4:4 quality-95 JPEG, 8-bit sRGB PNG, 16-bit
+  Rec.2020/PQ/full-range PNG with `cICP(9,16,0,1)`, and PIZ-compressed float32 RGB EXR with finite
+  negative and above-one values. No user captures or third-party image content are included.
+- Added a checked-in generator and frozen dimensions, decoded samples, application color metadata,
+  encoded SHA-256 values, JPEG sampling, PNG signaling, and EXR compression expectations.
+- Verified every fixture through the current Python production probe/decode paths: 4 focused tests
+  passed with Ruff formatting and lint clean.
+
+## 2026-08-29 — Native application migration Steps 19a.2–19a.3
+
+- Probed WIC on Windows 11/MSVC against every JPEG/PNG fixture. Caller-owned RGB8/RGB16 decode,
+  Unicode input/output paths, two-band PNG/JPEG encoding, exact PNG round trip, and requested JPEG
+  4:4:4 (`SampleFactors=0x111111`) passed. WIC does not expose PNG `cICP`; the production boundary
+  will inspect that raw chunk separately and check cancellation between synchronous WIC calls.
+- Rejected TinyEXR 3.2.0 after recording its successful Linux 246/246 sanitizer suite and bounded
+  PIZ streaming probe: stock MSVC rejected C11 `_Atomic`; `/experimental:c11atomics` advanced the
+  build but exposed GCC-only `__builtin_clz` and further strict-MSVC portability failures.
+- Selected the security-fixed OpenEXRCore 3.4.13 C API at commit
+  `c1194b2cb23a1bdf76fe5e756b22e8436b9a98c9`, with Imath 3.2.2 commit
+  `1e480d11cb98b032a2dece9b9a8730512effc7f6`. Its public custom streams passed UTF-16 Windows-handle
+  input/output, injected cancellation, PIZ float scanline round trip, and preservation of finite
+  negative and above-one values. The Release probe was 1,179,648 bytes.
+- Added immutable URL/SHA-256 dependency pins and build-only static linkage to OpenEXRCore plus WIC
+  system import libraries. Dependency tools, tests, examples, Python bindings, high-level OpenEXR
+  C++ library, installation, and shared libraries stay outside the product graph. Exact OpenEXR,
+  Imath, OpenJPH, and libdeflate binary notices are retained for release packaging.
+- Hardened the native application contract test to fail once with the missing fixture-directory
+  path instead of continuing into empty session data. Scoped CMake 4.3's compatibility policy so
+  the CMake-3.22 `EXCLUDE_FROM_ALL` path configures without developer warnings.
+- Verified a clean portable Release build and CTest 4/4. Verified a clean Windows x64 MSVC Release
+  build and CTest/WARP 5/5. The 260,608-byte native executable imported only Windows/MSVC runtime
+  DLLs; source search found no linked alternate codec. Removed all disposable Windows probe,
+  fixture, and clean-build directories and files after recording results.
+
+## 2026-08-29 — Native application migration Steps 19b–19d
+
+- Added bounded raw JPEG/PNG inspection with strict signature, segment/chunk, CRC, RGB layout,
+  JPEG sampling, and PNG `cICP` validation. WIC decodes RGB8 and native RGB16 into one reusable
+  caller-owned frame; exact frozen PNG/JPEG/PQ samples pass.
+- Added one-host-frame source orchestration over the existing two-slot D3D12 uploader. Every source
+  is re-inspected against session metadata, each upload uses the native cancellable ABI, slot reuse
+  remains fence-managed inside `pano_gpu`, and both final fences complete before return.
+- Added strict single-part PIZ scanline EXR inspection through OpenEXRCore, retaining data/display
+  windows and requiring full-resolution float B/G/R channels. PIZ chunks decode directly into the
+  caller's interleaved float buffer with per-chunk cancellation and finite-sample validation;
+  negative and above-one values round-trip exactly.
+- Added focused malformed/unsupported metadata, undersized buffer, cancellation, exact sample, and
+  integrated upload diagnostics. Two-frame D3D12 uploads report 36 bytes for RGB8, 72 for RGB16,
+  and 144 for float32, with completed upload fences and no host float expansion for PQ sources.
+- Verified strict portable Release build and CTest 4/4 after each format. Verified Windows x64 MSVC
+  Release `/W4 /WX` build and CTest/WARP 5/5 after each integrated upload path.
+
+## 2026-08-29 — Native application migration Steps 19e–19g
+
+- Added a stateful native image-writer contract with ordered caller-owned row bands, exact row-count
+  completion, explicit finish, idempotent abort, pre-touch option validation, cancellation, and
+  cleanup limited to the incomplete path created by that writer.
+- Added WIC PNG output with bounded per-band RGB-to-BGR conversion and exact RGB8 round trip. Added
+  WIC JPEG quality 1–100 and explicit 4:4:4 configuration; quality-95 output stays within the frozen
+  maximum 15-level sample error and reports `4:4:4` through the independent header parser.
+- Added portable OpenEXRCore float R/G/B PIZ output. Arbitrary caller bands feed one compression-
+  chunk buffer; a 33-row regression crosses a full 32-row PIZ chunk plus a one-row final chunk and
+  round-trips finite negative and above-one values exactly. Non-finite rows are rejected.
+- Verified Unicode output paths, invalid options, incomplete finish, cancellation, repeated abort,
+  and owned-partial removal. Strict portable Release build/CTest passed 4/4; Windows x64 MSVC
+  Release `/W4 /WX` build and CTest/WARP passed 5/5.
+
+## 2026-08-29 — Native application migration Step 19h
+
+- Added opaque same-directory output-stage ownership with collision-safe OS-exclusive marker
+  creation. Stage abort is idempotent and removes only the exact stage/marker pair owned by its
+  handle; successful publication disowns the final destination.
+- Added one- and three-file publication transactions. Existing destinations move to owned backups,
+  staged outputs publish in requested order, and failures roll published files back before
+  restoring originals. A preserved backup remains recoverable if an OS restore itself fails.
+- Added a fault matrix before/after every backup and publish plus pre-cleanup. Original panorama,
+  coverage, and thumbnail contents survive every injected boundary; destinations that did not
+  exist remain absent after rollback.
+- Added stale recovery restricted to exact per-destination stage names with the native ownership
+  marker and a 24-hour age floor. Unmarked and falsely marked lookalikes remain untouched.
+- Verified strict portable Release build/CTest 4/4 and Windows x64 MSVC Release `/W4 /WX`
+  build/CTest/WARP 5/5. Step 19 codec and staged-output ownership is complete.
+
+## 2026-08-29 — Native application migration Step 20a.1
+
+- Added a checked native CPU resource planner matching the Python fallback's 192 MiB runtime
+  reserve, three float-RGB source working sets, 164 bytes per output pixel-row per worker, eight-
+  worker automatic cap, 8 GiB budget ceiling, and full color-plus-weight scratch accounting.
+- Frozen 64×64 and 4K-source cases match the Python oracle exactly, including one/two-worker strip
+  heights, the 21274-wide 164-row plan, auto-worker bounds, insufficient budgets, invalid
+  dimensions, and overflow rejection.
+- Verified strict portable Release build/CTest 4/4 and Windows x64 MSVC Release `/W4 /WX`
+  build/CTest/WARP 5/5.
+
+## 2026-08-29 — Native application migration Step 20a.2
+
+- Added an opaque CPU render-storage owner with one disk-backed color/weight scratch mapping and
+  one exact 164-byte-per-pixel strip arena per planned worker. The mapping exposes separate float
+  color and weight regions while worker arenas remain isolated and bounded by the admitted plan.
+- Added live/peak allocation diagnostics and strict plan/layout validation. Construction failures
+  after directory creation, file sizing, mapping, or before strip allocation unwind mappings,
+  handles, files, and only the uniquely owned scratch directory.
+- Verified writable non-overlapping regions, exact 32,768-byte mapping plus 41,984-byte two-worker
+  arena, idempotent destruction, mismatch rejection, and every injected cleanup boundary.
+- Verified strict portable Release build/CTest 4/4 and Windows x64 MSVC Release `/W4 /WX`
+  build/CTest/WARP 5/5 with no leftover scratch directories.
+
+## 2026-08-29 — Native application migration Step 20a.3
+
+- Added an opaque persistent CPU worker pool with a fixed admitted size from one through eight,
+  stable worker indices, atomic task claiming, single-batch concurrency rejection, pool reuse,
+  cancellation checks between tasks, callback-failure propagation, and join-on-destroy teardown.
+- Partial thread construction now signals and joins every already-created worker before propagating
+  failure. CPU pool creation has no adapter or D3D12 input and cannot select WARP as a fallback.
+- Verified exact-once task execution, pool reuse, callback failure, pre- and mid-batch cancellation,
+  invalid worker counts, and idempotent destruction.
+- Verified strict portable Release build/CTest 4/4 and Windows x64 MSVC Release `/W4 /WX`
+  build/CTest/WARP 5/5. Step 20a is complete.
+
+## 2026-08-29 — Native application migration Step 20b
+
+- Added row-banded CPU equirectangular and rectilinear world-ray generation matching the proven
+  D3D12 pixel-center, seam, latitude, fixed-90-degree thumbnail, and vertical-FoV conventions.
+- Added world-to-camera projection with the canonical matrix layout, exact half-pixel validity
+  bounds, clamped bilinear coordinates, edge distances, and safe uncovered handling for non-finite
+  rays. Invalid FoVs and non-finite bases are rejected before output mutation.
+- Added explicit uint8/uint16/float32 sampling with independently supplied sRGB/PQ/linear transfer
+  functions. Bilinear interpolation happens in decoded linear light; float linear samples retain
+  finite negative and above-one values.
+- Added strict hard selection and coverage matching the shader's minimum valid weight and `>` tie
+  behavior. Frozen one-frame fixtures cover boundaries, behind-camera rays, all sample formats,
+  transfer decoding, edges, invalid inputs, and deterministic ties.
+- Verified strict portable Release build/CTest 4/4 and Windows x64 MSVC Release `/W4 /WX`
+  build/CTest/WARP 5/5. Step 20b is complete.
+
+## 2026-08-29 — Native application migration Steps 20c–20e
+
+- Added capture-order CPU frame iteration with mandatory acquire/compose/release callbacks,
+  cancellation between frames, and release after a failed compose. Tests prove at most one frame
+  is live and every acquired frame is released before the next acquisition.
+- Reused strict hard selection across frames; equal weights retain the earlier capture while a
+  larger edge weight replaces it, matching the shared CPU/D3D12 oracle.
+- Added D3D12-matched feather-width calculation, minimum valid weight, weighted accumulation,
+  zero-safe normalization, coverage, and separate incomplete-session magenta marking.
+- Added supplied positive global gains and row-banded bilinear local log-gain sampling. Both apply
+  in linear light after transfer decoding and preserve the shader's `exp(log_gain)` order.
+- Verified strict portable Release build/CTest 4/4 and Windows x64 MSVC Release `/W4 /WX`
+  build/CTest/WARP 5/5. Steps 20c, 20d, and 20e are complete.
+
+## 2026-08-29 — Native application migration Step 20f
+
+- Added caller-bounded CPU exposure proxies using the D3D12 shader's exact fractional source-pixel
+  area weights. Explicit uint8/uint16/float32 plus sRGB/PQ/linear decoding is shared with ordinary
+  sampling; non-divisible cells and all transfer endpoints have frozen fixtures.
+- Added checked lexicographic exposure-pair enumeration and direct one-pass projection of both
+  frames onto the equirectangular sample grid. No sample-grid temporary allocation is made, and
+  overlap uses the canonical half-pixel camera boundary rules.
+- Added deterministic bilinear sampling of two retained linear-light proxies into interleaved pair
+  samples. Fixed center, fractional, overlap, no-overlap, and zero-pair fixtures pass.
+- Verified strict portable Release build/CTest 4/4 and Windows x64 MSVC Release `/W4 /WX`
+  build/CTest/WARP 5/5. Step 20f is complete.
+
+## 2026-08-29 — Native application migration Step 20g
+
+- Added D3D12-matched exposure classification using Rec.709 luminance, the `1e-5` dark cutoff,
+  finite checks, geometric overlap, and explicit sRGB/PQ-only `>= 0.995` clipping. Linear samples
+  remain unbounded and are never rejected merely for exceeding that threshold.
+- Added the shader's edge-reflected Sobel magnitude over log luminance and independent finite 90th-
+  percentile limits for each frame, followed by inclusive gradient filtering.
+- Added log-ratio construction, inclusive 10–90% trimming, median/MAD reduction, exact minimum
+  valid/inlier thresholds, rejection priority, excessive-MAD cutoff, and robust equation weight.
+- Frozen fixtures cover dark, clipped, non-finite, no-overlap, linear-unbounded, flat/textured
+  gradients, accepted pairs, insufficient data, and excessive dispersion.
+- Verified strict portable Release build/CTest 4/4 and Windows x64 MSVC Release `/W4 /WX`
+  build/CTest/WARP 5/5. Step 20g is complete.
+
+## 2026-08-29 — Native application migration Step 20h
+
+- Added capture-ordered measured equations and the D3D12 geometric bridge algorithm. Rejected
+  photometric pairs with at least 24 geometric samples may connect otherwise disconnected measured
+  components using zero-difference, unit-weight edges; truly disconnected pairs remain disconnected.
+- Ported the proven weighted Laplacian solve in native `double`, including row pivoting, singular-
+  row handling, median centering, nearest-centered-median anchor selection, and `±ln(2)` log-gain
+  clamps. The weighted three-frame oracle produces `0, -0.057142857, 0.257142857`.
+- Added final positive gain reports with supplied manual factors and disconnected-warning state,
+  plus frozen manual-match and discard transitions that preserve target/selection state.
+- Added a mutex-protected opaque cache keyed by the caller's frozen session/options identity.
+  Cached reports are copied on read, mismatched identities miss, invalidation is precise, and
+  repeated destruction is safe.
+- Verified strict portable Release build/CTest 4/4 and Windows x64 MSVC Release `/W4 /WX`
+  build/CTest/WARP 5/5. Step 20h is complete.
+
+## 2026-08-29 — Native application migration Step 20i
+
+- Added cumulative 4096-bin encoded-sRGB luminance histograms over finite covered pixels and the
+  D3D12 0.5/99.5-percentile interpolation, including invalid narrow/tiny distributions.
+- Added PQ/Rec.2020 SDR conversion with reference-white-relative Reinhard luminance tone mapping
+  and the existing Rec.2020-to-linear-sRGB matrix. SDR encoding clamps negatives, applies optional
+  shared levels, and quantizes uint8 with the shader's round-to-nearest-even rule.
+- Added linear float bands that preserve finite negative and above-one values exactly.
+- Connected caller-owned converted bands directly to the ordered native image writers. SDR uses
+  one exact band-sized byte scratch; float rows stream without a conversion copy or image-sized
+  allocation. Portable EXR and Windows WIC PNG round trips pass.
+- Verified strict portable Release build/CTest 4/4 and Windows x64 MSVC Release `/W4 /WX`
+  build/CTest/WARP 5/5. Step 20i is complete.
+
+## 2026-08-29 — Native application migration Step 20j
+
+- Added an opaque CPU render coordinator with atomic single-render admission and five coarse
+  allocation/decode/compose/encode/publish phases. It has no adapter input and never creates or
+  selects a D3D12 device.
+- Cancellation is checked before and after every phase; admitted failure, cancellation, or an
+  unexpected callback exception invokes cleanup exactly once and prevents all later phases.
+  Concurrent rejection invokes neither phase work nor cleanup belonging to the active render.
+- Fault fixtures inject every phase, preserve simulated existing output, verify precise stopping,
+  and immediately complete a later render. Cancellation is injected after every phase, a held
+  thread proves true concurrent rejection, and repeated success/destruction is safe.
+- Verified strict portable Release build/CTest 4/4 and Windows x64 MSVC Release `/W4 /WX`
+  build/CTest/WARP 5/5. Step 20 and the native CPU fallback packet are complete; physical CPU-only
+  hardware remains on the explicitly deferred cross-device checklist.
+
+## 2026-08-29 — Native application migration Step 21a
+
+- Added a Windows-subsystem `pano-stitch-native-gui` target using only Win32 and common controls.
+  The window owns a deterministic message loop/close path and has labelled session/output, format,
+  blend, preview, render, cancel, and status controls with explicit tab stops and dialog keyboard
+  navigation.
+- Enabled per-monitor-v2 DPI awareness, deterministic 96/144/192-DPI metrics, resize layout, and
+  `WM_DPICHANGED` suggested-rectangle handling. The shell has no Python or redistributable UI
+  runtime.
+- Added a hidden GUI self-test for control creation, tab order styles, DPI metrics, and repeated
+  close. Because Windows GUI-subsystem processes do not reliably inherit CTest pipes on this host,
+  a CMake runner now translates stable per-invariant exit codes into useful CTest diagnostics.
+- Verified portable core Release build/CTest 4/4 and Windows x64 MSVC Release `/W4 /WX`
+  build/CTest 6/6, including GUI self-test and WARP coexistence. No visible GUI or game was launched.
+
+## 2026-08-29 — Native application migration Step 21b
+
+- Added native COM folder/session pickers and labelled game/session controls. The editable session
+  combo preserves explicit-file selection while discovered rows use the frozen CET mod path and
+  reverse filename ordering.
+- Added portable discovery of complete, incomplete, and invalid session rows with deduplicated
+  source paths. Missing game/mod directories produce an empty result; actual enumeration failures
+  remain errors.
+- Added generation-tagged background refresh workers. Workers perform only filesystem/JSON work
+  and enqueue plain records; the UI thread alone applies current results through `WM_APP`, rejects
+  stale generations, updates controls, and presents complete/incomplete/error status.
+- Shutdown clears the target HWND, joins every owned refresh worker, and then releases queued
+  results. The hidden GUI test injects stale/current completions at the message boundary and proves
+  only the current rows appear.
+- Verified portable Release build/CTest 4/4 and Windows x64 MSVC Release `/W4 /WX`
+  build/CTest 6/6. No visible dialog/window or game was launched.
+
+## 2026-08-29 — Native application migration Step 21c
+
+- Added a platform-neutral GUI request snapshot with the frozen JPEG 95, full-resolution, feather,
+  1024 MiB, automatic-worker, GPU, and auto-contrast defaults. Conditional JPEG/GPU-strict
+  enablement and invalid numeric/range handling are shared by the Win32 form and native contracts.
+- Expanded the native form with separate screenshot, output-directory, and output-name controls;
+  format, resolution, optional width, blend, memory, workers, thumbnail, coverage, incomplete,
+  auto-contrast, GPU, and GPU-strict options; and a DPI-scaled 26-control tab chain.
+- Added coalesced generation-tagged background validation. The UI thread captures plain options,
+  workers return only a plan or error through `WM_APP`, and any selection or option edit invalidates
+  older completions before actions can be re-enabled.
+- Preserved `panorama-<session-id>` naming and format suffixes. Render confirmation lists the exact
+  panorama/coverage/thumbnail destinations from the current validated plan and defaults to refusing
+  replacement; workers never invoke a dialog or touch a window handle.
+- Added portable fixtures for defaults, enablement, Unicode snapshots, invalid ranges, stale
+  validation, and overwrite ordering, plus hidden Win32 checks for widget defaults, tab stops, and
+  stale/current message application.
+- Verified portable Release build/CTest 4/4 and Windows x64 MSVC Release `/W4 /WX`
+  build/CTest/D3D12 WARP 6/6. No visible dialog/window or game was launched.
+
+## 2026-08-29 — Native application migration Step 21d and ABI 10
+
+- Bumped and synchronized the native/ctypes ABI to 10 and added a device-retaining D3D12 preview
+  surface owner for a fixed-width native HWND. It owns a two-buffer flip-model swap chain, RTVs,
+  one viewport-sized RGBA8 presentation texture, explicit diagnostics, and idempotent teardown.
+- Added the native child preview surface to the DPI layout. Create, dark clear/present, resize,
+  zero-size suspension/occlusion, repeated recreation, and close all execute on the UI thread;
+  surface failure gets one ordered surface/device rebuild before becoming an error.
+- Added a Shader Model 5.1 direct-present pass that reads retained RGB8 panorama/overview buffers,
+  applies the canonical base crop, writes the bounded RGBA8 viewport texture, and GPU-copies it to
+  the current back buffer. The production path never maps or reads preview pixels on the host.
+- Added atomic concurrent-present rejection and explicit real/injected device-removal diagnostics.
+  A test-only readback hook verifies exact overview and cropped RGBA pixels on WARP, followed by
+  device-loss failure, owner reconstruction, successful repeat presentation, and live-count reset.
+- Verified strict portable Release build/CTest 4/4, Ruff, formatting, mypy, focused ctypes pytest
+  22/22, and Windows x64 MSVC Release `/W4 /WX` build/CTest/D3D12 WARP 6/6. No visible window or
+  game was launched.
+
+## 2026-08-29 — Native application migration Step 21e
+
+- Added portable overview/magnified preview state matching the frozen proportional pointer crop,
+  centered clamping, and explicit leave/resize reset. Center, both edges, invalid dimensions, and
+  non-finite pointer fixtures pass.
+- Replaced the static preview child with a dedicated window class. Pointer motion tracks leave and
+  updates only an attached retained preview; leave and parent resize restore overview before the
+  next present, so magnification cannot persist accidentally.
+- Added checked compact-mask hit testing through the active crop. Candidates remain in capture
+  order; ordinary selection excludes the target, while target mode excludes selected sources and
+  admits only the first valid candidate.
+- Added direct GPU overlay presentation with the proven magenta hover tint, blue target tint,
+  target/boundary colors, seam-wrapped horizontal boundaries, clamped vertical boundaries, and
+  atomic preview/surface concurrency rejection. WARP pixels exactly match the retained overlay
+  renderer through a test-only readback oracle; production does no host preview readback.
+- Removed the one-vblank wait from interactive preview presents and added a 31-update physical-
+  adapter p95 gate. The current NVIDIA device passed the strict `<16.667 ms` assertion; the known
+  Windows console-loader behavior suppressed the successful numeric diagnostic, so no invented
+  timing is recorded.
+- Verified strict portable Release build/CTest 4/4 and Windows x64 MSVC Release `/W4 /WX`
+  build/CTest/D3D12 hardware+WARP 6/6. No visible GUI or game was launched.
+
+## 2026-08-29 — Native application migration Step 21f
+
+- Added a selected-session native preview coordinator that admits bounded D3D12 memory, decodes
+  and uploads sources on a worker, composes a four-times-width SDR preview, retains an overview and
+  compact geometric masks, and publishes the owner to the UI thread only after complete success.
+- Wired Preview to the coordinator with generation-tagged result ownership, real cancellation,
+  stale-result rejection, resize serialization around the borrowed device handle, and ordered
+  close cleanup. The previous retained preview survives failed exposure recomposition.
+- Added right-click target selection, left-click source toggling, direct retained GPU overlays,
+  and keyboard-accessible automatic, manual-match, and discard commands. Resident exposure proxies
+  and equations are cached; automatic target gains and manual overlap shifts recompose without
+  decoding sources again. Disconnected solve state is surfaced as a warning.
+- Added WARP contracts for WIC decode/upload, banded composition, retained preview/mask ownership,
+  reset recomposition, cancellation preservation, invalid selections, idempotent teardown, and
+  live-session-count restoration. Native failures now print their coordinator error text.
+- Made `DOWNLOAD_EXTRACT_TIMESTAMP` conditional on CMake 3.24 so the declared CMake 3.22 minimum
+  no longer misparses it as part of `URL_HASH`. Strict GCC compilation of the changed application
+  and contract translation units passed; the portable CTest tree could not be regenerated because
+  its stale dependency population attempted restricted network access.
+- Verified Windows x64 MSVC Release `/W4 /WX` build and hidden-GUI/D3D12 WARP CTest 6/6. No visible
+  GUI or game was launched.
+
+## 2026-08-29 — Native application migration Steps 21g–21h
+
+- Added bounded full-session D3D12 rendering from the retained preview owner. Panorama bands stream
+  through staged writers; optional grayscale coverage and correctly projected thumbnail outputs
+  publish transactionally only after every requested artifact succeeds.
+- Wired background render progress, cancellation, error recovery, preview restoration, and ordered
+  shutdown into the Win32 frontend. Focused contracts prove successful output inspection and that
+  cancellation preserves pre-existing destinations.
+- Added version-tolerant UTF-8 JSON settings with Unicode-safe atomic publication, remembered game,
+  image, output, and auto-contrast values, and per-game/session stitched-output history. Hidden GUI
+  tests remain hermetic and never read or write the real `%APPDATA%` settings file.
+- Added discovered-session deletion with an opt-in captured-image checkbox. The GUI presents the
+  exact deduplicated target list and defaults to refusal before calling the portable deletion core,
+  then refreshes discovery and reports deleted/missing counts.
+- Strict GCC compilation passed for the settings and contract translation units. Windows x64 MSVC
+  Release `/W4 /WX` build and hidden-GUI/application/D3D12 WARP CTest passed 6/6. No visible GUI,
+  file-deletion action, or game was launched.
+
+## 2026-08-29 — Native application migration Steps 22a.1 and 22b.1
+
+- Ran the frozen Python and native application contract suites against the shared metadata, codec,
+  option, discovery/history/deletion, publication, CPU, and D3D12 fixtures. Ruff, formatting, mypy,
+  and all 171 Python tests passed; MSVC Release and all six native GUI/application/WARP tests passed.
+- Added the frozen `--verify-gpu-runtime RESULT_PATH` protocol to the native GUI with exit 0/2/3,
+  adapter identity, MSVC delay loading, and application-directory DLL resolution. Missing/corrupt
+  DLLs are caught before imported calls and both native/Python loaders suppress and restore only the
+  thread-local Windows bad-image dialog mode.
+- Added an explicit comparison release mode containing distinct native and Python entry points,
+  one shared root `pano_gpu.dll`, dependency notices, and no duplicated mutable GPU runtime. The
+  legacy release default remains unchanged pending manual frontend parity.
+- Built and audited the r3 comparison archive at
+  `C:\dev\panorama-step22-comparison-r3-dist`. It is 75,408,515 bytes with SHA-256
+  `61fb9fdd66df4b17021fb79fd222fc5844801511dcf827f20d6341a6de9618bf`; extracted size is
+  191,895,583 bytes. Both entry points verified ABI 10 and the same RTX 5090 identity, and both
+  returned exit 3 against temporarily corrupted shared DLL bytes.
+- Step 22a.2 remains the first external gate: compare native/Python interaction, keyboard and
+  accessibility, persistence, and guarded deletion on disposable session copies. Steps 22b.2–22d
+  intentionally remain pending until that candidate has no release-blocking frontend difference.
+
+## 2026-08-29 — Native-only explicit candidate and Steps 22c.1–22c.2
+
+- Added a non-default `native` release mode that stages the Win32 application, one `pano_gpu.dll`,
+  codec notices, and README directly after the native build/test gate. This branch never creates a
+  venv or invokes Python, pip, package bindings, or PyInstaller; the existing Python default and
+  comparison rollback remain available pending manual parity.
+- Added a strict native-only audit mode rejecting `_internal`, Python bytecode/extensions/runtime,
+  and base-library payloads. It retains runtime probing, corrupt-DLL exit-3, forbidden shader/vendor
+  checks, PE dependency inspection, and extracted-path cleanup.
+- Switched all MSVC native targets and static codec dependencies to the static runtime. Release
+  build and hidden-GUI/application/D3D12 WARP CTest passed 6/6; the audited executable and DLL no
+  longer import `MSVCP` or `VCRUNTIME` redistributables.
+- Two clean native candidate builds were byte-identical at 914,977 compressed and 2,198,465
+  extracted bytes, SHA-256 `8f7c4dd1a53c8b63b2635741fe6567a7ece4bac8fbfef52957ce6b76124b84ae`.
+  This is approximately 98.8% smaller compressed than the 75,408,515-byte comparison candidate.
+- The strict NVIDIA audit passed ABI 10/pipeline verification and corrupt-DLL handling. Candidate
+  payload Steps 22c.1–22c.2 are complete; default switching, obsolete PyInstaller/source removal,
+  and final acceptance remain gated by Step 22a.2 manual frontend parity.
+
+## 2026-08-29 — Step 22b.2 Unicode-path acceptance hardening
+
+- Fixed the release builder and archive auditor to quote the runtime-probe result path passed
+  through PowerShell `Start-Process`; without those quotes, paths containing spaces were split into
+  extra native arguments and could launch the GUI instead of running the headless probe.
+- Strengthened the focused release contract test to require the quoted argument in the builder and
+  both auditor probe paths. The six release tests, Ruff check, and Ruff format check pass.
+- Cleanly extracted the retained native candidate to `C:\dev\Panorama Native Ω 空格` and
+  verified ABI 10 on the NVIDIA GeForce RTX 5090 with vendor `0x10de`, device `0x2b85`, and LUID
+  `0x0000000000014331`. The temporary Unicode directory was removed.
+- Re-ran the corrected strict native-only archive audit under the MSVC environment. Runtime,
+  corrupt-DLL exit 3, dependency, shader-hash, and payload checks passed; its temporary extraction,
+  diagnostic, and report files were removed.
+- Added a native migration contract for the existing Python settings/history JSON shape at the
+  shared `%APPDATA%\PanoramaCapture\gui-settings.json` location. MSVC Release `/W4 /WX` rebuilt
+  successfully and all 6 CTest entries passed. After replacing the generated zero-byte Imath cache
+  through the pinned FetchContent download, the portable Release build also completed and all 4
+  Linux CTest entries passed.
+- Re-ran the corrected comparison-archive audit: the Python and native entry points reported the
+  same ABI 10 RTX 5090 identity, both corrupt-DLL checks completed through their controlled failure
+  path, and no stitcher, native-test, or Windows Error Reporting process remained. The temporary
+  report, extraction directory, and probe diagnostic were removed.
+- Step 22b.2 remains incomplete until Step 22a.2 manual frontend/settings parity approves making the
+  native executable the default and confirms rollback to the comparison archive.
+
+## 2026-08-29 — Headless D3D12 resource regression (Step 22a.1.1)
+
+- Added a Windows test-only `pano_app_headless_probe` target that invokes the production native
+  preview/exposure/render coordinator without creating a window or GUI message loop. It refuses
+  existing destinations, supports the production render options plus a bounded preview hold, and
+  verifies native live counts return to their pre-run values after teardown.
+- Added a machine-local ignored PowerShell monitor for the established Windows stage and authorized
+  real session. It records per-process physical working set, private commit, normalized CPU,
+  dedicated/shared GPU memory, and aggregate GPU-engine utilization by phase, retains CSV evidence,
+  and removes only its newly generated panorama companions.
+- Fixed the monitor's phase-boundary classification after `Get-Counter` crossed from preview idle
+  into exposure and attributed active GPU work to the old phase. A sample now counts as stable only
+  when the phase is unchanged before and after counter collection. Six stable idle samples in each
+  corrected natural-resolution run measured 0% CPU and 0% GPU.
+- The 3072×1536 retained-preview run peaked at 116.2 MiB physical RAM and 1568.8 MiB dedicated
+  VRAM. Natural 17552×8776 hard and feather runs with automatic exposure, projected thumbnail, and
+  coverage peaked at 116.3/116.4 MiB physical RAM, 2175.4/2298.4 MiB dedicated VRAM,
+  11.1% normalized CPU, and 24.0/29.3% sampled active GPU. Both stayed below the strict decimal
+  1,000,000,000-byte host-RAM requirement and the 2560 MiB measured VRAM ceiling.
+- Hard rendering took 23.0 seconds after 42.1 seconds of exposure analysis; feather rendering took
+  20.4 seconds after 36.5 seconds of exposure analysis. Every requested output was published and
+  checked, then removed; no probe process or Windows test output remained.
+- Portable Release CTest passed 4/4 and Windows x64 MSVC Release `/W4 /WX` build/CTest passed 7/7,
+  including the new probe help smoke test. Mypy, all 172 Python tests, and Ruff lint/format over
+  repository-owned `src`, `scripts`, and `tests` pass; the literal whole-tree Ruff command reaches
+  generated `native/build-release/_deps` vendor sources and reports their pre-existing findings.
+  The backend therefore does not reproduce the native GUI's reported idle load or 4–12 GiB waves;
+  those remain a frontend/ownership regression.
+
+## 2026-08-29 — Native UI redesign sequencing decision
+
+- Accepted the external three-tab Input/Preview/Output prototype as the replacement for the
+  provisional native form, using sensible system-only Win32/Direct2D presentation rather than
+  requiring pixel-identical generated artwork.
+- Added migration packet 21i: first correct capped D3D12 admission, replace the shell/state owner,
+  and implement Input, Preview/exposure, and Output/D3D12 workflows with explicit idle-resource
+  acceptance. Retain the source session in VRAM, but eliminate duplicate workers, periodic idle GPU
+  submissions, and the observed 4–12 GiB memory waves.
+- Output directory and filename lead the Output panel. Separate `Render` and `Render with thumbnail`
+  actions replace the thumbnail checkbox; coverage moves to debug App Settings.
+- CPU integration intentionally follows the accepted D3D12 redesign rather than blocking or
+  shaping it. First accept the replacement D3D12 UI visually and functionally; then wire the
+  already-ported CPU primitives into that accepted UI. The overall redesign/rewrite remains
+  incomplete until CPU preview and full rendering pass the fixed 2048 MiB budget and tested
+  fallback/cancellation/publication behavior.
+
+## 2026-08-29 — Native UI redesign Step 21i.1
+
+- Corrected explicit D3D12 cap semantics: safely available system memory remains free adapter
+  memory minus `max(384 MiB, 15% total VRAM)`, while the stitcher's usable allocation is now the
+  lesser of that value and the user cap. The adapter reserve is no longer subtracted from the cap.
+- Added native contracts proving a cap smaller than the adapter reserve remains fully usable,
+  genuinely low free memory still rejects, existing 32-row banding remains valid, and the known
+  30×3840×2160 to 17552×8776 workload is admitted banded under 4096 MiB.
+- Portable Release build/CTest passed 4/4. Windows x64 MSVC Release `/W4 /WX` build and all seven
+  native GUI/application/WARP CTests passed.
+- The physical RTX 5090 run under an explicit 4096 MiB cap published the natural hard panorama,
+  thumbnail, and coverage. It peaked at 129.3 MiB physical RAM, 3818.9 MiB private commit,
+  3399.6 MiB dedicated VRAM, 11.7% CPU, 30.6% sampled GPU, and 0% stable-idle GPU. Rendering took
+  9.0 seconds after 36.7 seconds of exposure analysis. The prior 2560 MiB comparison threshold was
+  intentionally exceeded because the corrected cap permits larger, faster bands; the 4096 MiB
+  application cap and physical-host-RAM gate both passed.
+
+## 2026-08-29 — Native UI redesign shell and Input workflows
+
+- Added explicit Input/Preview/Output workflow state and per-window shell ownership. Normal GUI
+  startup no longer creates a D3D12 preview device; tab navigation only relayouts state, and resize
+  presents the retained swap chain only while Preview is visible.
+- Replaced the session combo with a report-style table containing local-time session labels, pose
+  counts, persisted UTF-8 tags, and row Actions. Invalid, incomplete, stitched, and ordinary rows
+  have distinct semantic status presentation and invalid/incomplete infotips.
+- Extended the backward-compatible transactional settings file with normalized per-session tags,
+  an explicit D3D12 allocation cap, and debug coverage. Added contracts for legacy defaults,
+  Unicode tag update/removal, the 64-character boundary, malformed UTF-8 rejection, and complete
+  round-trip persistence.
+- Added native App Settings, Input Options, and tag-editing modals. The unset D3D12 cap derives as
+  `max(1024 MiB, min(50% dedicated VRAM, 4096 MiB))`; a decrease discards and rebuilds a ready
+  preview after validation, while an increase retains it. Debug coverage is no longer exposed on
+  the ordinary Input page.
+- Row Actions now offers guarded metadata-only or metadata-plus-screenshots deletion. CTest caught
+  a direct `TaskDialogIndirect` loader dependency (`0xc0000138`); runtime resolution plus a clear
+  three-choice system fallback restored compatibility without weakening confirmation.
+- Added scoped control-notification suppression so a game/session/screenshots change advances
+  invalidation once. Output-only edits now revalidate without discarding retained preview.
+- Portable Release CTest passes 4/4. Windows x64 MSVC Release `/W4 /WX` and all seven native
+  GUI/application/WARP tests pass. Final visual, tooltip-hover, and modal keyboard inspection is
+  deferred to the combined D3D12 redesigned-frontend acceptance run after Preview and Output are
+  present and before CPU wire-back begins.
+
+## 2026-08-29 — Native UI redesign Preview and Output workflows
+
+- Added admitted Preview/exposure/render operation generations and centralized mutation locking.
+  Tabs and read-only modals remain available during work, while mutable Input/Preview/Output
+  controls cannot launch overlapping workers. Matching completion restores controls on success,
+  cancellation, launch failure, and stale-result paths.
+- Deduplicated identical preview pointer messages and same-size window notifications. Hidden Output
+  render completion no longer resizes or presents the preview swap chain; returning to Preview is
+  the event that presents retained state.
+- Added event-driven operation caption progress with dynamically resolved Windows caption color.
+  No progress timer or idle render loop was introduced.
+- Moved blend and SDR auto-contrast into Preview Options, retained the proven overlay target/source
+  interaction and automatic/manual/discard exposure actions, and reorganized Preview around the
+  panorama surface with Options and `Render >>` navigation.
+- Added separate `Render` and `Render with thumbnail` actions. Each requests its exact output mode,
+  revalidates without discarding Preview, and launches only after the matching plan completes.
+  Output directory/name lead the panel; debug coverage is sourced from App Settings; percentage and
+  explicit-pixel resolution modes cannot override one another through hidden stale values.
+- Added `update_native_preview_render_plan`, which accepts output/budget mutations only when every
+  retained session/encoding/frame geometry field matches. The WARP contract proves changed output
+  and removed-thumbnail routing reach the retained renderer and incompatible session identity is
+  rejected.
+- Applied a system-only dark shell with dynamically resolved immersive caption/control themes,
+  dark fallback painting, semantic table colors, yellow active-stage/action drawing, and no new
+  redistributable dependency.
+- Portable Release CTest passes 4/4. Windows x64 MSVC Release `/W4 /WX` and all seven native
+  GUI/application/WARP tests pass. The combined manual visual/interaction run and redesigned-GUI
+  retained-preview resource hold remain the D3D12 redesign gate before CPU wire-back.
+
+## 2026-08-29 — Redesigned GUI visual and retained-preview regression
+
+- Corrected the modal DPI contract: child controls and modal client/outer bounds now use the same
+  per-monitor DPI, fields stack vertically, and validation plus Cancel/OK stay anchored inside the
+  client area. Reused the dark/yellow button treatment while preserving explicit Enter/Escape and
+  combo-drop-down keyboard behavior.
+- Captured Input, Preview, Output, App Settings, Input Options, and Preview Options on the secondary
+  monitor. The known complete session built a visually correct retained preview through the physical
+  RTX 5090 D3D12 path.
+- Held that redesigned GUI preview idle for 30 seconds with 10 valid per-process GPU samples. Peak
+  physical RAM was 95.672 MiB, private commit 1714.801 MiB, dedicated VRAM 1583.973 MiB, and shared
+  VRAM 26.199 MiB; sampled idle CPU and GPU were both 0%. Evidence is retained in the ignored
+  `.local/ui-redesign-preview-idle-passing.csv` file.
+- MSVC Release `/W4 /WX` and all seven native CTests pass after the modal corrections. Temporary
+  Windows-stage screenshots/CSV files were removed after final evidence was copied under `.local`.
+- The ownership audit found that most HWND, worker, cancellation, settings, and retained-preview
+  state still uses process globals despite the per-window workflow shell. Step 21i.2 therefore
+  remains incomplete until those resources are consolidated under the application/window owner and
+  repeated close/stale-completion/resource checks pass. Manual visual/interaction acceptance still
+  precedes CPU wire-back.
+
+## 2026-08-29 — Redesigned GUI explicit state ownership
+
+- Consolidated all control/font/settings state and every refresh/validation/result queue, worker,
+  progress counter, cancellation token, CPU/D3D12 preview owner, device/surface, exposure edit, and
+  interaction generation beneath the `GuiShellState` stored in `GWLP_USERDATA`. The remaining
+  namespace-level pointer is non-owning and exists only to bridge legacy Win32 helper signatures
+  during the owning window's lifetime.
+- Strengthened the hidden GUI self-test to prove the callback state is the exact owner and that
+  `WM_DESTROY` joins and clears every worker/result collection, nulls all native handles and owners,
+  clears the callback HWND, and returns global device/queue/fence/session/output live counts to zero.
+- Repeated the physical RTX 5090 retained-preview hold after consolidation. Ten valid samples again
+  measured 0% idle CPU and GPU, with peaks of 95.684 MiB physical RAM, 1711.820 MiB private commit,
+  1583.973 MiB dedicated VRAM, and 26.199 MiB shared VRAM. The ignored evidence is
+  `.local/ui-owner-preview-idle-passing.csv`.
+- Portable Release CTest passes 4/4; MSVC Release `/W4 /WX` and all seven Windows CTests pass. Ruff
+  lint/format, mypy, and all 172 Python tests pass. Step 21i.2 implementation and automated gates are
+  complete; the combined manual D3D12 visual/interaction/accessibility acceptance remains before CPU
+  wire-back.
+
+## 2026-08-29 — Redesigned GUI accessibility annotations
+
+- Added the system `IAccPropServices` owner beneath `GuiShellState` and explicit dual MSAA/UI
+  Automation names for ambiguous controls. Session-row names include the local session label, pose
+  count, status, and optional tag; refresh, tag edits, successful publication, list replacement, and
+  window teardown update or clear those annotations with the represented state.
+- The hidden GUI self-test now proves the accessibility service is created and released with the
+  owning window. MSVC Release `/W4 /WX` and all seven Windows native CTests pass; portable Release
+  CTest passes 4/4, mypy and all 172 Python tests pass, and Ruff lint/format passes over the 33
+  repository-owned files in `src`, `scripts`, and `tests`. The literal whole-tree Ruff invocation
+  enters generated OpenEXR/Imath sources and reports their existing vendor findings.
+- A no-screenshot audit of the rebuilt application on `DISPLAY2` found correct native MSAA roles and
+  focusable state for standard Buttons, Edits, and the ListView. Its two real session rows exposed
+  descriptive names ending in `0 poses, invalid` and `30 poses, stitched`. The legacy managed UI
+  Automation bridge on this Windows host still reports every standard Win32 control as an
+  unfocusable Pane and ignores control-self name overrides, even with the Common Controls v6
+  manifest and Microsoft's UIA Name property. Final accessibility acceptance therefore remains a
+  manual screen-reader or Accessibility Insights check; no custom provider has been introduced to
+  work around a machine-specific diagnostic bridge.
+
+## 2026-08-29 — CPU wire-back readiness audit
+
+- Audited the current native CPU core while the redesigned D3D12 UI awaits its manual interaction
+  gate. The existing core already fixes its planner at 2048 MiB and implements CPU preview pixels,
+  memory-banded hard/feather full rendering, SDR auto-contrast, JPEG/PNG/linear EXR output,
+  projected thumbnail, coverage, progress, cancellation, staged publication, and idempotent owner
+  cleanup. Focused native contracts cover creation, compatible plan mutation, both blends,
+  thumbnail/coverage, cancellation, publication, and destruction.
+- The remaining work is frontend routing rather than another rendering-core refactor. The GUI still
+  rejects `use_gpu == false` at preview launch, accepts only D3D12 preview results, presents only a
+  D3D12 swap chain, routes exposure and full render through the D3D12 owner, and enables Output only
+  when that owner exists.
+- Split Step 21i.6 into five independently verifiable packets: deterministic backend admission,
+  owned CPU preview creation, event-driven GDI presentation without hover interaction, retained CPU
+  full-render routing, and forced-no-D3D12 resource/recovery acceptance. Implementation remains
+  sequenced after the manual redesigned-D3D12 visual/interaction/accessibility gate, as previously
+  approved; no CPU-facing product behavior changed during this audit.
+
+## 2026-08-29 — Redesigned GUI interaction correction packet
+
+- Restored system-owned dark caption rendering so main and modal titles remain legible, removed the
+  redundant Open JSON action, replaced the placeholder settings drawing with the Windows settings
+  glyph, and made the session Actions column a visible `Actions` drop-down button.
+- Changed the tag editor to open on a single Tag-cell click, use the plain `Tag` label, and show a
+  live muted right-aligned UTF-8 character allowance beneath the field while preserving the
+  64-codepoint persistence contract.
+- Replaced the three main Preview exposure actions with one launcher and a modeless Exposure panel
+  docked to the main window. The panel supplies a boundaries toggle, explicit target selection,
+  pose grid with hover overlays, manual/automatic correction, and discard enablement only after an
+  exposure edit. Hovering or clicking the panorama itself no longer selects or overlays poses;
+  magnification and leave-reset behavior remain isolated to the preview surface.
+- Added an in-client operation progress strip, Windows taskbar progress, and a completion sound.
+  Output now uses large fixed-length slider thumbs, editable synchronized percentage values,
+  compact five-digit pixel input, the `Scale (%)` label, and left-aligned exclusive format choices.
+- Extended the hidden GUI self-test for the single exposure launcher, hidden legacy actions,
+  typed-percent synchronization, and exclusive format selection. Windows x64 MSVC Release `/W4
+  /WX` builds and all seven native GUI/application/WARP CTests pass. The combined manual visual,
+  interaction, natural-resolution, and accessibility inspection remains the gate before Step
+  21i.6 CPU wire-back.
+
+## 2026-08-30 — HTML prototype Input-screen translation
+
+- Translated `C:\dev\native-gui-prototype\proto-1.html` into the native Input view without adding
+  a browser runtime or changing discovery, selection, tagging, validation, or preview admission.
+  The native layout now follows the prototype's 16-DIP page rhythm, compact workflow header,
+  bordered Input card, fixed 288-DIP session table, editable directory fields, icon-only directory
+  and refresh actions, and one-line status/actions footer.
+- Applied the prototype Tailwind palette and table presentation: gray header, alternating neutral
+  rows, invalid/stitched color only on the Session cell, and split `Actions`/chevron buttons. The
+  shared header uses numbered tabs without the provisional chevrons, a compact settings control,
+  and the amber primary-action treatment.
+- Added hidden-GUI regression assertions for editable directory controls, prototype labels, fixed
+  table height, and footer alignment. Rendered the source HTML headlessly in Edge at 900x700 and
+  compared it with a valid minimum-size `DISPLAY2` native capture. After excluding native title-bar
+  chrome, the card, both directory fields, 288-DIP table, and footer align within 0–2 pixels
+  vertically; the four-pixel-wider native client produces only 2–5-pixel horizontal differences.
+  Windows x64 MSVC Release `/W4 /WX` builds and all seven native GUI/application/WARP CTests pass.
+  The local `PrintWindow` harness remains intermittently unreliable; partial captures are not used
+  as acceptance evidence.
+
+## 2026-08-30 — Shared native control styling rules
+
+- Replaced per-control alignment fixes with shared owner-drawn button rules. All workflow, primary,
+  secondary, modal, and session-row Actions controls now use consistent padding, vertical
+  alignment, border treatment, and hover/pressed states; workflow number badges are 24 DIPs.
+- Centered all single-line edit text through one subclass and preserved its original `EN_CHANGE`
+  behavior for programmatic updates, including Scale slider synchronization. The hidden GUI test
+  verifies the common button/edit/list subclasses, hover enter/leave behavior, and centered edit
+  formatting rectangle.
+- Fixed initially blank main, Exposure, and modal captions by reasserting their existing titles
+  after the top-level window becomes visible, then applying standard DWM dark-caption attributes.
+  Fresh `DISPLAY2` captures show both `Cyberpunk Panorama Stitcher` and `App Settings` in standard
+  title bars, with the translated Input layout intact.
+- Windows x64 MSVC Release `/W4 /WX` builds and all seven native GUI/application/WARP CTests pass.
+  A whole-worktree `git diff --check` remains noisy only because tracked generated CMake outputs
+  contain pre-existing trailing whitespace; the edited progress document passes its focused check.
+
+## 2026-08-30 — HTML badge and intrinsic footer sizing refinement
+
+- Gave workflow badge numerals their own 10-point font so they match the HTML's smaller number type
+  inside the circular badge without changing the previously approved badge diameter.
+- Replaced the Input footer's fixed Options and Preview widths with measured text content plus the
+  HTML button rule's 16-DIP horizontal padding, 16-DIP icon slot, and 8-DIP child gap. Corrected the
+  Options pencil to the MDL2 `Edit` glyph at the inherited 16-pixel visual size.
+- Added hidden-GUI assertions that both footer button widths equal their computed content widths.
+  Fresh settled Edge and `DISPLAY2` native captures were compared at a 900-pixel client width;
+  Options measures 114 pixels in Edge and 111 pixels with native GDI font metrics while preserving
+  matching padding, gap, alignment, and right-side button spacing.
+- Windows x64 MSVC Release `/W4 /WX` builds and all seven native GUI/application/WARP CTests pass.
+
+## 2026-08-30 — Shared button geometry correction
+
+- Corrected the Options icon diagnosis using the supplied `Untitled.jpg`: the native drawing box
+  clipped the Fluent Edit glyph and made it appear to be a different symbol. Options now measures
+  the glyph's natural advance, draws it without clipping, and derives its width from 16-DIP outer
+  padding, the measured icon, an 8-DIP gap, measured text, and trailing padding.
+- Propagated the HTML button rules across workflow, modal, icon-only, and embedded Actions controls:
+  DPI-scaled six-DIP corner radii, gray-300 foreground, and 12-point/16-pixel inherited icon sizing.
+  Actions now flows compact padding, measured text, gaps, separator, and chevron rather than using
+  guessed fixed partitions; its hit target uses the same intrinsic width calculation.
+- Compared fresh settled Edge and native captures, including a normalized 150% Options crop. The
+  glyph is complete and the left padding, child gap, foreground, and radius align; only expected
+  GDI-versus-DirectWrite rasterization differences remain.
+- Windows x64 MSVC Release `/W4 /WX` builds and all seven native GUI/application/WARP CTests pass.
+
+## 2026-08-30 — Session table body padding correction
+
+- Replaced the session body cells' four-pixel text inset with the HTML table's shared eight-DIP
+  padding. The same helper now positions the embedded Actions button and defines its hit-test bounds,
+  keeping visible and interactive geometry synchronized at every DPI.
+- Changed neutral session-row text from the old near-white value to the prototype's gray-300, while
+  preserving invalid, incomplete, and stitched status colors on the first cell only.
+- A fresh `DISPLAY2` capture confirms Session, pose count, Tag, and Actions body content aligns with
+  the corresponding padded header columns. Windows x64 MSVC Release `/W4 /WX` builds and all seven
+  native GUI/application/WARP CTests pass.
+
+## 2026-08-30 — WebView2 host, Input bridge, and native Preview slot
+
+- Pinned Microsoft.Web.WebView2 SDK 1.0.4191.47 by NuGet hash, statically linked its x64 loader,
+  retained its redistribution notices, and added runtime detection plus a native
+  download/retry/exit recovery prompt. Browser profile data is isolated under
+  `%LOCALAPPDATA%\PanoramaStitcher\WebView2`; roaming application settings are unchanged.
+- Embedded the offline HTML/CSS/JavaScript bundle as an executable resource with no CDN or loose
+  release asset. Added an owned asynchronous host beneath `GuiShellState`, exact version-1 yyjson
+  command parsing, stale page-generation rejection, navigation blocking, and controller teardown
+  before worker/GPU cleanup. After manual Input/Preview acceptance, WebView became the default and
+  `--native-ui` selects the previous Win32 frontend as the transition rollback.
+- Wired real Input snapshots and commands to the existing discovery, validation, selection,
+  editable directories, native folder pickers, refresh, tag/delete actions, settings/options, and
+  Preview admission paths. A `DISPLAY2` smoke capture at the 920x680 minimum showed the four real
+  sessions with correct incomplete/invalid/stitched first-cell colors and a valid selected session.
+- Kept preview pixels native. The page reports a generation-matched, fully visible 2:1 placeholder
+  rectangle; native code validates finiteness, WebView raster scale, client bounds, stage, retained
+  preview ownership, and plausible size before raising the existing preview child HWND over it.
+  Resizes/stage changes hide stale geometry and reset magnification once. A real 30-pose RTX 5090
+  preview rendered correctly in the HTML slot with the persistent green completion badge.
+- The embedded bridge contract test covers resource policy, runtime/profile consistency, accepted
+  command families, fractional/150%-scale preview geometry, and rejection of extra fields,
+  versions, command targets, and native-window injection. Windows x64 MSVC Release `/W4 /WX` and
+  all eight native CTests pass. The user manually confirmed launch, native Preview placement,
+  hover-to-1:1 magnification, leave reset, and resize alignment. Preview options/exposure and
+  Output/CPU parity remain subsequent packets.
+- The authoritative editable UI sources are `stitcher/native/resources/pano_app_ui.html`,
+  `pano_app_ui.css`, and `pano_app_ui.js`. CMake validates their explicit sibling references and
+  inlines them into one generated HTML resource for the executable; no loose UI source is shipped.
+  Changing any of the three requires rebuilding the native GUI. The Windows staging copy and
+  generated build-tree HTML are disposable inputs, not additional sources of truth.
+- Verified the new default and rollback selection after rebuilding with MSVC `/W4 /WX`: ordinary
+  launch created the WebView frontend, while `--native-ui` created only the previous native window;
+  all eight Windows CTests passed. Whole-tree measurement found 329.649 MiB physical working set
+  across the seven-process WebView idle tree and 477.352 MiB with the real retained preview ready.
+  The preview-ready native host used 166.781 MiB physical working set; its 1913.344 MiB private
+  commit includes retained D3D12 resources and is not physical host RAM. Every measured native and
+  WebView descendant exited within five seconds of closing the GUI; no detached preview worker was
+  observed.
+- Replaced the first embedded Input/Preview markup with the prototype's Tailwind 4.3.3 layout and
+  utility class names while retaining the versioned production bridge, editable path inputs, and
+  native preview placeholder. Output remains deliberately unavailable in this partial WebView
+  slice. Ordinary launch no longer exposes any Win32 controls as an implicit fallback;
+  `--native-ui` is the only opt-in rollback.
+- Corrected blank default startup by allowing the trusted initial `NavigateToString` navigation
+  before the bridge handshake, explicitly showing the sized controller, and hiding the native
+  preview child until validated page geometry arrives. Navigation failures now reach the existing
+  visible host-error path. A real `CopyFromScreen` capture on `DISPLAY2` showed the WebView Input
+  page populated with four live sessions; a separate `--native-ui` process-tree run contained only
+  the 19.922 MiB native process. MSVC Release and all eight CTests plus the six focused release-build
+  Python tests passed.
+- Split the editable WebView UI into sibling HTML, CSS, and JavaScript sources without changing
+  presentation or bridge behavior. A checked CMake generator now requires both source references,
+  inlines the assets into one generated HTML resource, and makes both the GUI and contract-test
+  resource compilation depend on all three inputs. The embedded contract rejects unresolved asset
+  names. MSVC Release and all eight CTests passed, and a real `DISPLAY2` capture showed the live
+  Input screen unchanged after the split.
+- Replaced the imperative WebView screen updater with a tiny declarative, real-DOM renderer. Function
+  components derive every displayed property from the authoritative native snapshot, reuse the fixed
+  Input/Preview/Output tree while hiding inactive screens, and update attributes, properties, styles,
+  and event handlers only when their values change. Session rows are the sole collection and are
+  intentionally rebuilt as a unit on each snapshot, avoiding key/reconciliation machinery. A focused
+  browser harness confirmed stable screen-node identity, full row replacement, derived stage changes,
+  and zero mutations for an unchanged fixed tree. MSVC Release `/W4 /WX`, all eight native CTests,
+  JavaScript syntax validation, and a real `DISPLAY2` capture passed.
+- Added content-driven WebView window height without making the shell fight ordinary manual resizing.
+  The page measures its visible screen with viewport-stretching rules temporarily neutralized, reports
+  only changed natural heights, and remeasures after a monitor DPI transition. Native code validates the
+  exact bridge message, applies DPI-aware non-client chrome, retains width, and clamps the result to the
+  active monitor work area. A `DISPLAY2` probe matched the independently measured 650-pixel content with
+  a 650-pixel client (`920x689` outer), then confirmed a manual resize to `920x769` remained unchanged.
+  MSVC Release `/W4 /WX` and all eight native CTests passed.
+- Corrected the resulting preview-layout race: every WebView client resize now publishes the layout
+  generation it invalidated, allowing the next page geometry report to match instead of leaving the
+  native preview surface hidden. A fresh `DISPLAY2` run rendered the authorized real-session D3D12
+  preview visibly and correctly positioned in the automatically fitted `920x691` window. MSVC Release
+  `/W4 /WX` and all eight native CTests passed.
+- Added the selected v2 application mark as a transparent RGBA source master and a seven-frame Windows
+  icon (`16`, `24`, `32`, `48`, `64`, `128`, and `256` pixels). CMake now treats the ICO as an explicit
+  resource-generation dependency, resolves its portable RC template path, and embeds it into the native
+  GUI and resource contract test. The main window class loads matching large and small shared icon
+  resources. MSVC Release `/W4 /WX` and all eight native CTests passed; a real `DISPLAY2` capture showed
+  the new mark in the title bar at small-icon size.
+- Made the latest WebView natural content height the DPI-aware minimum track height, capped to the active
+  monitor work area so genuine overflow can still scroll. The page suppresses vertical overflow when
+  content fits within a one-pixel rounding tolerance and retains `auto` only for real overflow. A
+  `DISPLAY2` preview capture showed the retained D3D12 surface without the previous inert scrollbar; a
+  bounds probe rejected a shrink from `689` to `609` pixels while preserving a manual increase to `769`.
+  The native self-test covers the dynamic `WM_GETMINMAXINFO` result, and MSVC Release `/W4 /WX` plus all
+  eight native CTests passed.
+- Throttled width-driven WebView preview relayout to one immediate update followed by at most one update
+  every 50 ms and a final trailing update. The native preview surface remains visible between updates;
+  height-only window changes bypass preview relayout, unchanged page geometry is not reposted, and
+  generation-tagged content-height reports prevent an older width measurement from restoring a stale
+  height. Content-height deduplication also includes that generation so a report rejected while a newer
+  width is pending is always retried for the accepted layout. A live fast-resize probe forced the window
+  to a stale 938-pixel height, observed 13 distinct intermediate preview widths, then confirmed it shrank
+  and remained at 818 pixels with the preview still visible. During an active width throttle, native
+  minimum tracking now uses the ordinary window floor instead of the preceding wider layout's stale
+  content height. Horizontal `WM_SIZING` proposals also preserve the latest asynchronously fitted outer
+  height so the Windows sizing loop cannot restore its original taller drag rectangle; vertical and
+  corner resizing remain user-controlled. Width-changing user sizing sessions now cancel the periodic
+  timer and publish one final generation from `WM_EXITSIZEMOVE`, covering a last height-only Windows
+  commit after the final throttled width; cleanup clears all timer, dirty, and sizing flags and is
+  idempotent. MSVC Release `/W4 /WX` and all eight native CTests passed.
+- Replaced the legacy Exposure controls in the default frontend with a separately embedded WebView
+  satellite while retaining the explicit `--native-ui` implementation. The page reports its natural
+  height after pose-grid and DPI/viewport changes; native placement applies DPI-aware non-client chrome,
+  clamps to the monitor work area, and keeps the satellite non-resizable by omitting `WS_THICKFRAME`.
+  Reference/manual pose selection, reset/equalize enablement, overlay routing, hover boundaries, and the
+  main-window open-state glyph remain native-authoritative. A real 30-pose `DISPLAY2` smoke produced a
+  fixed `340x524` panel with every action visible and no scrollbar or clipping. MSVC Release `/W4 /WX`,
+  all eight native CTests, embedded-resource contracts, and JavaScript syntax validation passed.
+- Unified Exposure pose interaction between the retained native preview and the WebView pose grid.
+  Preview hit-testing now retains every underlying pose: LMB sets the reference only for exactly one
+  hovered pose, while RMB toggles every hovered non-reference pose as a manual selection. Grid LMB/RMB
+  use the same native mutations. Hover and leave messages repaint overlays without publishing a new
+  snapshot, avoiding the former DOM replacement between mouse-down and mouse-up that suppressed grid
+  clicks. The native self-test covers single-pose reference selection, overlap rejection, and multi-pose
+  manual toggling; MSVC Release `/W4 /WX` and all eight native CTests passed.
+- Hardened the WebView Exposure workflow after manual NVIDIA inspection. Tag cells are plain table text;
+  tag editing remains only in the Actions menu. With Show overlay enabled, manually selected poses now
+  join the existing overlay mask, producing magenta boundaries plus the shader's 20%-opacity matching
+  fill while ordinary hover behavior is unchanged. Automatic/manual exposure reports monotonic phases
+  from `Sampling poses` through recomposition and retention, and any busy Preview operation now replaces
+  the completion check with fractional tab/taskbar progress. Finally, legacy layout seeds the initially
+  zero-sized native preview child until WebView supplies retained-preview geometry, then leaves the
+  WebView-owned child unchanged during exposure start/completion so it cannot cover the HTML Adjust
+  Exposure row. Portable native exposure contracts, JavaScript syntax,
+  focused release tests, MSVC Release `/W4 /WX`, and all eight Windows CTests passed.
+- Fixed a destructive settings lifecycle exposed during GUI testing. An unreadable, malformed, or
+  non-object existing `gui-settings.json` previously loaded as successful empty defaults, allowing a
+  later shutdown save to erase session tags and history. Existing invalid files now fail loading without
+  mutating the caller's settings, and the GUI latches settings persistence off for the entire run unless
+  startup loading succeeded. A genuinely missing file remains a valid first-run default. The portable
+  contract preserves a sentinel tag across malformed input; MSVC Release `/W4 /WX` and all eight Windows
+  CTests pass without opening the user's real settings profile.
+- Completed persistent reference-pose overlay styling. With Show overlay enabled, the reference now joins
+  manually selected poses in the fill mask and both retained-preview shaders select its cyan 20%-opacity
+  fill by pose identity; transient reference-selection hover remains cyan and manual selection remains
+  magenta. The WARP contract uses an all-covered mask to verify a true interior fill pixel instead of a
+  boundary override. The Exposure satellite now uses the ordinary Windows owned-window caption with only
+  the system Close command: tool-window, resize, minimize, and maximize chrome are absent. MSVC/FXC Release
+  and all eight Windows CTests passed without opening the user's settings profile. The same full contract
+  passed on the NVIDIA GeForce RTX 5090; physical retained-preview latency measured 0.870 ms p95 and direct
+  swap-chain presentation measured 4.567 ms p95.
+- Corrected native D3D12 automatic exposure to match the proven CUDA GUI workflow rather than CUDA's
+  separate retained-backend solver. Interactive correction now measures the fixed 256-by-128 unfiltered
+  overlap graph and propagates median corrections outward from the selected reference, incorporating
+  current manual gains without equation weights, neutral bridges, global centering, or the former
+  one-stop clamp. Portable solver contracts and the new WARP graph-reduction contract pass; MSVC Release
+  and all eight Windows CTests pass. On authorized session `1787897185-2`, reference pose 13 produced all
+  30 gains within 0.0103% of the historical Python/CUDA-GUI estimator (reference gain exactly `1.0`, with
+  the expected range from `0.032624` to `2.410715`). A disposable 64-by-32 NVIDIA render also completed
+  and its output was removed.
+- Added a Preview action-row note, `Exposure has been adjusted`, to the left of Adjust exposure. Its
+  muted italic presentation is derived from the native preview's actual non-unity gain vector, remains
+  accurate across preview recomposition, and clears with exposure discard or retained-preview reset.
+  The embedded WebView contract, JavaScript syntax check, MSVC Release build, all eight Windows CTests,
+  and all 172 Python tests passed.

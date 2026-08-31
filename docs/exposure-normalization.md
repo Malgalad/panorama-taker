@@ -10,6 +10,10 @@ outward from that target. Each newly reached pose uses the median correction pro
 corrected overlapping neighbors. There is no gain clamp. A weak or disconnected overlap graph
 produces a warning and leaves the current corrections unchanged so the user can correct poses
 manually. Progress covers pose sampling, pairwise overlap comparison, and correction propagation.
+Interactive correction samples the equirectangular overlap graph on a fixed 256-by-128 grid. It does
+not apply the backend's gradient filter, equation weights, neutral bridge edges, global least-squares
+centering, or one-stop gain clamp; those belong to the retained render-backend exposure solver and
+are not the user-facing reference-pose operation.
 
 In the GUI, the user selects a target pose and one or more intersecting poses, then clicks
 **Match exposure**. The stitcher estimates one scalar linear-light RGB gain from their overlap and

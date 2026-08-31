@@ -24,7 +24,7 @@ extern "C" {
 
 enum
 {
-    PANO_GPU_ABI_VERSION = 9,
+    PANO_GPU_ABI_VERSION = 10,
 };
 
 typedef enum pano_gpu_result
@@ -304,6 +304,56 @@ typedef struct pano_gpu_preview_overlay_request
     uint8_t *output_rgb8;
     uint64_t output_rgb8_bytes;
 } pano_gpu_preview_overlay_request;
+
+typedef struct pano_gpu_preview_surface_create_options
+{
+    uint32_t size;
+    uint32_t abi_version;
+    uint64_t native_window;
+    uint32_t width;
+    uint32_t height;
+} pano_gpu_preview_surface_create_options;
+
+typedef struct pano_gpu_preview_surface_diagnostics
+{
+    uint32_t size;
+    uint32_t abi_version;
+    uint32_t width;
+    uint32_t height;
+    uint64_t present_count;
+    uint64_t resize_count;
+    uint32_t occluded;
+    uint32_t live_surface_count;
+    uint32_t device_lost;
+    uint32_t reserved;
+} pano_gpu_preview_surface_diagnostics;
+
+typedef struct pano_gpu_preview_surface_present_request
+{
+    uint32_t size;
+    uint32_t abi_version;
+    uint32_t crop_left;
+    uint32_t crop_top;
+    uint32_t crop_width;
+    uint32_t crop_height;
+    uint32_t use_overview;
+} pano_gpu_preview_surface_present_request;
+
+typedef struct pano_gpu_preview_surface_overlay_request
+{
+    uint32_t size;
+    uint32_t abi_version;
+    uint32_t crop_left;
+    uint32_t crop_top;
+    uint32_t crop_width;
+    uint32_t crop_height;
+    uint32_t use_overview;
+    const uint8_t *hovered_frames;
+    uint64_t hovered_frame_bytes;
+    int32_t target_pose;
+    uint32_t target_mode;
+    uint32_t show_boundaries;
+} pano_gpu_preview_surface_overlay_request;
 
 typedef struct pano_gpu_projection_request
 {
@@ -638,6 +688,7 @@ typedef struct pano_gpu_device pano_gpu_device;
 typedef struct pano_gpu_session pano_gpu_session;
 typedef struct pano_gpu_output pano_gpu_output;
 typedef struct pano_gpu_preview pano_gpu_preview;
+typedef struct pano_gpu_preview_surface pano_gpu_preview_surface;
 
 PANO_GPU_API uint32_t pano_gpu_abi_version(void) PANO_GPU_NOEXCEPT;
 PANO_GPU_API pano_gpu_result pano_gpu_probe(char *error_buffer, uint32_t error_buffer_size) PANO_GPU_NOEXCEPT;
@@ -778,6 +829,11 @@ PANO_GPU_API pano_gpu_result pano_gpu_plan_auto_contrast_histogram(
     char *error_buffer,
     uint32_t error_buffer_size) PANO_GPU_NOEXCEPT;
 PANO_GPU_API pano_gpu_result pano_gpu_session_reduce_exposure_graph(
+    pano_gpu_session *session,
+    const pano_gpu_exposure_pair_request *request_template,
+    char *error_buffer,
+    uint32_t error_buffer_size) PANO_GPU_NOEXCEPT;
+PANO_GPU_API pano_gpu_result pano_gpu_session_reduce_reference_exposure_graph(
     pano_gpu_session *session,
     const pano_gpu_exposure_pair_request *request_template,
     char *error_buffer,
@@ -1024,6 +1080,40 @@ PANO_GPU_API pano_gpu_result pano_gpu_preview_render_overlay_generation(
     const pano_gpu_cancellation_token *token,
     char *error_buffer,
     uint32_t error_buffer_size) PANO_GPU_NOEXCEPT;
+PANO_GPU_API pano_gpu_result pano_gpu_preview_surface_create(
+    pano_gpu_device *device,
+    const pano_gpu_preview_surface_create_options *options,
+    pano_gpu_preview_surface **surface,
+    char *error_buffer,
+    uint32_t error_buffer_size) PANO_GPU_NOEXCEPT;
+PANO_GPU_API pano_gpu_result pano_gpu_preview_surface_resize(
+    pano_gpu_preview_surface *surface,
+    uint32_t width,
+    uint32_t height,
+    char *error_buffer,
+    uint32_t error_buffer_size) PANO_GPU_NOEXCEPT;
+PANO_GPU_API pano_gpu_result pano_gpu_preview_surface_clear_present(
+    pano_gpu_preview_surface *surface,
+    const float rgba[4],
+    char *error_buffer,
+    uint32_t error_buffer_size) PANO_GPU_NOEXCEPT;
+PANO_GPU_API pano_gpu_result pano_gpu_preview_surface_present_base(
+    pano_gpu_preview_surface *surface,
+    pano_gpu_preview *preview,
+    const pano_gpu_preview_surface_present_request *request,
+    char *error_buffer,
+    uint32_t error_buffer_size) PANO_GPU_NOEXCEPT;
+PANO_GPU_API pano_gpu_result pano_gpu_preview_surface_present_overlay(
+    pano_gpu_preview_surface *surface,
+    pano_gpu_preview *preview,
+    const pano_gpu_preview_surface_overlay_request *request,
+    char *error_buffer,
+    uint32_t error_buffer_size) PANO_GPU_NOEXCEPT;
+PANO_GPU_API pano_gpu_result pano_gpu_preview_surface_query_diagnostics(
+    const pano_gpu_preview_surface *surface,
+    pano_gpu_preview_surface_diagnostics *diagnostics,
+    char *error_buffer,
+    uint32_t error_buffer_size) PANO_GPU_NOEXCEPT;
 PANO_GPU_API pano_gpu_result pano_gpu_cancellation_token_create(
     pano_gpu_cancellation_token **token, char *error_buffer, uint32_t error_buffer_size) PANO_GPU_NOEXCEPT;
 PANO_GPU_API void pano_gpu_cancellation_token_cancel(pano_gpu_cancellation_token *token) PANO_GPU_NOEXCEPT;
@@ -1033,6 +1123,8 @@ PANO_GPU_API void pano_gpu_device_destroy(pano_gpu_device **device) PANO_GPU_NOE
 PANO_GPU_API void pano_gpu_session_destroy(pano_gpu_session **session) PANO_GPU_NOEXCEPT;
 PANO_GPU_API void pano_gpu_output_destroy(pano_gpu_output **output) PANO_GPU_NOEXCEPT;
 PANO_GPU_API void pano_gpu_preview_destroy(pano_gpu_preview **preview) PANO_GPU_NOEXCEPT;
+PANO_GPU_API void pano_gpu_preview_surface_destroy(
+    pano_gpu_preview_surface **surface) PANO_GPU_NOEXCEPT;
 
 #if defined(PANO_GPU_TEST_HOOKS)
 PANO_GPU_API void pano_gpu_test_fail_next_allocation(void) PANO_GPU_NOEXCEPT;
@@ -1135,6 +1227,14 @@ PANO_GPU_API void pano_gpu_test_fail_next_preview_allocation(void) PANO_GPU_NOEX
 PANO_GPU_API uint32_t pano_gpu_test_live_preview_count(void) PANO_GPU_NOEXCEPT;
 PANO_GPU_API int32_t pano_gpu_test_claim_preview_rendering(pano_gpu_preview *preview) PANO_GPU_NOEXCEPT;
 PANO_GPU_API void pano_gpu_test_release_preview_rendering(pano_gpu_preview *preview) PANO_GPU_NOEXCEPT;
+PANO_GPU_API pano_gpu_result pano_gpu_test_read_preview_surface(
+    pano_gpu_preview_surface *surface,
+    uint8_t *rgba8,
+    uint64_t rgba8_bytes,
+    char *error_buffer,
+    uint32_t error_buffer_size) PANO_GPU_NOEXCEPT;
+PANO_GPU_API void pano_gpu_test_fail_next_preview_surface_device_removed(
+    void) PANO_GPU_NOEXCEPT;
 PANO_GPU_API pano_gpu_result pano_gpu_test_validate_projection_request(
     const pano_gpu_session *session,
     const pano_gpu_projection_request *request,

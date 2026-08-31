@@ -35,7 +35,7 @@ SHADER_CONTRACTS = (
     (
         "render_preview_overlay.hlsl",
         "render_preview_overlay",
-        "c62cd3c73eca50069030345031ba583cd41e419bedd458c9b64f49db533fe9b4",
+        "1a35f312dcc0b61901218ab039332946c3a8058796e9c9999bf73305cc332a32",
     ),
 )
 

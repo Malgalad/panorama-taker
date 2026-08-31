@@ -1,0 +1,3 @@
+/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/openexr-subbuild/CMakeFiles/openexr-populate.dir
+/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/openexr-subbuild/CMakeFiles/edit_cache.dir
+/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/openexr-subbuild/CMakeFiles/rebuild_cache.dir

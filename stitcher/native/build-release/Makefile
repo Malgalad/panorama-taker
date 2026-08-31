@@ -95,6 +95,51 @@ rebuild_cache:
 rebuild_cache/fast: rebuild_cache
 .PHONY : rebuild_cache/fast
 
+# Special rule for the target list_install_components
+list_install_components:
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --cyan "Available install components are: \"Unspecified\""
+.PHONY : list_install_components
+
+# Special rule for the target list_install_components
+list_install_components/fast: list_install_components
+.PHONY : list_install_components/fast
+
+# Special rule for the target install
+install: preinstall
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --cyan "Install the project..."
+	/usr/bin/cmake -P cmake_install.cmake
+.PHONY : install
+
+# Special rule for the target install
+install/fast: preinstall/fast
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --cyan "Install the project..."
+	/usr/bin/cmake -P cmake_install.cmake
+.PHONY : install/fast
+
+# Special rule for the target install/local
+install/local: preinstall
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --cyan "Installing only the local directory..."
+	/usr/bin/cmake -DCMAKE_INSTALL_LOCAL_ONLY=1 -P cmake_install.cmake
+.PHONY : install/local
+
+# Special rule for the target install/local
+install/local/fast: preinstall/fast
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --cyan "Installing only the local directory..."
+	/usr/bin/cmake -DCMAKE_INSTALL_LOCAL_ONLY=1 -P cmake_install.cmake
+.PHONY : install/local/fast
+
+# Special rule for the target install/strip
+install/strip: preinstall
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --cyan "Installing the project stripped..."
+	/usr/bin/cmake -DCMAKE_INSTALL_DO_STRIP=1 -P cmake_install.cmake
+.PHONY : install/strip
+
+# Special rule for the target install/strip
+install/strip/fast: preinstall/fast
+	@$(CMAKE_COMMAND) -E cmake_echo_color --switch=$(COLOR) --cyan "Installing the project stripped..."
+	/usr/bin/cmake -DCMAKE_INSTALL_DO_STRIP=1 -P cmake_install.cmake
+.PHONY : install/strip/fast
+
 # The main all target
 all: cmake_check_build_system
 	$(CMAKE_COMMAND) -E cmake_progress_start /home/pogorelov/panorama-taker/stitcher/native/build-release/CMakeFiles /home/pogorelov/panorama-taker/stitcher/native/build-release//CMakeFiles/progress.marks
@@ -491,6 +536,45 @@ ContinuousSubmit/fast:
 .PHONY : ContinuousSubmit/fast
 
 #=============================================================================
+# Target rules for targets named yyjson
+
+# Build rule for target.
+yyjson: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 yyjson
+.PHONY : yyjson
+
+# fast build rule for target.
+yyjson/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/yyjson.dir/build.make CMakeFiles/yyjson.dir/build
+.PHONY : yyjson/fast
+
+#=============================================================================
+# Target rules for targets named pano_app_core
+
+# Build rule for target.
+pano_app_core: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 pano_app_core
+.PHONY : pano_app_core
+
+# fast build rule for target.
+pano_app_core/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/build
+.PHONY : pano_app_core/fast
+
+#=============================================================================
+# Target rules for targets named pano-stitch-native
+
+# Build rule for target.
+pano-stitch-native: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 pano-stitch-native
+.PHONY : pano-stitch-native
+
+# fast build rule for target.
+pano-stitch-native/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano-stitch-native.dir/build.make CMakeFiles/pano-stitch-native.dir/build
+.PHONY : pano-stitch-native/fast
+
+#=============================================================================
 # Target rules for targets named pano_gpu
 
 # Build rule for target.
@@ -504,6 +588,19 @@ pano_gpu/fast:
 .PHONY : pano_gpu/fast
 
 #=============================================================================
+# Target rules for targets named pano_app_contract_test
+
+# Build rule for target.
+pano_app_contract_test: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 pano_app_contract_test
+.PHONY : pano_app_contract_test
+
+# fast build rule for target.
+pano_app_contract_test/fast:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_contract_test.dir/build.make CMakeFiles/pano_app_contract_test.dir/build
+.PHONY : pano_app_contract_test/fast
+
+#=============================================================================
 # Target rules for targets named pano_gpu_contract_test
 
 # Build rule for target.
@@ -515,6 +612,446 @@ pano_gpu_contract_test: cmake_check_build_system
 pano_gpu_contract_test/fast:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_gpu_contract_test.dir/build.make CMakeFiles/pano_gpu_contract_test.dir/build
 .PHONY : pano_gpu_contract_test/fast
+
+#=============================================================================
+# Target rules for targets named uninstall
+
+# Build rule for target.
+uninstall: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 uninstall
+.PHONY : uninstall
+
+# fast build rule for target.
+uninstall/fast:
+	$(MAKE) $(MAKESILENT) -f _deps/imath-build/CMakeFiles/uninstall.dir/build.make _deps/imath-build/CMakeFiles/uninstall.dir/build
+.PHONY : uninstall/fast
+
+#=============================================================================
+# Target rules for targets named Imath
+
+# Build rule for target.
+Imath: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 Imath
+.PHONY : Imath
+
+# fast build rule for target.
+Imath/fast:
+	$(MAKE) $(MAKESILENT) -f _deps/imath-build/src/Imath/CMakeFiles/Imath.dir/build.make _deps/imath-build/src/Imath/CMakeFiles/Imath.dir/build
+.PHONY : Imath/fast
+
+#=============================================================================
+# Target rules for targets named Iex
+
+# Build rule for target.
+Iex: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 Iex
+.PHONY : Iex
+
+# fast build rule for target.
+Iex/fast:
+	$(MAKE) $(MAKESILENT) -f _deps/openexr-build/src/lib/Iex/CMakeFiles/Iex.dir/build.make _deps/openexr-build/src/lib/Iex/CMakeFiles/Iex.dir/build
+.PHONY : Iex/fast
+
+#=============================================================================
+# Target rules for targets named IlmThread
+
+# Build rule for target.
+IlmThread: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 IlmThread
+.PHONY : IlmThread
+
+# fast build rule for target.
+IlmThread/fast:
+	$(MAKE) $(MAKESILENT) -f _deps/openexr-build/src/lib/IlmThread/CMakeFiles/IlmThread.dir/build.make _deps/openexr-build/src/lib/IlmThread/CMakeFiles/IlmThread.dir/build
+.PHONY : IlmThread/fast
+
+#=============================================================================
+# Target rules for targets named OpenEXRCore
+
+# Build rule for target.
+OpenEXRCore: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 OpenEXRCore
+.PHONY : OpenEXRCore
+
+# fast build rule for target.
+OpenEXRCore/fast:
+	$(MAKE) $(MAKESILENT) -f _deps/openexr-build/src/lib/OpenEXRCore/CMakeFiles/OpenEXRCore.dir/build.make _deps/openexr-build/src/lib/OpenEXRCore/CMakeFiles/OpenEXRCore.dir/build
+.PHONY : OpenEXRCore/fast
+
+#=============================================================================
+# Target rules for targets named openjph
+
+# Build rule for target.
+openjph: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 openjph
+.PHONY : openjph
+
+# fast build rule for target.
+openjph/fast:
+	$(MAKE) $(MAKESILENT) -f _deps/openexr-build/external/OpenJPH/src/core/CMakeFiles/openjph.dir/build.make _deps/openexr-build/external/OpenJPH/src/core/CMakeFiles/openjph.dir/build
+.PHONY : openjph/fast
+
+#=============================================================================
+# Target rules for targets named OpenEXR
+
+# Build rule for target.
+OpenEXR: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 OpenEXR
+.PHONY : OpenEXR
+
+# fast build rule for target.
+OpenEXR/fast:
+	$(MAKE) $(MAKESILENT) -f _deps/openexr-build/src/lib/OpenEXR/CMakeFiles/OpenEXR.dir/build.make _deps/openexr-build/src/lib/OpenEXR/CMakeFiles/OpenEXR.dir/build
+.PHONY : OpenEXR/fast
+
+#=============================================================================
+# Target rules for targets named OpenEXRUtil
+
+# Build rule for target.
+OpenEXRUtil: cmake_check_build_system
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/Makefile2 OpenEXRUtil
+.PHONY : OpenEXRUtil
+
+# fast build rule for target.
+OpenEXRUtil/fast:
+	$(MAKE) $(MAKESILENT) -f _deps/openexr-build/src/lib/OpenEXRUtil/CMakeFiles/OpenEXRUtil.dir/build.make _deps/openexr-build/src/lib/OpenEXRUtil/CMakeFiles/OpenEXRUtil.dir/build
+.PHONY : OpenEXRUtil/fast
+
+src/pano_app.o: src/pano_app.cpp.o
+.PHONY : src/pano_app.o
+
+# target to build an object file
+src/pano_app.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app.cpp.o
+.PHONY : src/pano_app.cpp.o
+
+src/pano_app.i: src/pano_app.cpp.i
+.PHONY : src/pano_app.i
+
+# target to preprocess a source file
+src/pano_app.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app.cpp.i
+.PHONY : src/pano_app.cpp.i
+
+src/pano_app.s: src/pano_app.cpp.s
+.PHONY : src/pano_app.s
+
+# target to generate assembly for a file
+src/pano_app.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app.cpp.s
+.PHONY : src/pano_app.cpp.s
+
+src/pano_app_codec.o: src/pano_app_codec.cpp.o
+.PHONY : src/pano_app_codec.o
+
+# target to build an object file
+src/pano_app_codec.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_codec.cpp.o
+.PHONY : src/pano_app_codec.cpp.o
+
+src/pano_app_codec.i: src/pano_app_codec.cpp.i
+.PHONY : src/pano_app_codec.i
+
+# target to preprocess a source file
+src/pano_app_codec.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_codec.cpp.i
+.PHONY : src/pano_app_codec.cpp.i
+
+src/pano_app_codec.s: src/pano_app_codec.cpp.s
+.PHONY : src/pano_app_codec.s
+
+# target to generate assembly for a file
+src/pano_app_codec.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_codec.cpp.s
+.PHONY : src/pano_app_codec.cpp.s
+
+src/pano_app_cpu.o: src/pano_app_cpu.cpp.o
+.PHONY : src/pano_app_cpu.o
+
+# target to build an object file
+src/pano_app_cpu.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_cpu.cpp.o
+.PHONY : src/pano_app_cpu.cpp.o
+
+src/pano_app_cpu.i: src/pano_app_cpu.cpp.i
+.PHONY : src/pano_app_cpu.i
+
+# target to preprocess a source file
+src/pano_app_cpu.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_cpu.cpp.i
+.PHONY : src/pano_app_cpu.cpp.i
+
+src/pano_app_cpu.s: src/pano_app_cpu.cpp.s
+.PHONY : src/pano_app_cpu.s
+
+# target to generate assembly for a file
+src/pano_app_cpu.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_cpu.cpp.s
+.PHONY : src/pano_app_cpu.cpp.s
+
+src/pano_app_cpu_session.o: src/pano_app_cpu_session.cpp.o
+.PHONY : src/pano_app_cpu_session.o
+
+# target to build an object file
+src/pano_app_cpu_session.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_cpu_session.cpp.o
+.PHONY : src/pano_app_cpu_session.cpp.o
+
+src/pano_app_cpu_session.i: src/pano_app_cpu_session.cpp.i
+.PHONY : src/pano_app_cpu_session.i
+
+# target to preprocess a source file
+src/pano_app_cpu_session.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_cpu_session.cpp.i
+.PHONY : src/pano_app_cpu_session.cpp.i
+
+src/pano_app_cpu_session.s: src/pano_app_cpu_session.cpp.s
+.PHONY : src/pano_app_cpu_session.s
+
+# target to generate assembly for a file
+src/pano_app_cpu_session.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_cpu_session.cpp.s
+.PHONY : src/pano_app_cpu_session.cpp.s
+
+src/pano_app_discovery.o: src/pano_app_discovery.cpp.o
+.PHONY : src/pano_app_discovery.o
+
+# target to build an object file
+src/pano_app_discovery.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_discovery.cpp.o
+.PHONY : src/pano_app_discovery.cpp.o
+
+src/pano_app_discovery.i: src/pano_app_discovery.cpp.i
+.PHONY : src/pano_app_discovery.i
+
+# target to preprocess a source file
+src/pano_app_discovery.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_discovery.cpp.i
+.PHONY : src/pano_app_discovery.cpp.i
+
+src/pano_app_discovery.s: src/pano_app_discovery.cpp.s
+.PHONY : src/pano_app_discovery.s
+
+# target to generate assembly for a file
+src/pano_app_discovery.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_discovery.cpp.s
+.PHONY : src/pano_app_discovery.cpp.s
+
+src/pano_app_gui_state.o: src/pano_app_gui_state.cpp.o
+.PHONY : src/pano_app_gui_state.o
+
+# target to build an object file
+src/pano_app_gui_state.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_gui_state.cpp.o
+.PHONY : src/pano_app_gui_state.cpp.o
+
+src/pano_app_gui_state.i: src/pano_app_gui_state.cpp.i
+.PHONY : src/pano_app_gui_state.i
+
+# target to preprocess a source file
+src/pano_app_gui_state.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_gui_state.cpp.i
+.PHONY : src/pano_app_gui_state.cpp.i
+
+src/pano_app_gui_state.s: src/pano_app_gui_state.cpp.s
+.PHONY : src/pano_app_gui_state.s
+
+# target to generate assembly for a file
+src/pano_app_gui_state.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_gui_state.cpp.s
+.PHONY : src/pano_app_gui_state.cpp.s
+
+src/pano_app_main.o: src/pano_app_main.cpp.o
+.PHONY : src/pano_app_main.o
+
+# target to build an object file
+src/pano_app_main.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano-stitch-native.dir/build.make CMakeFiles/pano-stitch-native.dir/src/pano_app_main.cpp.o
+.PHONY : src/pano_app_main.cpp.o
+
+src/pano_app_main.i: src/pano_app_main.cpp.i
+.PHONY : src/pano_app_main.i
+
+# target to preprocess a source file
+src/pano_app_main.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano-stitch-native.dir/build.make CMakeFiles/pano-stitch-native.dir/src/pano_app_main.cpp.i
+.PHONY : src/pano_app_main.cpp.i
+
+src/pano_app_main.s: src/pano_app_main.cpp.s
+.PHONY : src/pano_app_main.s
+
+# target to generate assembly for a file
+src/pano_app_main.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano-stitch-native.dir/build.make CMakeFiles/pano-stitch-native.dir/src/pano_app_main.cpp.s
+.PHONY : src/pano_app_main.cpp.s
+
+src/pano_app_options.o: src/pano_app_options.cpp.o
+.PHONY : src/pano_app_options.o
+
+# target to build an object file
+src/pano_app_options.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_options.cpp.o
+.PHONY : src/pano_app_options.cpp.o
+
+src/pano_app_options.i: src/pano_app_options.cpp.i
+.PHONY : src/pano_app_options.i
+
+# target to preprocess a source file
+src/pano_app_options.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_options.cpp.i
+.PHONY : src/pano_app_options.cpp.i
+
+src/pano_app_options.s: src/pano_app_options.cpp.s
+.PHONY : src/pano_app_options.s
+
+# target to generate assembly for a file
+src/pano_app_options.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_options.cpp.s
+.PHONY : src/pano_app_options.cpp.s
+
+src/pano_app_plan.o: src/pano_app_plan.cpp.o
+.PHONY : src/pano_app_plan.o
+
+# target to build an object file
+src/pano_app_plan.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_plan.cpp.o
+.PHONY : src/pano_app_plan.cpp.o
+
+src/pano_app_plan.i: src/pano_app_plan.cpp.i
+.PHONY : src/pano_app_plan.i
+
+# target to preprocess a source file
+src/pano_app_plan.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_plan.cpp.i
+.PHONY : src/pano_app_plan.cpp.i
+
+src/pano_app_plan.s: src/pano_app_plan.cpp.s
+.PHONY : src/pano_app_plan.s
+
+# target to generate assembly for a file
+src/pano_app_plan.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_plan.cpp.s
+.PHONY : src/pano_app_plan.cpp.s
+
+src/pano_app_preview.o: src/pano_app_preview.cpp.o
+.PHONY : src/pano_app_preview.o
+
+# target to build an object file
+src/pano_app_preview.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_preview.cpp.o
+.PHONY : src/pano_app_preview.cpp.o
+
+src/pano_app_preview.i: src/pano_app_preview.cpp.i
+.PHONY : src/pano_app_preview.i
+
+# target to preprocess a source file
+src/pano_app_preview.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_preview.cpp.i
+.PHONY : src/pano_app_preview.cpp.i
+
+src/pano_app_preview.s: src/pano_app_preview.cpp.s
+.PHONY : src/pano_app_preview.s
+
+# target to generate assembly for a file
+src/pano_app_preview.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_preview.cpp.s
+.PHONY : src/pano_app_preview.cpp.s
+
+src/pano_app_publication.o: src/pano_app_publication.cpp.o
+.PHONY : src/pano_app_publication.o
+
+# target to build an object file
+src/pano_app_publication.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_publication.cpp.o
+.PHONY : src/pano_app_publication.cpp.o
+
+src/pano_app_publication.i: src/pano_app_publication.cpp.i
+.PHONY : src/pano_app_publication.i
+
+# target to preprocess a source file
+src/pano_app_publication.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_publication.cpp.i
+.PHONY : src/pano_app_publication.cpp.i
+
+src/pano_app_publication.s: src/pano_app_publication.cpp.s
+.PHONY : src/pano_app_publication.s
+
+# target to generate assembly for a file
+src/pano_app_publication.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_publication.cpp.s
+.PHONY : src/pano_app_publication.cpp.s
+
+src/pano_app_session.o: src/pano_app_session.cpp.o
+.PHONY : src/pano_app_session.o
+
+# target to build an object file
+src/pano_app_session.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_session.cpp.o
+.PHONY : src/pano_app_session.cpp.o
+
+src/pano_app_session.i: src/pano_app_session.cpp.i
+.PHONY : src/pano_app_session.i
+
+# target to preprocess a source file
+src/pano_app_session.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_session.cpp.i
+.PHONY : src/pano_app_session.cpp.i
+
+src/pano_app_session.s: src/pano_app_session.cpp.s
+.PHONY : src/pano_app_session.s
+
+# target to generate assembly for a file
+src/pano_app_session.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_session.cpp.s
+.PHONY : src/pano_app_session.cpp.s
+
+src/pano_app_settings.o: src/pano_app_settings.cpp.o
+.PHONY : src/pano_app_settings.o
+
+# target to build an object file
+src/pano_app_settings.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_settings.cpp.o
+.PHONY : src/pano_app_settings.cpp.o
+
+src/pano_app_settings.i: src/pano_app_settings.cpp.i
+.PHONY : src/pano_app_settings.i
+
+# target to preprocess a source file
+src/pano_app_settings.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_settings.cpp.i
+.PHONY : src/pano_app_settings.cpp.i
+
+src/pano_app_settings.s: src/pano_app_settings.cpp.s
+.PHONY : src/pano_app_settings.s
+
+# target to generate assembly for a file
+src/pano_app_settings.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_settings.cpp.s
+.PHONY : src/pano_app_settings.cpp.s
+
+src/pano_app_writer.o: src/pano_app_writer.cpp.o
+.PHONY : src/pano_app_writer.o
+
+# target to build an object file
+src/pano_app_writer.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_writer.cpp.o
+.PHONY : src/pano_app_writer.cpp.o
+
+src/pano_app_writer.i: src/pano_app_writer.cpp.i
+.PHONY : src/pano_app_writer.i
+
+# target to preprocess a source file
+src/pano_app_writer.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_writer.cpp.i
+.PHONY : src/pano_app_writer.cpp.i
+
+src/pano_app_writer.s: src/pano_app_writer.cpp.s
+.PHONY : src/pano_app_writer.s
+
+# target to generate assembly for a file
+src/pano_app_writer.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_core.dir/build.make CMakeFiles/pano_app_core.dir/src/pano_app_writer.cpp.s
+.PHONY : src/pano_app_writer.cpp.s
 
 src/pano_gpu.o: src/pano_gpu.cpp.o
 .PHONY : src/pano_gpu.o
@@ -540,6 +1077,30 @@ src/pano_gpu.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_gpu.dir/build.make CMakeFiles/pano_gpu.dir/src/pano_gpu.cpp.s
 .PHONY : src/pano_gpu.cpp.s
 
+tests/pano_app_contract_test.o: tests/pano_app_contract_test.cpp.o
+.PHONY : tests/pano_app_contract_test.o
+
+# target to build an object file
+tests/pano_app_contract_test.cpp.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_contract_test.dir/build.make CMakeFiles/pano_app_contract_test.dir/tests/pano_app_contract_test.cpp.o
+.PHONY : tests/pano_app_contract_test.cpp.o
+
+tests/pano_app_contract_test.i: tests/pano_app_contract_test.cpp.i
+.PHONY : tests/pano_app_contract_test.i
+
+# target to preprocess a source file
+tests/pano_app_contract_test.cpp.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_contract_test.dir/build.make CMakeFiles/pano_app_contract_test.dir/tests/pano_app_contract_test.cpp.i
+.PHONY : tests/pano_app_contract_test.cpp.i
+
+tests/pano_app_contract_test.s: tests/pano_app_contract_test.cpp.s
+.PHONY : tests/pano_app_contract_test.s
+
+# target to generate assembly for a file
+tests/pano_app_contract_test.cpp.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_app_contract_test.dir/build.make CMakeFiles/pano_app_contract_test.dir/tests/pano_app_contract_test.cpp.s
+.PHONY : tests/pano_app_contract_test.cpp.s
+
 tests/pano_gpu_contract_test.o: tests/pano_gpu_contract_test.cpp.o
 .PHONY : tests/pano_gpu_contract_test.o
 
@@ -564,6 +1125,30 @@ tests/pano_gpu_contract_test.cpp.s:
 	$(MAKE) $(MAKESILENT) -f CMakeFiles/pano_gpu_contract_test.dir/build.make CMakeFiles/pano_gpu_contract_test.dir/tests/pano_gpu_contract_test.cpp.s
 .PHONY : tests/pano_gpu_contract_test.cpp.s
 
+third_party/yyjson/yyjson.o: third_party/yyjson/yyjson.c.o
+.PHONY : third_party/yyjson/yyjson.o
+
+# target to build an object file
+third_party/yyjson/yyjson.c.o:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/yyjson.dir/build.make CMakeFiles/yyjson.dir/third_party/yyjson/yyjson.c.o
+.PHONY : third_party/yyjson/yyjson.c.o
+
+third_party/yyjson/yyjson.i: third_party/yyjson/yyjson.c.i
+.PHONY : third_party/yyjson/yyjson.i
+
+# target to preprocess a source file
+third_party/yyjson/yyjson.c.i:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/yyjson.dir/build.make CMakeFiles/yyjson.dir/third_party/yyjson/yyjson.c.i
+.PHONY : third_party/yyjson/yyjson.c.i
+
+third_party/yyjson/yyjson.s: third_party/yyjson/yyjson.c.s
+.PHONY : third_party/yyjson/yyjson.s
+
+# target to generate assembly for a file
+third_party/yyjson/yyjson.c.s:
+	$(MAKE) $(MAKESILENT) -f CMakeFiles/yyjson.dir/build.make CMakeFiles/yyjson.dir/third_party/yyjson/yyjson.c.s
+.PHONY : third_party/yyjson/yyjson.c.s
+
 # Help Target
 help:
 	@echo "The following are some of the valid targets for this Makefile:"
@@ -571,6 +1156,10 @@ help:
 	@echo "... clean"
 	@echo "... depend"
 	@echo "... edit_cache"
+	@echo "... install"
+	@echo "... install/local"
+	@echo "... install/strip"
+	@echo "... list_install_components"
 	@echo "... rebuild_cache"
 	@echo "... test"
 	@echo "... Continuous"
@@ -601,14 +1190,74 @@ help:
 	@echo "... NightlySubmit"
 	@echo "... NightlyTest"
 	@echo "... NightlyUpdate"
+	@echo "... uninstall"
+	@echo "... Iex"
+	@echo "... IlmThread"
+	@echo "... Imath"
+	@echo "... OpenEXR"
+	@echo "... OpenEXRCore"
+	@echo "... OpenEXRUtil"
+	@echo "... openjph"
+	@echo "... pano-stitch-native"
+	@echo "... pano_app_contract_test"
+	@echo "... pano_app_core"
 	@echo "... pano_gpu"
 	@echo "... pano_gpu_contract_test"
+	@echo "... yyjson"
+	@echo "... src/pano_app.o"
+	@echo "... src/pano_app.i"
+	@echo "... src/pano_app.s"
+	@echo "... src/pano_app_codec.o"
+	@echo "... src/pano_app_codec.i"
+	@echo "... src/pano_app_codec.s"
+	@echo "... src/pano_app_cpu.o"
+	@echo "... src/pano_app_cpu.i"
+	@echo "... src/pano_app_cpu.s"
+	@echo "... src/pano_app_cpu_session.o"
+	@echo "... src/pano_app_cpu_session.i"
+	@echo "... src/pano_app_cpu_session.s"
+	@echo "... src/pano_app_discovery.o"
+	@echo "... src/pano_app_discovery.i"
+	@echo "... src/pano_app_discovery.s"
+	@echo "... src/pano_app_gui_state.o"
+	@echo "... src/pano_app_gui_state.i"
+	@echo "... src/pano_app_gui_state.s"
+	@echo "... src/pano_app_main.o"
+	@echo "... src/pano_app_main.i"
+	@echo "... src/pano_app_main.s"
+	@echo "... src/pano_app_options.o"
+	@echo "... src/pano_app_options.i"
+	@echo "... src/pano_app_options.s"
+	@echo "... src/pano_app_plan.o"
+	@echo "... src/pano_app_plan.i"
+	@echo "... src/pano_app_plan.s"
+	@echo "... src/pano_app_preview.o"
+	@echo "... src/pano_app_preview.i"
+	@echo "... src/pano_app_preview.s"
+	@echo "... src/pano_app_publication.o"
+	@echo "... src/pano_app_publication.i"
+	@echo "... src/pano_app_publication.s"
+	@echo "... src/pano_app_session.o"
+	@echo "... src/pano_app_session.i"
+	@echo "... src/pano_app_session.s"
+	@echo "... src/pano_app_settings.o"
+	@echo "... src/pano_app_settings.i"
+	@echo "... src/pano_app_settings.s"
+	@echo "... src/pano_app_writer.o"
+	@echo "... src/pano_app_writer.i"
+	@echo "... src/pano_app_writer.s"
 	@echo "... src/pano_gpu.o"
 	@echo "... src/pano_gpu.i"
 	@echo "... src/pano_gpu.s"
+	@echo "... tests/pano_app_contract_test.o"
+	@echo "... tests/pano_app_contract_test.i"
+	@echo "... tests/pano_app_contract_test.s"
 	@echo "... tests/pano_gpu_contract_test.o"
 	@echo "... tests/pano_gpu_contract_test.i"
 	@echo "... tests/pano_gpu_contract_test.s"
+	@echo "... third_party/yyjson/yyjson.o"
+	@echo "... third_party/yyjson/yyjson.i"
+	@echo "... third_party/yyjson/yyjson.s"
 .PHONY : help
 
 

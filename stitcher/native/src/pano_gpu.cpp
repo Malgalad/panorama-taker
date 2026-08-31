@@ -17,6 +17,7 @@
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
+#include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
@@ -46,6 +47,8 @@
 #include "pano_gpu_tone_map_rec2020_shader.h"
 #include "pano_gpu_rec2020_linear_srgb_shader.h"
 #include "pano_gpu_preview_base_shader.h"
+#include "pano_gpu_preview_present_shader.h"
+#include "pano_gpu_preview_present_overlay_shader.h"
 #include "pano_gpu_preview_overlay_shader.h"
 #include "pano_gpu_exposure_proxy_uint8_shader.h"
 #include "pano_gpu_exposure_proxy_uint16_shader.h"
@@ -78,6 +81,10 @@ std::atomic<uint32_t> live_fence_count {0};
 std::atomic<uint32_t> live_session_count {0};
 std::atomic<uint32_t> live_output_count {0};
 std::atomic<uint32_t> live_preview_count {0};
+std::atomic<uint32_t> live_preview_surface_count {0};
+#if defined(PANO_GPU_TEST_HOOKS)
+std::atomic<bool> fail_next_preview_surface_device_removed {false};
+#endif
 #if defined(PANO_GPU_TEST_HOOKS)
 std::atomic<bool> fail_next_fence_wait {false};
 #endif
@@ -321,6 +328,37 @@ struct pano_gpu_preview
         if (count_registered)
             live_preview_count.fetch_sub(1, std::memory_order_relaxed);
         release_session(session);
+    }
+};
+
+struct pano_gpu_preview_surface
+{
+    std::shared_ptr<pano_gpu_device_core> device_core;
+    uint32_t width {0};
+    uint32_t height {0};
+    uint64_t present_count {0};
+    uint64_t resize_count {0};
+    bool occluded {false};
+    bool device_lost {false};
+    bool count_registered {false};
+    std::atomic<bool> presenting {false};
+#if defined(_WIN32)
+    Microsoft::WRL::ComPtr<IDXGISwapChain3> swap_chain;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> rtv_heap;
+    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2> buffers;
+    Microsoft::WRL::ComPtr<ID3D12Resource> present_texture;
+#endif
+    ~pano_gpu_preview_surface()
+    {
+#if defined(_WIN32)
+        for (auto &buffer : buffers)
+            buffer.Reset();
+        present_texture.Reset();
+        rtv_heap.Reset();
+        swap_chain.Reset();
+#endif
+        if (count_registered)
+            live_preview_surface_count.fetch_sub(1, std::memory_order_relaxed);
     }
 };
 
@@ -917,9 +955,9 @@ pano_gpu_result pano_gpu_plan_memory(
         return PANO_GPU_UNAVAILABLE;
     }
     const uint64_t reserve = std::max(gpu_reserve_bytes, request->total_bytes * 15 / 100);
-    const uint64_t budget = request->requested_budget_bytes == 0 ? request->free_bytes :
-        std::min(request->free_bytes, request->requested_budget_bytes);
-    const uint64_t available = budget > reserve ? budget - reserve : 0;
+    const uint64_t system_available = request->free_bytes > reserve ? request->free_bytes - reserve : 0;
+    const uint64_t available = request->requested_budget_bytes == 0 ? system_available :
+        std::min(system_available, request->requested_budget_bytes);
     uint64_t minimum_session_bytes = 0;
     uint64_t source_frame_bytes = 0;
     uint64_t minimum_upload_bytes = 0;
@@ -1803,9 +1841,156 @@ pano_gpu_result pano_gpu_session_invalidate_exposure(
     return PANO_GPU_SUCCESS;
 }
 
-pano_gpu_result pano_gpu_session_reduce_exposure_graph(
+static pano_gpu_result dispatch_reference_exposure_pair_ratios(
+    pano_gpu_session *const session, char *const error_buffer,
+    const uint32_t error_buffer_size) noexcept
+{
+    if (session == nullptr || !session->resident_pair_classified ||
+        session->resident_pair_ratios_ready || session->resident_pair_sample_count == 0)
+    {
+        write_error(error_buffer, error_buffer_size,
+                    "resident reference exposure-pair inputs are not ready");
+        return PANO_GPU_INVALID_ARGUMENT;
+    }
+#if !defined(_WIN32)
+    write_error(error_buffer, error_buffer_size, "D3D12 is available only on Windows");
+    return PANO_GPU_UNAVAILABLE;
+#else
+    ID3D12Device *const device = session->device_core->d3d_device.Get();
+    D3D12_DESCRIPTOR_RANGE ranges[2] {
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 2}};
+    D3D12_ROOT_PARAMETER parameters[2] {};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants = {0, 0, 1};
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[1].DescriptorTable = {2, ranges};
+    const D3D12_ROOT_SIGNATURE_DESC root_description {
+        2, parameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    Microsoft::WRL::ComPtr<ID3DBlob> serialized, errors;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline;
+    if (FAILED(D3D12SerializeRootSignature(
+            &root_description, D3D_ROOT_SIGNATURE_VERSION_1_0, &serialized, &errors)) ||
+        FAILED(device->CreateRootSignature(
+            0, serialized->GetBufferPointer(), serialized->GetBufferSize(), IID_PPV_ARGS(&root))))
+    {
+        write_error(error_buffer, error_buffer_size,
+                    "cannot create resident reference exposure-pair root signature");
+        return PANO_GPU_UNAVAILABLE;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_description {};
+    pipeline_description.pRootSignature = root.Get();
+    pipeline_description.CS = {
+        pano_gpu_exposure_pair_ratio_shader, sizeof(pano_gpu_exposure_pair_ratio_shader)};
+    if (FAILED(device->CreateComputePipelineState(&pipeline_description, IID_PPV_ARGS(&pipeline))))
+    {
+        write_error(error_buffer, error_buffer_size,
+                    "cannot create resident reference exposure-pair pipeline");
+        return PANO_GPU_UNAVAILABLE;
+    }
+    D3D12_DESCRIPTOR_HEAP_DESC heap_description {};
+    heap_description.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap_description.NumDescriptors = 3;
+    heap_description.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+    if (FAILED(device->CreateDescriptorHeap(&heap_description, IID_PPV_ARGS(&heap))) ||
+        FAILED(device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
+        FAILED(device->CreateCommandList(
+            0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), pipeline.Get(),
+            IID_PPV_ARGS(&list))))
+    {
+        write_error(error_buffer, error_buffer_size,
+                    "cannot create resident reference exposure-pair dispatch");
+        return PANO_GPU_UNAVAILABLE;
+    }
+    const UINT count = static_cast<UINT>(session->resident_pair_sample_count);
+    const UINT increment =
+        device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto descriptor = heap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_SHADER_RESOURCE_VIEW_DESC luminance_srv {};
+    luminance_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    luminance_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    luminance_srv.Format = DXGI_FORMAT_UNKNOWN;
+    luminance_srv.Buffer.NumElements = count;
+    luminance_srv.Buffer.StructureByteStride = 2 * sizeof(float);
+    device->CreateShaderResourceView(
+        session->resident_pair_scratch[4].Get(), &luminance_srv, descriptor);
+    descriptor.ptr += increment;
+    D3D12_SHADER_RESOURCE_VIEW_DESC accepted_srv {};
+    accepted_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+    accepted_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    accepted_srv.Format = DXGI_FORMAT_R32_UINT;
+    accepted_srv.Buffer.NumElements = count;
+    device->CreateShaderResourceView(
+        session->resident_pair_scratch[1].Get(), &accepted_srv, descriptor);
+    descriptor.ptr += increment;
+    D3D12_UNORDERED_ACCESS_VIEW_DESC ratio_uav {};
+    ratio_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
+    ratio_uav.Format = DXGI_FORMAT_R32_FLOAT;
+    ratio_uav.Buffer.NumElements = count;
+    device->CreateUnorderedAccessView(
+        session->resident_pair_scratch[9].Get(), nullptr, &ratio_uav, descriptor);
+
+    std::array<D3D12_RESOURCE_BARRIER, 2> copy_transitions {};
+    copy_transitions[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    copy_transitions[0].Transition = {
+        session->resident_pair_scratch[5].Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_SOURCE};
+    copy_transitions[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    copy_transitions[1].Transition = {
+        session->resident_pair_scratch[1].Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_COPY_DEST};
+    list->ResourceBarrier(2, copy_transitions.data());
+    list->CopyResource(
+        session->resident_pair_scratch[1].Get(), session->resident_pair_scratch[5].Get());
+    for (auto &transition : copy_transitions)
+    {
+        transition.Transition.StateBefore = transition.Transition.StateAfter;
+        transition.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+    }
+    list->ResourceBarrier(2, copy_transitions.data());
+    D3D12_RESOURCE_BARRIER luminance_transition {};
+    luminance_transition.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    luminance_transition.Transition = {
+        session->resident_pair_scratch[4].Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+    list->ResourceBarrier(1, &luminance_transition);
+    const uint32_t constants[1] {count};
+    ID3D12DescriptorHeap *heaps[] {heap.Get()};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRootSignature(root.Get());
+    list->SetComputeRoot32BitConstants(0, 1, constants, 0);
+    list->SetComputeRootDescriptorTable(1, heap->GetGPUDescriptorHandleForHeapStart());
+    list->Dispatch((count + 63) / 64, 1, 1);
+    if (FAILED(list->Close()))
+    {
+        write_error(error_buffer, error_buffer_size,
+                    "cannot close resident reference exposure-pair dispatch");
+        return PANO_GPU_UNAVAILABLE;
+    }
+    ID3D12CommandList *lists[] {list.Get()};
+    session->device_core->queue->ExecuteCommandLists(1, lists);
+    const uint64_t fence_value =
+        session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (FAILED(session->device_core->queue->Signal(
+            session->device_core->fence.Get(), fence_value)) ||
+        wait_for_fence(
+            session->device_core.get(), fence_value, error_buffer, error_buffer_size,
+            "resident reference exposure-pair dispatch timed out") != PANO_GPU_SUCCESS)
+        return PANO_GPU_UNAVAILABLE;
+    session->resident_pair_ratios_ready = true;
+    return PANO_GPU_SUCCESS;
+#endif
+}
+
+static pano_gpu_result reduce_exposure_graph(
     pano_gpu_session *const session, const pano_gpu_exposure_pair_request *const request_template,
-    char *const error_buffer, const uint32_t error_buffer_size) noexcept
+    const bool filter_gradients, char *const error_buffer,
+    const uint32_t error_buffer_size) noexcept
 {
     if (session == nullptr || request_template == nullptr ||
         request_template->size != sizeof(*request_template) ||
@@ -1841,13 +2026,16 @@ pano_gpu_result pano_gpu_session_reduce_exposure_graph(
             if (result == PANO_GPU_SUCCESS)
                 result = pano_gpu_session_dispatch_exposure_pair_classification(
                     session, error_buffer, error_buffer_size);
-            if (result == PANO_GPU_SUCCESS)
+            if (result == PANO_GPU_SUCCESS && filter_gradients)
                 result = pano_gpu_session_dispatch_exposure_pair_gradient_limits(
                     session, request.sample_width, request.sample_height, error_buffer,
                     error_buffer_size);
             if (result == PANO_GPU_SUCCESS)
-                result = pano_gpu_session_dispatch_exposure_pair_filter_ratios(
-                    session, error_buffer, error_buffer_size);
+                result = filter_gradients
+                    ? pano_gpu_session_dispatch_exposure_pair_filter_ratios(
+                          session, error_buffer, error_buffer_size)
+                    : dispatch_reference_exposure_pair_ratios(
+                          session, error_buffer, error_buffer_size);
             if (result == PANO_GPU_SUCCESS)
                 result = pano_gpu_session_dispatch_exposure_pair_trim(
                     session, error_buffer, error_buffer_size);
@@ -1889,6 +2077,22 @@ pano_gpu_result pano_gpu_session_reduce_exposure_graph(
         write_error(error_buffer, error_buffer_size, "unexpected D3D12 exposure-graph reduction failure");
         return PANO_GPU_UNAVAILABLE;
     }
+}
+
+pano_gpu_result pano_gpu_session_reduce_exposure_graph(
+    pano_gpu_session *const session, const pano_gpu_exposure_pair_request *const request_template,
+    char *const error_buffer, const uint32_t error_buffer_size) noexcept
+{
+    return reduce_exposure_graph(
+        session, request_template, true, error_buffer, error_buffer_size);
+}
+
+pano_gpu_result pano_gpu_session_reduce_reference_exposure_graph(
+    pano_gpu_session *const session, const pano_gpu_exposure_pair_request *const request_template,
+    char *const error_buffer, const uint32_t error_buffer_size) noexcept
+{
+    return reduce_exposure_graph(
+        session, request_template, false, error_buffer, error_buffer_size);
 }
 
 pano_gpu_result pano_gpu_session_query_exposure_graph(
@@ -4805,6 +5009,688 @@ void pano_gpu_output_destroy(pano_gpu_output **const output) noexcept
     delete owned;
 }
 
+#if defined(_WIN32)
+static pano_gpu_result wait_surface_idle(
+    pano_gpu_preview_surface *const surface, char *const error_buffer,
+    const uint32_t error_buffer_size)
+{
+    const uint64_t fence =
+        surface->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (FAILED(surface->device_core->queue->Signal(
+            surface->device_core->fence.Get(), fence)))
+    {
+        write_error(error_buffer, error_buffer_size, "cannot signal preview surface fence");
+        return PANO_GPU_UNAVAILABLE;
+    }
+    return wait_for_fence(surface->device_core.get(), fence, error_buffer,
+                          error_buffer_size, "preview surface fence timed out");
+}
+
+static bool create_surface_back_buffers(pano_gpu_preview_surface *const surface)
+{
+    ID3D12Device *const device = surface->device_core->d3d_device.Get();
+    const UINT increment =
+        device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    auto handle = surface->rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    for (UINT index = 0; index < surface->buffers.size(); ++index)
+    {
+        if (FAILED(surface->swap_chain->GetBuffer(
+                index, IID_PPV_ARGS(&surface->buffers[index]))))
+            return false;
+        device->CreateRenderTargetView(surface->buffers[index].Get(), nullptr, handle);
+        handle.ptr += increment;
+    }
+    return true;
+}
+
+static bool create_surface_present_texture(pano_gpu_preview_surface *const surface)
+{
+    D3D12_HEAP_PROPERTIES heap {};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC description {};
+    description.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    description.Width = surface->width;
+    description.Height = surface->height;
+    description.DepthOrArraySize = 1;
+    description.MipLevels = 1;
+    description.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    description.SampleDesc.Count = 1;
+    description.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    return SUCCEEDED(surface->device_core->d3d_device->CreateCommittedResource(
+        &heap, D3D12_HEAP_FLAG_NONE, &description,
+        D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr,
+        IID_PPV_ARGS(&surface->present_texture)));
+}
+
+static void update_surface_device_lost(
+    pano_gpu_preview_surface *const surface) noexcept
+{
+    surface->device_lost =
+        FAILED(surface->device_core->d3d_device->GetDeviceRemovedReason());
+}
+#endif
+
+pano_gpu_result pano_gpu_preview_surface_create(
+    pano_gpu_device *const device,
+    const pano_gpu_preview_surface_create_options *const options,
+    pano_gpu_preview_surface **const surface, char *const error_buffer,
+    const uint32_t error_buffer_size) noexcept
+{
+    if (surface == nullptr)
+        return PANO_GPU_INVALID_ARGUMENT;
+    *surface = nullptr;
+    if (device == nullptr || !device->core || options == nullptr ||
+        options->size != sizeof(*options) ||
+        options->abi_version != PANO_GPU_ABI_VERSION ||
+        options->native_window == 0 || options->width == 0 || options->height == 0)
+    {
+        write_error(error_buffer, error_buffer_size, "invalid preview surface options");
+        return PANO_GPU_INVALID_ARGUMENT;
+    }
+#if !defined(_WIN32)
+    write_error(error_buffer, error_buffer_size, "D3D12 is available only on Windows");
+    return PANO_GPU_UNAVAILABLE;
+#else
+    const HWND window = reinterpret_cast<HWND>(
+        static_cast<uintptr_t>(options->native_window));
+    if (!IsWindow(window))
+    {
+        write_error(error_buffer, error_buffer_size, "preview surface window is invalid");
+        return PANO_GPU_INVALID_ARGUMENT;
+    }
+    pano_gpu_preview_surface *created = nullptr;
+    try
+    {
+        created = new pano_gpu_preview_surface;
+        created->device_core = device->core;
+        Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
+        if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory))))
+            throw std::runtime_error("cannot create preview DXGI factory");
+        DXGI_SWAP_CHAIN_DESC1 description {};
+        description.Width = options->width;
+        description.Height = options->height;
+        description.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        description.SampleDesc.Count = 1;
+        description.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+        description.BufferCount = 2;
+        description.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+        Microsoft::WRL::ComPtr<IDXGISwapChain1> swap_chain;
+        if (FAILED(factory->CreateSwapChainForHwnd(
+                device->core->queue.Get(), window, &description, nullptr,
+                nullptr, &swap_chain)) ||
+            FAILED(swap_chain.As(&created->swap_chain)))
+            throw std::runtime_error("cannot create preview swap chain");
+        factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER);
+        D3D12_DESCRIPTOR_HEAP_DESC heap {};
+        heap.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+        heap.NumDescriptors = 2;
+        if (FAILED(device->core->d3d_device->CreateDescriptorHeap(
+                &heap, IID_PPV_ARGS(&created->rtv_heap))) ||
+            !create_surface_back_buffers(created))
+            throw std::runtime_error("cannot create preview back buffers");
+        created->width = options->width;
+        created->height = options->height;
+        if (!create_surface_present_texture(created))
+            throw std::runtime_error("cannot create preview presentation texture");
+        live_preview_surface_count.fetch_add(1, std::memory_order_relaxed);
+        created->count_registered = true;
+        *surface = created;
+        return PANO_GPU_SUCCESS;
+    }
+    catch (const std::bad_alloc &)
+    {
+        delete created;
+        write_error(error_buffer, error_buffer_size, "cannot allocate preview surface");
+        return PANO_GPU_OUT_OF_MEMORY;
+    }
+    catch (...)
+    {
+        delete created;
+        write_error(error_buffer, error_buffer_size, "cannot create preview surface");
+        return PANO_GPU_UNAVAILABLE;
+    }
+#endif
+}
+
+pano_gpu_result pano_gpu_preview_surface_resize(
+    pano_gpu_preview_surface *const surface, const uint32_t width,
+    const uint32_t height, char *const error_buffer,
+    const uint32_t error_buffer_size) noexcept
+{
+    if (surface == nullptr)
+    {
+        write_error(error_buffer, error_buffer_size, "preview surface is null");
+        return PANO_GPU_INVALID_ARGUMENT;
+    }
+    if (width == 0 || height == 0)
+    {
+        surface->width = width;
+        surface->height = height;
+        surface->occluded = true;
+        return PANO_GPU_SUCCESS;
+    }
+#if !defined(_WIN32)
+    write_error(error_buffer, error_buffer_size, "D3D12 is available only on Windows");
+    return PANO_GPU_UNAVAILABLE;
+#else
+    if (surface->width == width && surface->height == height)
+        return PANO_GPU_SUCCESS;
+    if (wait_surface_idle(surface, error_buffer, error_buffer_size) != PANO_GPU_SUCCESS)
+        return PANO_GPU_UNAVAILABLE;
+    for (auto &buffer : surface->buffers)
+        buffer.Reset();
+    surface->present_texture.Reset();
+    if (FAILED(surface->swap_chain->ResizeBuffers(
+            2, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, 0)) ||
+        !create_surface_back_buffers(surface))
+    {
+        update_surface_device_lost(surface);
+        write_error(error_buffer, error_buffer_size, "cannot resize preview surface");
+        return PANO_GPU_UNAVAILABLE;
+    }
+    surface->width = width;
+    surface->height = height;
+    if (!create_surface_present_texture(surface))
+    {
+        write_error(error_buffer, error_buffer_size,
+                    "cannot resize preview presentation texture");
+        return PANO_GPU_UNAVAILABLE;
+    }
+    surface->occluded = false;
+    ++surface->resize_count;
+    return PANO_GPU_SUCCESS;
+#endif
+}
+
+pano_gpu_result pano_gpu_preview_surface_clear_present(
+    pano_gpu_preview_surface *const surface, const float rgba[4],
+    char *const error_buffer, const uint32_t error_buffer_size) noexcept
+{
+    if (surface == nullptr || rgba == nullptr)
+    {
+        write_error(error_buffer, error_buffer_size, "invalid preview clear request");
+        return PANO_GPU_INVALID_ARGUMENT;
+    }
+    if (surface->width == 0 || surface->height == 0)
+        return PANO_GPU_SUCCESS;
+#if !defined(_WIN32)
+    write_error(error_buffer, error_buffer_size, "D3D12 is available only on Windows");
+    return PANO_GPU_UNAVAILABLE;
+#else
+    ID3D12Device *const device = surface->device_core->d3d_device.Get();
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+    if (FAILED(device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
+        FAILED(device->CreateCommandList(
+            0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+            IID_PPV_ARGS(&list))))
+    {
+        write_error(error_buffer, error_buffer_size, "cannot create preview clear commands");
+        return PANO_GPU_UNAVAILABLE;
+    }
+    const UINT index = surface->swap_chain->GetCurrentBackBufferIndex();
+    D3D12_RESOURCE_BARRIER barrier {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition = {surface->buffers[index].Get(),
+                          D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_PRESENT,
+                          D3D12_RESOURCE_STATE_RENDER_TARGET};
+    list->ResourceBarrier(1, &barrier);
+    auto rtv = surface->rtv_heap->GetCPUDescriptorHandleForHeapStart();
+    rtv.ptr += static_cast<SIZE_T>(index) *
+               device->GetDescriptorHandleIncrementSize(
+                   D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+    list->ClearRenderTargetView(rtv, rgba, 0, nullptr);
+    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    list->ResourceBarrier(1, &barrier);
+    if (FAILED(list->Close()))
+    {
+        write_error(error_buffer, error_buffer_size, "cannot close preview clear commands");
+        return PANO_GPU_UNAVAILABLE;
+    }
+    ID3D12CommandList *lists[] {list.Get()};
+    surface->device_core->queue->ExecuteCommandLists(1, lists);
+    if (wait_surface_idle(surface, error_buffer, error_buffer_size) != PANO_GPU_SUCCESS)
+        return PANO_GPU_UNAVAILABLE;
+    const HRESULT presented = surface->swap_chain->Present(0, 0);
+    if (FAILED(presented))
+    {
+        update_surface_device_lost(surface);
+        write_error(error_buffer, error_buffer_size, "cannot present preview surface");
+        return PANO_GPU_UNAVAILABLE;
+    }
+    surface->occluded = presented == DXGI_STATUS_OCCLUDED;
+    ++surface->present_count;
+    return PANO_GPU_SUCCESS;
+#endif
+}
+
+pano_gpu_result pano_gpu_preview_surface_present_base(
+    pano_gpu_preview_surface *const surface, pano_gpu_preview *const preview,
+    const pano_gpu_preview_surface_present_request *const request,
+    char *const error_buffer, const uint32_t error_buffer_size) noexcept
+{
+    if (surface == nullptr || preview == nullptr || request == nullptr ||
+        request->size != sizeof(*request) ||
+        request->abi_version != PANO_GPU_ABI_VERSION || request->use_overview > 1 ||
+        surface->device_core.get() != preview->session->device_core.get() ||
+        (request->use_overview != 0 &&
+         (request->crop_left != 0 || request->crop_top != 0 ||
+          request->crop_width != 0 || request->crop_height != 0)) ||
+        (request->use_overview == 0 &&
+         (request->crop_width == 0 || request->crop_height == 0 ||
+          request->crop_width > preview->preview_width ||
+          request->crop_height > preview->preview_height ||
+          request->crop_left > preview->preview_width - request->crop_width ||
+          request->crop_top > preview->preview_height - request->crop_height)))
+    {
+        write_error(error_buffer, error_buffer_size,
+                    "invalid preview surface presentation request");
+        return PANO_GPU_INVALID_ARGUMENT;
+    }
+    if (surface->width == 0 || surface->height == 0)
+        return PANO_GPU_SUCCESS;
+    bool expected = false;
+    if (!surface->presenting.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel))
+    {
+        write_error(error_buffer, error_buffer_size,
+                    "concurrent preview surface presentation is rejected");
+        return PANO_GPU_UNAVAILABLE;
+    }
+    struct PresentRelease
+    {
+        std::atomic<bool> &presenting;
+        ~PresentRelease() { presenting.store(false, std::memory_order_release); }
+    } release {surface->presenting};
+#if defined(PANO_GPU_TEST_HOOKS)
+    if (fail_next_preview_surface_device_removed.exchange(
+            false, std::memory_order_relaxed))
+    {
+        surface->device_lost = true;
+        write_error(error_buffer, error_buffer_size,
+                    "preview surface device was removed");
+        return PANO_GPU_UNAVAILABLE;
+    }
+#endif
+#if !defined(_WIN32)
+    write_error(error_buffer, error_buffer_size, "D3D12 is available only on Windows");
+    return PANO_GPU_UNAVAILABLE;
+#else
+    ID3D12Device *const device = surface->device_core->d3d_device.Get();
+    D3D12_DESCRIPTOR_RANGE ranges[2] {
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 2}};
+    D3D12_ROOT_PARAMETER parameters[2] {};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants = {0, 0, 10};
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[1].DescriptorTable = {2, ranges};
+    const D3D12_ROOT_SIGNATURE_DESC root_description {
+        2, parameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    Microsoft::WRL::ComPtr<ID3DBlob> serialized, errors;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
+    if (FAILED(D3D12SerializeRootSignature(
+            &root_description, D3D_ROOT_SIGNATURE_VERSION_1_0,
+            &serialized, &errors)) ||
+        FAILED(device->CreateRootSignature(
+            0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+            IID_PPV_ARGS(&root))))
+    {
+        write_error(error_buffer, error_buffer_size,
+                    "cannot create preview presentation root signature");
+        return PANO_GPU_UNAVAILABLE;
+    }
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_description {};
+    pipeline_description.pRootSignature = root.Get();
+    pipeline_description.CS = {pano_gpu_preview_present_shader,
+                               sizeof(pano_gpu_preview_present_shader)};
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline;
+    D3D12_DESCRIPTOR_HEAP_DESC heap_description {};
+    heap_description.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap_description.NumDescriptors = 3;
+    heap_description.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+    if (FAILED(device->CreateComputePipelineState(
+            &pipeline_description, IID_PPV_ARGS(&pipeline))) ||
+        FAILED(device->CreateDescriptorHeap(
+            &heap_description, IID_PPV_ARGS(&heap))) ||
+        FAILED(device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
+        FAILED(device->CreateCommandList(
+            0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), pipeline.Get(),
+            IID_PPV_ARGS(&list))))
+    {
+        write_error(error_buffer, error_buffer_size,
+                    "cannot create preview presentation pipeline");
+        return PANO_GPU_UNAVAILABLE;
+    }
+    const UINT increment = device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto descriptor = heap->GetCPUDescriptorHandleForHeapStart();
+    const auto make_srv = [&](ID3D12Resource *const resource,
+                              const uint64_t bytes) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv {};
+        srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Format = DXGI_FORMAT_R8_UINT;
+        srv.Buffer.NumElements = static_cast<UINT>(bytes);
+        device->CreateShaderResourceView(resource, &srv, descriptor);
+        descriptor.ptr += increment;
+    };
+    make_srv(preview->preview_rgb8.Get(), preview->preview_rgb8_bytes);
+    make_srv(preview->overview_rgb8.Get(), preview->overview_rgb8_bytes);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav {};
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    device->CreateUnorderedAccessView(surface->present_texture.Get(), nullptr,
+                                      &uav, descriptor);
+    const uint32_t constants[10] {
+        preview->preview_width, preview->overview_width,
+        preview->overview_height, surface->width, surface->height,
+        request->crop_left, request->crop_top, request->crop_width,
+        request->crop_height, request->use_overview};
+    ID3D12DescriptorHeap *heaps[] {heap.Get()};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRootSignature(root.Get());
+    list->SetComputeRoot32BitConstants(0, 10, constants, 0);
+    list->SetComputeRootDescriptorTable(
+        1, heap->GetGPUDescriptorHandleForHeapStart());
+    list->Dispatch((surface->width + 7U) / 8U,
+                   (surface->height + 7U) / 8U, 1);
+    const UINT index = surface->swap_chain->GetCurrentBackBufferIndex();
+    D3D12_RESOURCE_BARRIER barriers[2] {};
+    for (auto &barrier : barriers)
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[0].Transition = {surface->present_texture.Get(),
+                              D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                              D3D12_RESOURCE_STATE_COPY_SOURCE};
+    barriers[1].Transition = {surface->buffers[index].Get(),
+                              D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_PRESENT,
+                              D3D12_RESOURCE_STATE_COPY_DEST};
+    list->ResourceBarrier(2, barriers);
+    list->CopyResource(surface->buffers[index].Get(),
+                       surface->present_texture.Get());
+    for (auto &barrier : barriers)
+        std::swap(barrier.Transition.StateBefore,
+                  barrier.Transition.StateAfter);
+    list->ResourceBarrier(2, barriers);
+    if (FAILED(list->Close()))
+    {
+        write_error(error_buffer, error_buffer_size,
+                    "cannot close preview presentation commands");
+        return PANO_GPU_UNAVAILABLE;
+    }
+    ID3D12CommandList *lists[] {list.Get()};
+    surface->device_core->queue->ExecuteCommandLists(1, lists);
+    if (wait_surface_idle(surface, error_buffer, error_buffer_size) !=
+        PANO_GPU_SUCCESS)
+        return PANO_GPU_UNAVAILABLE;
+    const HRESULT presented = surface->swap_chain->Present(0, 0);
+    if (FAILED(presented))
+    {
+        update_surface_device_lost(surface);
+        write_error(error_buffer, error_buffer_size,
+                    "cannot present retained preview surface");
+        return PANO_GPU_UNAVAILABLE;
+    }
+    surface->occluded = presented == DXGI_STATUS_OCCLUDED;
+    ++surface->present_count;
+    return PANO_GPU_SUCCESS;
+#endif
+}
+
+pano_gpu_result pano_gpu_preview_surface_present_overlay(
+    pano_gpu_preview_surface *const surface, pano_gpu_preview *const preview,
+    const pano_gpu_preview_surface_overlay_request *const request,
+    char *const error_buffer, const uint32_t error_buffer_size) noexcept
+{
+    if (surface == nullptr || preview == nullptr || request == nullptr ||
+        request->size != sizeof(*request) ||
+        request->abi_version != PANO_GPU_ABI_VERSION || request->use_overview > 1 ||
+        request->target_mode > 1 || request->show_boundaries > 1 ||
+        request->hovered_frames == nullptr ||
+        request->hovered_frame_bytes != preview->frame_count ||
+        request->target_pose < -1 ||
+        request->target_pose >= static_cast<int32_t>(preview->frame_count) ||
+        surface->device_core.get() != preview->session->device_core.get() ||
+        (request->use_overview != 0 &&
+         (request->crop_left != 0 || request->crop_top != 0 ||
+          request->crop_width != 0 || request->crop_height != 0)) ||
+        (request->use_overview == 0 &&
+         (request->crop_width == 0 || request->crop_height == 0 ||
+          request->crop_width > preview->preview_width ||
+          request->crop_height > preview->preview_height ||
+          request->crop_left > preview->preview_width - request->crop_width ||
+          request->crop_top > preview->preview_height - request->crop_height)))
+    {
+        write_error(error_buffer, error_buffer_size,
+                    "invalid preview surface overlay request");
+        return PANO_GPU_INVALID_ARGUMENT;
+    }
+    if (surface->width == 0 || surface->height == 0)
+        return PANO_GPU_SUCCESS;
+    bool expected = false;
+    if (!preview->rendering.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel))
+    {
+        write_error(error_buffer, error_buffer_size,
+                    "concurrent preview rendering is rejected");
+        return PANO_GPU_INVALID_ARGUMENT;
+    }
+    struct PreviewRelease
+    {
+        std::atomic<bool> &value;
+        ~PreviewRelease() { value.store(false, std::memory_order_release); }
+    } preview_release {preview->rendering};
+    expected = false;
+    if (!surface->presenting.compare_exchange_strong(
+            expected, true, std::memory_order_acq_rel))
+    {
+        write_error(error_buffer, error_buffer_size,
+                    "concurrent preview surface presentation is rejected");
+        return PANO_GPU_UNAVAILABLE;
+    }
+    PreviewRelease surface_release {surface->presenting};
+#if !defined(_WIN32)
+    write_error(error_buffer, error_buffer_size, "D3D12 is available only on Windows");
+    return PANO_GPU_UNAVAILABLE;
+#else
+    ID3D12Device *const device = surface->device_core->d3d_device.Get();
+    if (!preview->hovered_upload)
+    {
+        D3D12_HEAP_PROPERTIES upload_heap {}, default_heap {};
+        upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC description {};
+        description.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        description.Width = preview->frame_count;
+        description.Height = 1;
+        description.DepthOrArraySize = 1;
+        description.MipLevels = 1;
+        description.SampleDesc.Count = 1;
+        description.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (FAILED(device->CreateCommittedResource(
+                &upload_heap, D3D12_HEAP_FLAG_NONE, &description,
+                D3D12_RESOURCE_STATE_GENERIC_READ, nullptr,
+                IID_PPV_ARGS(&preview->hovered_upload))) ||
+            FAILED(device->CreateCommittedResource(
+                &default_heap, D3D12_HEAP_FLAG_NONE, &description,
+                D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                IID_PPV_ARGS(&preview->hovered_frames))))
+            return PANO_GPU_UNAVAILABLE;
+    }
+    void *mapped = nullptr;
+    if (FAILED(preview->hovered_upload->Map(0, nullptr, &mapped)))
+        return PANO_GPU_UNAVAILABLE;
+    std::memcpy(mapped, request->hovered_frames, preview->frame_count);
+    preview->hovered_upload->Unmap(0, nullptr);
+    D3D12_DESCRIPTOR_RANGE ranges[2] {
+        {D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, 0},
+        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 4}};
+    D3D12_ROOT_PARAMETER parameters[2] {};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants = {0, 0, 17};
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[1].DescriptorTable = {2, ranges};
+    const D3D12_ROOT_SIGNATURE_DESC root_description {
+        2, parameters, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+    Microsoft::WRL::ComPtr<ID3DBlob> serialized, errors;
+    Microsoft::WRL::ComPtr<ID3D12RootSignature> root;
+    D3D12_COMPUTE_PIPELINE_STATE_DESC pipeline_description {};
+    Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline;
+    D3D12_DESCRIPTOR_HEAP_DESC heap_description {};
+    heap_description.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+    heap_description.NumDescriptors = 5;
+    heap_description.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+    Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+    if (FAILED(D3D12SerializeRootSignature(
+            &root_description, D3D_ROOT_SIGNATURE_VERSION_1_0,
+            &serialized, &errors)) ||
+        FAILED(device->CreateRootSignature(
+            0, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+            IID_PPV_ARGS(&root))))
+        return PANO_GPU_UNAVAILABLE;
+    pipeline_description.pRootSignature = root.Get();
+    pipeline_description.CS = {pano_gpu_preview_present_overlay_shader,
+                               sizeof(pano_gpu_preview_present_overlay_shader)};
+    if (FAILED(device->CreateComputePipelineState(
+            &pipeline_description, IID_PPV_ARGS(&pipeline))) ||
+        FAILED(device->CreateDescriptorHeap(
+            &heap_description, IID_PPV_ARGS(&heap))) ||
+        FAILED(device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
+        FAILED(device->CreateCommandList(
+            0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), pipeline.Get(),
+            IID_PPV_ARGS(&list))))
+        return PANO_GPU_UNAVAILABLE;
+    if (preview->hovered_frames_ready)
+    {
+        D3D12_RESOURCE_BARRIER writable {};
+        writable.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        writable.Transition = {preview->hovered_frames.Get(),
+                               D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                               D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                               D3D12_RESOURCE_STATE_COPY_DEST};
+        list->ResourceBarrier(1, &writable);
+    }
+    list->CopyResource(preview->hovered_frames.Get(),
+                       preview->hovered_upload.Get());
+    D3D12_RESOURCE_BARRIER readable {};
+    readable.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    readable.Transition = {preview->hovered_frames.Get(),
+                           D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                           D3D12_RESOURCE_STATE_COPY_DEST,
+                           D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+    list->ResourceBarrier(1, &readable);
+    const UINT increment = device->GetDescriptorHandleIncrementSize(
+        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+    auto descriptor = heap->GetCPUDescriptorHandleForHeapStart();
+    const auto make_srv = [&](ID3D12Resource *const resource,
+                              const uint64_t bytes) {
+        D3D12_SHADER_RESOURCE_VIEW_DESC srv {};
+        srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        srv.Format = DXGI_FORMAT_R8_UINT;
+        srv.Buffer.NumElements = static_cast<UINT>(bytes);
+        device->CreateShaderResourceView(resource, &srv, descriptor);
+        descriptor.ptr += increment;
+    };
+    make_srv(preview->preview_rgb8.Get(), preview->preview_rgb8_bytes);
+    make_srv(preview->overview_rgb8.Get(), preview->overview_rgb8_bytes);
+    make_srv(preview->compact_masks.Get(), preview->compact_mask_bytes);
+    make_srv(preview->hovered_frames.Get(), preview->frame_count);
+    D3D12_UNORDERED_ACCESS_VIEW_DESC uav {};
+    uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+    uav.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    device->CreateUnorderedAccessView(surface->present_texture.Get(), nullptr,
+                                      &uav, descriptor);
+    const uint32_t constants[17] {
+        preview->preview_width, preview->preview_height,
+        preview->overview_width, preview->overview_height,
+        preview->mask_width, preview->mask_height, surface->width,
+        surface->height, request->crop_left, request->crop_top,
+        request->crop_width, request->crop_height, preview->frame_count,
+        static_cast<uint32_t>(request->target_pose), request->target_mode,
+        request->show_boundaries, request->use_overview};
+    ID3D12DescriptorHeap *heaps[] {heap.Get()};
+    list->SetDescriptorHeaps(1, heaps);
+    list->SetComputeRootSignature(root.Get());
+    list->SetComputeRoot32BitConstants(0, 17, constants, 0);
+    list->SetComputeRootDescriptorTable(
+        1, heap->GetGPUDescriptorHandleForHeapStart());
+    list->Dispatch((surface->width + 7U) / 8U,
+                   (surface->height + 7U) / 8U, 1);
+    const UINT index = surface->swap_chain->GetCurrentBackBufferIndex();
+    D3D12_RESOURCE_BARRIER barriers[2] {};
+    for (auto &barrier : barriers)
+        barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[0].Transition = {surface->present_texture.Get(),
+                              D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                              D3D12_RESOURCE_STATE_COPY_SOURCE};
+    barriers[1].Transition = {surface->buffers[index].Get(),
+                              D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                              D3D12_RESOURCE_STATE_PRESENT,
+                              D3D12_RESOURCE_STATE_COPY_DEST};
+    list->ResourceBarrier(2, barriers);
+    list->CopyResource(surface->buffers[index].Get(),
+                       surface->present_texture.Get());
+    for (auto &barrier : barriers)
+        std::swap(barrier.Transition.StateBefore,
+                  barrier.Transition.StateAfter);
+    list->ResourceBarrier(2, barriers);
+    if (FAILED(list->Close()))
+        return PANO_GPU_UNAVAILABLE;
+    ID3D12CommandList *lists[] {list.Get()};
+    surface->device_core->queue->ExecuteCommandLists(1, lists);
+    if (wait_surface_idle(surface, error_buffer, error_buffer_size) !=
+        PANO_GPU_SUCCESS)
+        return PANO_GPU_UNAVAILABLE;
+    preview->hovered_frames_ready = true;
+    const HRESULT presented = surface->swap_chain->Present(0, 0);
+    if (FAILED(presented))
+    {
+        update_surface_device_lost(surface);
+        return PANO_GPU_UNAVAILABLE;
+    }
+    surface->occluded = presented == DXGI_STATUS_OCCLUDED;
+    ++surface->present_count;
+    return PANO_GPU_SUCCESS;
+#endif
+}
+
+pano_gpu_result pano_gpu_preview_surface_query_diagnostics(
+    const pano_gpu_preview_surface *const surface,
+    pano_gpu_preview_surface_diagnostics *const diagnostics,
+    char *const error_buffer, const uint32_t error_buffer_size) noexcept
+{
+    if (surface == nullptr || diagnostics == nullptr ||
+        diagnostics->size != sizeof(*diagnostics) ||
+        diagnostics->abi_version != PANO_GPU_ABI_VERSION)
+    {
+        write_error(error_buffer, error_buffer_size, "invalid preview surface diagnostics");
+        return PANO_GPU_INVALID_ARGUMENT;
+    }
+    diagnostics->width = surface->width;
+    diagnostics->height = surface->height;
+    diagnostics->present_count = surface->present_count;
+    diagnostics->resize_count = surface->resize_count;
+    diagnostics->occluded = surface->occluded ? 1U : 0U;
+    diagnostics->live_surface_count =
+        live_preview_surface_count.load(std::memory_order_relaxed);
+    diagnostics->device_lost = surface->device_lost ? 1U : 0U;
+    diagnostics->reserved = 0;
+    return PANO_GPU_SUCCESS;
+}
+
 pano_gpu_result pano_gpu_preview_create(
     pano_gpu_session *const session, const pano_gpu_preview_create_options *const options,
     pano_gpu_preview **const preview, char *const error_buffer,
@@ -5418,7 +6304,108 @@ void pano_gpu_preview_destroy(pano_gpu_preview **const preview) noexcept
     delete owned;
 }
 
+void pano_gpu_preview_surface_destroy(
+    pano_gpu_preview_surface **const surface) noexcept
+{
+    if (surface == nullptr)
+        return;
+    pano_gpu_preview_surface *const owned = *surface;
+    *surface = nullptr;
+    delete owned;
+}
+
 #if defined(PANO_GPU_TEST_HOOKS)
+void pano_gpu_test_fail_next_preview_surface_device_removed(void) noexcept
+{
+    fail_next_preview_surface_device_removed.store(true,
+                                                    std::memory_order_relaxed);
+}
+
+ pano_gpu_result pano_gpu_test_read_preview_surface(
+    pano_gpu_preview_surface *const surface, uint8_t *const rgba8,
+    const uint64_t rgba8_bytes, char *const error_buffer,
+    const uint32_t error_buffer_size) noexcept
+{
+    uint64_t expected = 0;
+    if (surface == nullptr || rgba8 == nullptr ||
+        !checked_multiply(surface->width, surface->height, &expected) ||
+        !checked_multiply(expected, 4, &expected) || rgba8_bytes != expected)
+    {
+        write_error(error_buffer, error_buffer_size,
+                    "invalid preview surface readback request");
+        return PANO_GPU_INVALID_ARGUMENT;
+    }
+#if !defined(_WIN32)
+    write_error(error_buffer, error_buffer_size, "D3D12 is available only on Windows");
+    return PANO_GPU_UNAVAILABLE;
+#else
+    ID3D12Device *const device = surface->device_core->d3d_device.Get();
+    const auto texture = surface->present_texture->GetDesc();
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint {};
+    UINT64 total_bytes = 0;
+    device->GetCopyableFootprints(&texture, 0, 1, 0, &footprint, nullptr,
+                                  nullptr, &total_bytes);
+    D3D12_HEAP_PROPERTIES heap {};
+    heap.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC buffer {};
+    buffer.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    buffer.Width = total_bytes;
+    buffer.Height = 1;
+    buffer.DepthOrArraySize = 1;
+    buffer.MipLevels = 1;
+    buffer.SampleDesc.Count = 1;
+    buffer.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
+    Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
+    if (FAILED(device->CreateCommittedResource(
+            &heap, D3D12_HEAP_FLAG_NONE, &buffer,
+            D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+            IID_PPV_ARGS(&readback))) ||
+        FAILED(device->CreateCommandAllocator(
+            D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
+        FAILED(device->CreateCommandList(
+            0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
+            IID_PPV_ARGS(&list))))
+        return PANO_GPU_UNAVAILABLE;
+    D3D12_RESOURCE_BARRIER barrier {};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition = {surface->present_texture.Get(),
+                          D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                          D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                          D3D12_RESOURCE_STATE_COPY_SOURCE};
+    list->ResourceBarrier(1, &barrier);
+    D3D12_TEXTURE_COPY_LOCATION destination {};
+    destination.pResource = readback.Get();
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    destination.PlacedFootprint = footprint;
+    D3D12_TEXTURE_COPY_LOCATION source {};
+    source.pResource = surface->present_texture.Get();
+    source.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    list->CopyTextureRegion(&destination, 0, 0, 0, &source, nullptr);
+    std::swap(barrier.Transition.StateBefore, barrier.Transition.StateAfter);
+    list->ResourceBarrier(1, &barrier);
+    if (FAILED(list->Close()))
+        return PANO_GPU_UNAVAILABLE;
+    ID3D12CommandList *lists[] {list.Get()};
+    surface->device_core->queue->ExecuteCommandLists(1, lists);
+    if (wait_surface_idle(surface, error_buffer, error_buffer_size) !=
+        PANO_GPU_SUCCESS)
+        return PANO_GPU_UNAVAILABLE;
+    void *mapped = nullptr;
+    const D3D12_RANGE range {0, static_cast<SIZE_T>(total_bytes)};
+    if (FAILED(readback->Map(0, &range, &mapped)))
+        return PANO_GPU_UNAVAILABLE;
+    for (uint32_t row = 0; row < surface->height; ++row)
+        std::memcpy(rgba8 + static_cast<size_t>(row) * surface->width * 4,
+                    static_cast<const uint8_t *>(mapped) +
+                        static_cast<size_t>(row) * footprint.Footprint.RowPitch,
+                    static_cast<size_t>(surface->width) * 4);
+    readback->Unmap(0, nullptr);
+    return PANO_GPU_SUCCESS;
+#endif
+}
+
 void pano_gpu_test_fail_next_allocation(void) noexcept
 {
     fail_next_allocation.store(true, std::memory_order_relaxed);

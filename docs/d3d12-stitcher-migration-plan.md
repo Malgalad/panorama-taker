@@ -2021,178 +2021,527 @@ destabilize the D3D12 cutover.
 Use the following continuation only after increment 16 is accepted. Keep the transitional Python
 release usable until the final native gate.
 
+For Steps 17–22, each three-part heading such as 17a.1 is one implementation unit. Review,
+implement, test, and record that leaf before starting the next. Lettered headings group related
+work only; they are not single implementation tasks. Where a lettered section has no three-part
+children, the lettered section itself is the implementation unit.
+
 ### 17. Freeze application-level contracts
+
+Step 17 creates the Python reference contract used to judge the native application. Fixtures must
+assert structured values and semantic error categories, not complete human-readable messages. Do
+not change product behavior while freezing it.
 
 #### 17a. Freeze metadata and session-management behavior
 
-- Add fixtures for metadata validation, path inference, discovery/history, and moved/incomplete
-  sessions.
+##### 17a.1. Add shared-schema metadata fixtures (complete)
 
-Gate: the existing Python loaders pass valid/invalid fixture expectations unchanged.
+- Add minimal valid horizontal/full-sphere sessions and invalid root, required-field, range,
+  encoding, and frame cases.
+- Record the loaded fields or semantic validation category for each fixture.
+
+Gate: the current schema loader passes the fixture table without production changes.
+
+##### 17a.2. Add CET metadata fixtures (complete)
+
+- Add completed, active, aborted, failed, malformed-state, empty-pose, and rotated-origin cases.
+- Freeze CET-to-canonical basis conversion and the current explicit PQ/Rec.2020 encoding result.
+
+Gate: CET fixtures load or fail in the expected semantic category.
+
+##### 17a.3. Freeze path inference and moved-session behavior (complete)
+
+- Cover an existing recorded path, an explicit image-directory basename match, a metadata-sibling
+  match, and basename-only fallback, including Unicode and Windows-style paths.
+
+Gate: path precedence and returned path spelling match current Python behavior.
+
+##### 17a.4. Freeze discovery and history behavior (complete)
+
+- Cover missing mod directory, reverse filename ordering, valid/incomplete/malformed rows, local
+  dates, duplicate image paths, history keys, and stitched output names.
+
+Gate: discovery returns the same ordered records and preserves malformed sessions as error rows.
+
+##### 17a.5. Freeze deletion-target decisions without deleting fixtures (complete)
+
+- Cover JSON-only versus JSON-plus-images target selection, deduplication, missing files, and the
+  distinction between incomplete and completed rows.
+
+Gate: target and result fixtures pass using temporary copies only.
 
 #### 17b. Freeze render-option and output behavior
 
-- Add fixtures for defaults, output naming, overwrite decisions, exposure edits, settings, CLI help,
-  and representative semantic error categories.
+##### 17b.1. Freeze CLI and GUI option defaults (complete)
 
-Gate: CLI and application helpers pass without byte-for-byte message coupling.
+- Record defaults for width, format, quality, blend, memory budget, incomplete sessions, exposure,
+  thumbnail, coverage, backend strictness, and runtime verification.
 
-#### 17c. Extract a headless application-core interface
+Gate: CLI parsing and GUI-independent default helpers match their recorded frontend-specific
+fixtures; intentional CLI/GUI differences remain explicit.
 
-- Move one state transition at a time behind a Tk-independent interface, starting with validation,
-  then planning, then render/cancel/history updates.
-- Keep Tk as the only caller until each transition has contract coverage.
+##### 17b.2. Freeze option validation and semantic error categories (complete)
 
-Gate: Tk tests and new headless tests pass after every moved transition; no widget dependency enters
-the application core.
+- Cover ranges, mutually exclusive choices, format-specific options, missing sessions/images,
+  unavailable GPU, cancellation, and post-dispatch failure without exact message matching.
+
+Gate: each invalid request maps to one stable category and no output is opened.
+
+##### 17b.3. Freeze output naming and overwrite decisions (complete)
+
+- Cover default suffixes, session-derived names, thumbnail/coverage companions, edited names,
+  existing destinations, and same-directory stage names.
+
+Gate: pure naming/decision fixtures pass without touching existing user output.
+
+##### 17b.4. Freeze exposure-edit state transitions (complete)
+
+- Cover automatic correction, target selection, manual match, discard/reset, warning state, and
+  preview-to-full reuse using deterministic gain/report values.
+
+Gate: state snapshots match after each edit sequence without rendering large images.
+
+##### 17b.5. Freeze settings and history persistence (complete)
+
+- Cover absent, valid, partial, malformed, and legacy settings plus stitched-history updates.
+- Use temporary files and compare normalized values rather than serialized key order.
+
+Gate: load/save round trips preserve current defaults and compatibility behavior.
+
+##### 17b.6. Freeze command help and exit categories (complete)
+
+- Snapshot option names, command structure, version output, and success/unavailable/failure exit
+  categories while allowing prose and wrapping to evolve.
+
+Gate: CLI tests assert parsed structure and required help tokens, not byte-for-byte output.
+
+#### 17c. Extract a Python headless reference interface
+
+This is a Python reference boundary, not the future C++ implementation. It remains the parity
+oracle until Step 22 and must not import Tk, PIL ImageTk, or widget types.
+
+##### 17c.1. Define immutable headless request, result, and error-category types (complete)
+
+- Introduce only the fields already consumed by application workflows; keep render implementation
+  objects behind the existing compositor boundary.
+
+Gate: import tests prove the module loads without Tk and type checks pass.
+
+##### 17c.2. Move session validation behind the headless interface (complete)
+
+- Adapt existing load/path/image validation calls without changing their order or exceptions.
+
+Gate: 17a fixtures and existing Tk tests pass with Tk as the sole production caller.
+
+##### 17c.3. Move render-request planning behind the headless interface (complete)
+
+- Produce normalized options, output paths, overwrite requirements, and backend admission intent;
+  do not start decoding or rendering.
+
+Gate: 17b option/output fixtures match before and after extraction.
+
+##### 17c.4. Move render and cancellation transitions behind the interface (complete)
+
+- Represent start, progress, cancellation request, success, cancelled, and failure as headless
+  state/events while retaining existing worker-thread ownership.
+
+Gate: deterministic fake-render tests and existing GUI lifecycle tests pass.
+
+##### 17c.5. Move history/settings updates behind the interface (complete)
+
+- Apply successful-render history and settings transitions without file dialogs or widgets.
+
+Gate: persistence fixtures and Tk behavior pass; no Tk import enters the headless module.
 
 ### 18. Add a native command-line host
 
-#### 18a. Add an executable with version/help only
+The native host consists of a widget-free C++ application library plus a thin executable. It uses
+the existing versioned `pano_gpu` C ABI; do not fold application policy into `pano_gpu`.
 
-- Build a native executable over the core with stable exit-code categories and no render command.
+#### 18a. Establish the native application targets
 
-Gate: CTest covers help, version, unknown options, Unicode paths, and clean startup/shutdown.
+##### 18a.1. Add an empty native application-core library (complete)
 
-#### 18b. Port render-option parsing
+- Add a C++ target with explicit result/error-category types and no Windows UI dependency.
 
-- Add one option group at a time and translate it into a plain native render-plan request.
+Gate: portable Release builds/tests prove construction and destruction without a GPU.
 
-Gate: defaults, conflicts, ranges, and semantic errors match the frozen Python fixtures.
+##### 18a.2. Add the native executable with version only (complete)
+
+- Link the application core and print the product/version without loading images or creating a
+  D3D12 device.
+
+Gate: CTest covers version and clean startup/shutdown.
+
+##### 18a.3. Add help and command dispatch (complete)
+
+- Add help, unknown-command handling, stable exit categories, and UTF-16 Windows argument
+  conversion; still provide no render command.
+
+Gate: CTest covers help, unknown options, Unicode arguments, and clean teardown.
+
+#### 18b. Port render-option parsing one group at a time
+
+##### 18b.1. Add session/output path and size options (complete)
+
+Gate: defaults, required values, Unicode paths, and numeric ranges match 17b fixtures.
+
+##### 18b.2. Add format, quality, blend, thumbnail, and coverage options (complete)
+
+Gate: format-specific conflicts and normalized values match 17b fixtures.
+
+##### 18b.3. Add memory, backend, and incomplete-session options (complete)
+
+Gate: ranges, defaults, strictness, and admission intent match 17b fixtures.
+
+##### 18b.4. Add exposure options (complete)
+
+Gate: automatic/manual/target conflicts and normalized values match 17b fixtures.
 
 #### 18c. Port session JSON parsing and validation
 
-- Parse schema fields, then paths, then frames/encodings while preserving the current schema and
-  compatibility decisions.
+##### 18c.1. Select the JSON implementation (complete)
 
-Gate: every valid/invalid metadata fixture matches Python validation results and inferred paths.
+- Compare viable small native implementations for UTF-8 correctness, numeric validation, license,
+  archive cost, diagnostics, and MSVC/portable builds before adding a production dependency.
+
+Gate: record one decision and pass a standalone valid/invalid/Unicode probe.
+
+##### 18c.2. Parse the shared-session root and scalar fields (complete)
+
+Gate: root/type/required-field/range cases match 17a semantic categories.
+
+##### 18c.3. Parse frames, matrices, and image encoding (complete)
+
+Gate: frame and encoding fixtures produce field-for-field native/Python values.
+
+##### 18c.4. Parse CET sessions and canonicalize camera bases (complete)
+
+Gate: completed/incomplete/error states and basis fixtures match Python tolerances.
+
+##### 18c.5. Port path inference (complete)
+
+Gate: existing, moved, sibling, basename, Unicode, and Windows-style cases match 17a.
 
 #### 18d. Produce native validation and render plans
 
-- Connect parsed sessions/options to the native core without decoding or encoding images yet.
+##### 18d.1. Produce validated session summaries (complete)
 
-Gate: native and Python validation/render plans match fixture-by-fixture. The executable is still
-not a shipped renderer.
+- Return normalized session identity, completeness, encoding, frames, and source paths without
+  opening image files.
 
-### 19. Port codecs and staged output ownership
+Gate: summaries match the frozen Python reference fixture-by-fixture.
+
+##### 18d.2. Produce output and overwrite plans (complete)
+
+Gate: names, companions, stages, and overwrite requirements match 17b.
+
+##### 18d.3. Produce backend-neutral render plans (complete)
+
+- Combine validated metadata/options into plain dimensions, projection, blend, exposure, memory,
+  and output requests without decoding, encoding, or dispatch.
+
+Gate: native/Python plan snapshots match; the executable is still not a shipped renderer.
+
+### 19. Port codecs and staged output ownership (complete)
 
 #### 19a. Evaluate and select codec dependencies
 
-- Test candidate libraries against tiny committed JPEG, 8/16-bit PNG, PQ metadata, and float EXR
-  fixtures before adding a production dependency.
-- Record license, archive-size, color-metadata, streaming, and Windows-build results.
+##### 19a.1. Commit tiny decoded-sample and metadata expectations (complete)
 
-Gate: one explicit dependency decision covers every required format; no codec code is integrated
-before this gate.
+- Add generated/licensed-safe JPEG, 8/16-bit PNG, PQ metadata, and float EXR fixtures plus expected
+  dimensions, samples, and metadata.
 
-#### 19b. Port JPEG and 8-bit PNG source decode
+Gate: Python reads every fixture and the fixture provenance is recorded.
 
-- Decode one SDR source at a time into the two-slot upload pipeline.
-- Preserve JPEG and PNG color metadata and native 8-bit samples.
+##### 19a.2. Probe candidate codec libraries outside production targets (complete)
+
+- Measure license, static/runtime dependencies, archive cost, UTF-16 paths, metadata access,
+  scanline/band streaming, cancellation points, and MSVC/portable builds.
+
+Gate: disposable probes decode and encode every required format or document a precise gap.
+
+##### 19a.3. Record and integrate the dependency decision (complete)
+
+- Choose the smallest explicit set covering all formats, pin versions/licenses, and add build-only
+  linkage before product calls it.
+
+Gate: clean portable/MSVC builds and dependency audit pass with no unused alternate codec.
+
+#### 19b. Port JPEG and 8-bit PNG source decode (complete)
+
+##### 19b.1. Inspect JPEG and 8-bit PNG headers/metadata (complete)
+
+Gate: dimensions, channels, sample type, transfer, primaries, and malformed-input categories match
+the frozen fixtures without allocating a full decoded image.
+
+##### 19b.2. Decode one SDR source into a caller-owned buffer (complete)
+
+Gate: decoded samples and cancellation/error cleanup match fixtures with one bounded allocation.
+
+##### 19b.3. Connect SDR decode to two-slot D3D12 upload (complete)
+
+- Release each decoded source only after its upload fence permits buffer reuse.
 
 Gate: JPEG and 8-bit PNG fixtures match frozen samples, metadata, bounded memory, and cancellation.
 
-#### 19c. Port 16-bit PQ PNG source decode
+#### 19c. Port 16-bit PQ PNG source decode (complete)
 
-- Preserve native `uint16` samples plus Rec.2020/PQ/full-range metadata through upload.
+##### 19c.1. Inspect 16-bit PNG and PQ/Rec.2020 metadata (complete)
+
+Gate: bit depth, range, primaries, transfer, reference white, and malformed metadata match fixtures.
+
+##### 19c.2. Decode native `uint16` rows into a caller-owned buffer (complete)
+
+Gate: samples remain `uint16` and host peak memory contains no float-expanded frame.
+
+##### 19c.3. Connect PQ PNG decode to two-slot D3D12 upload (complete)
+
+- Preserve explicit Rec.2020/PQ/full-range metadata through session creation and upload.
 
 Gate: PQ PNG fixtures match frozen samples/metadata and never expand to float on the host.
 
-#### 19d. Port float EXR source decode
+#### 19d. Port float EXR source decode (complete)
 
-- Stream native float scanlines into the upload slots and preserve linear Rec.2020 metadata.
+##### 19d.1. Inspect EXR headers, channels, windows, and compression (complete)
+
+Gate: supported layouts and representative rejection categories match frozen fixtures.
+
+##### 19d.2. Decode bounded float scanlines (complete)
+
+- Preserve finite above-one values and reject non-finite samples consistently.
+
+Gate: decoded scanlines match fixtures without allocating another full-frame conversion.
+
+##### 19d.3. Connect EXR scanlines to two-slot D3D12 upload (complete)
+
+- Preserve explicit linear Rec.2020 metadata through session creation and upload.
 
 Gate: finite/above-one EXR fixtures match frozen samples and bounded-memory behavior.
 
-#### 19e. Port PNG output
+#### 19e. Port PNG output (complete)
 
-- Add streaming 8-bit SDR PNG output and required metadata through caller-owned bands.
+##### 19e.1. Create an 8-bit SDR PNG writer with required metadata (complete)
+
+Gate: header metadata and invalid-option categories match fixtures before pixel writes.
+
+##### 19e.2. Stream caller-owned output bands (complete)
+
+Gate: odd/final band sizes and row order produce expected decoded samples with bounded memory.
+
+##### 19e.3. Finish or abort PNG output (complete)
 
 Gate: PNG samples, metadata, options, cancellation, and encode failures match fixtures.
 
-#### 19f. Port JPEG output
+#### 19f. Port JPEG output (complete)
 
-- Add JPEG 4:4:4 quality behavior through caller-owned bands.
+##### 19f.1. Create a JPEG writer with 4:4:4 quality configuration (complete)
+
+Gate: quality/range validation and encoded sampling metadata match fixtures.
+
+##### 19f.2. Stream caller-owned output bands (complete)
+
+Gate: odd/final band sizes and row order remain bounded and decode within frozen tolerances.
+
+##### 19f.3. Finish or abort JPEG output (complete)
 
 Gate: JPEG tolerances, subsampling, quality, cancellation, and encode failures match fixtures.
 
-#### 19g. Port EXR output
+#### 19g. Port EXR output (complete)
 
-- Add streaming float scanline EXR with the current compression, color metadata, and above-one
-  behavior.
+##### 19g.1. Create an EXR writer with current channels, compression, and color metadata (complete)
+
+Gate: header fields and invalid-option categories match fixtures before pixel writes.
+
+##### 19g.2. Stream float scanlines (complete)
+
+Gate: finite and above-one values round-trip within tolerance with bounded memory.
+
+##### 19g.3. Finish or abort EXR output (complete)
 
 Gate: EXR round-trip and bounded-memory tests match current tolerances.
 
-#### 19h. Own staged publication and cleanup natively
+#### 19h. Own staged publication and cleanup natively (complete)
 
-- Write same-directory staged files, flush/close, and atomically publish only on complete success.
-- Add narrowly scoped stale-stage recovery consistent with current behavior.
+##### 19h.1. Add same-directory stage ownership (complete)
 
-Gate: every cancel/failure boundary preserves existing output and leaves no partial artifact.
+- Create collision-safe stages without replacing destinations; close/abort removes only owned
+  stages.
 
-### 20. Port the CPU fallback
+Gate: success, cancellation, encode failure, and repeated cleanup leave no owned partial.
 
-#### 20a. Add CPU planning and strip ownership
+##### 19h.2. Add one-file atomic publication (complete)
 
-- Implement the same memory admission, strip sizing, worker limit, scratch ownership, and
-  cancellation contract without image math.
+- Flush/close before replace and preserve an existing destination on every injected boundary.
 
-Gate: plans and peak allocations match frozen Python cases; WARP is never selected as fallback.
+Gate: publication fault injection either commits the new file or restores the old file.
+
+##### 19h.3. Add panorama/coverage/thumbnail publication transactions (complete)
+
+- Publish companions with rollback semantics matching the frozen Python behavior.
+
+Gate: failure at every backup/publish/restore boundary preserves a recoverable complete set.
+
+##### 19h.4. Add narrowly scoped stale-stage recovery (complete)
+
+- Recognize only application-owned stage naming and never delete captures or ordinary user output.
+
+Gate: stale-stage fixtures match current behavior and unrelated files remain untouched.
+
+### 20. Port the CPU fallback (complete)
+
+#### 20a. Add CPU planning and strip ownership (complete)
+
+##### 20a.1. Port checked memory admission and strip sizing without image math (complete)
+
+Gate: plans and rejected limits match frozen Python cases.
+
+##### 20a.2. Add bounded scratch/strip owners and allocation diagnostics (complete)
+
+Gate: peak live bytes match plans and partial construction cleans up.
+
+##### 20a.3. Add the fixed worker-pool owner and cancellation token plumbing (complete)
+
+Gate: worker limits and teardown pass; WARP is never selected as CPU fallback.
 
 #### 20b. Port one-frame CPU projection and hard blend
 
-- Port the already-frozen projection/sampling primitives for one strip and one frame.
+##### 20b.1. Port equirectangular and rectilinear world-ray generation (complete)
+
+Gate: seam, pole, pixel-center, and thumbnail rays match frozen tolerances.
+
+##### 20b.2. Port world-to-camera projection and validity (complete)
+
+Gate: basis, FoV boundary, behind-camera, and non-finite cases match fixtures.
+
+##### 20b.3. Port transfer decode and bilinear sampling (complete)
+
+Gate: uint8/uint16/float, half-pixel, edge, sRGB/PQ/linear, and clipping cases match the proven
+D3D12 oracle.
+
+##### 20b.4. Add one-frame hard selection and coverage (complete)
 
 Gate: deterministic hard-blend fixtures match Python pixels and coverage.
 
-#### 20c. Add multi-frame hard composition
+#### 20c. Add multi-frame hard composition (complete)
 
-- Loop frames in capture order and preserve strict hard-blend ties.
+##### 20c.1. Add capture-order frame iteration within one strip (complete)
+
+Gate: each source is decoded/released in order and peak memory remains bounded.
+
+##### 20c.2. Add strict hard-weight replacement and tie behavior (complete)
 
 Gate: multi-frame hard fixtures match the shared CPU/GPU oracle.
 
-#### 20d. Add CPU feather composition
+#### 20d. Add CPU feather composition (complete)
 
-- Add feather weights, accumulation, normalization, coverage, and incomplete magenta.
+##### 20d.1. Port feather weights and weighted accumulation (complete)
+
+Gate: per-frame accumulated color/weight fixtures match the proven D3D12 behavior.
+
+##### 20d.2. Add normalization and coverage (complete)
+
+Gate: covered pixels and zero-weight pixels match shared fixtures without divide-by-zero.
+
+##### 20d.3. Add incomplete-session magenta marking (complete)
 
 Gate: feather and incomplete-coverage fixtures match the shared oracle with bounded strips.
 
-#### 20e. Add supplied exposure gains
+#### 20e. Add supplied exposure gains (complete)
 
-- Apply global and local supplied gains without exposure analysis.
+##### 20e.1. Apply supplied global gains in linear light (complete)
+
+Gate: identity and non-unit gains match the proven D3D12 color order.
+
+##### 20e.2. Apply supplied local gain maps (complete)
 
 Gate: identity/global/local-gain fixtures match the shared oracle.
 
-#### 20f. Add CPU exposure proxies and pair sampling
+#### 20f. Add CPU exposure proxies and pair sampling (complete)
 
-- Port area-filter proxy generation and geometric pair sampling.
+##### 20f.1. Port bounded area-filter proxy generation (complete)
+
+Gate: proxy dimensions and pixels match frozen fixtures for every transfer function.
+
+##### 20f.2. Port overlap geometry and pair enumeration (complete)
+
+Gate: pair identities, overlap bounds, and no-overlap cases match fixtures.
+
+##### 20f.3. Port deterministic pair sampling (complete)
 
 Gate: proxy pixels and sampled overlap fixtures match the frozen Python oracle.
 
-#### 20g. Add CPU exposure classification and reduction
+#### 20g. Add CPU exposure classification and reduction (complete)
 
-- Port photometric classification, gradients, trimming, and robust pair reduction.
+##### 20g.1. Port photometric sample classification (complete)
+
+Gate: dark, clipped, saturated, non-finite, and accepted categories match D3D12 fixtures.
+
+##### 20g.2. Port gradient calculation and filtering (complete)
+
+Gate: gradients and accepted masks match fixed samples.
+
+##### 20g.3. Port trimming and robust pair reduction (complete)
 
 Gate: reduced equations and rejection reasons match frozen fixtures.
 
-#### 20h. Add CPU exposure solve and caching
+#### 20h. Add CPU exposure solve and caching (complete)
 
-- Solve the anchored graph in native `double`, apply manual inputs, and retain the report/gains.
+##### 20h.1. Build weighted exposure equations and connected components (complete)
+
+Gate: coefficients, weights, anchors, and disconnected cases match D3D12 fixtures.
+
+##### 20h.2. Port the weighted anchored solve in native `double` (complete)
+
+- Use the D3D12/CUDA-proven behavior rather than assuming the stale Python CPU solver is
+  authoritative.
+
+Gate: gains and residuals match fixed well-conditioned and degenerate systems.
+
+##### 20h.3. Apply manual inputs and produce the exposure report (complete)
+
+Gate: automatic, target, manual-match, discard, and warning cases match 17b.
+
+##### 20h.4. Cache gains/report by the frozen session/options identity (complete)
 
 Gate: exposure reports match current tolerances and preview-to-full solves once.
 
-#### 20i. Add conversion and streaming output bands
+#### 20i. Add conversion and streaming output bands (complete)
 
-- Add auto contrast, SDR/PQ conversion, quantization, and float bands in the same order already
-  proven for D3D12.
+##### 20i.1. Add histogram accumulation and auto-contrast levels (complete)
+
+Gate: SDR and converted-PQ histograms/levels match D3D12 fixtures.
+
+##### 20i.2. Add PQ tone mapping and Rec.2020-to-sRGB conversion (complete)
+
+Gate: intermediate linear sRGB values match fixed D3D12 results.
+
+##### 20i.3. Add SDR encoding and integer quantization (complete)
+
+Gate: uint8 output matches within the existing one-code-value tolerance.
+
+##### 20i.4. Add linear float output bands (complete)
+
+Gate: above-one values and color metadata are preserved within float tolerance.
+
+##### 20i.5. Connect converted bands to the native writers (complete)
 
 Gate: PNG/JPEG/EXR output tolerances and bounded memory match Python.
 
-#### 20j. Complete CPU failure and concurrency behavior
+#### 20j. Complete CPU failure and concurrency behavior (complete)
 
-- Add worker-pool limits, cancellation at every phase, staged cleanup, and repeated renders.
+##### 20j.1. Add CPU allocation/decode/compose/encode failure injection (complete)
 
-Gate: the native CPU suite passes on a clean system without a compatible GPU or graphics SDK.
+Gate: each failure releases owned resources, preserves existing output, and permits a later render.
+
+##### 20j.2. Add cancellation around every CPU blocking boundary (complete)
+
+Gate: cancellation latency is bounded, staged files are removed, and no later phase starts.
+
+##### 20j.3. Add CPU concurrent-render rejection and repetition tests (complete)
+
+Gate: portable and Windows native CPU suites pass without creating a D3D12 device. A physical
+CPU-only-machine run remains on the deferred cross-device checklist.
 
 ### 21. Add the native GUI shell
 
@@ -2203,90 +2552,469 @@ Gate: the native CPU suite passes on a clean system without a compatible GPU or 
 - Drive validation/render work from background threads and marshal only state/progress to the UI
   thread.
 
-#### 21a. Add the empty native shell
+#### 21a. Add the empty native shell (complete)
 
-- Add Win32 common controls, DPI/accessibility behavior, keyboard navigation, and close handling.
+##### 21a.1. Add the window, message loop, and deterministic shutdown (complete)
+
+Gate: startup, repeated close, and application-core teardown pass without controls or GPU work.
+
+##### 21a.2. Add DPI awareness and resize/layout primitives (complete)
+
+Gate: unit conversion and manual 100/150/200-percent DPI resizing pass.
+
+##### 21a.3. Add labelled common controls and keyboard navigation (complete)
 
 Gate: native-DPI, screen-reader labels, tab order, keyboard activation, and repeated close pass.
 
-#### 21b. Add session selection
+#### 21b. Add session selection (complete)
 
-- Add discovery, selection, refresh, and path editing without render options.
+##### 21b.1. Add game/session path controls and native file dialogs (complete)
+
+Gate: Unicode path editing/dialog cancellation passes without changing stored state.
+
+##### 21b.2. Add background discovery and refresh (complete)
+
+Gate: stale refresh results are rejected and only record data crosses to the UI thread.
+
+##### 21b.3. Add selection and incomplete/error row presentation (complete)
 
 Gate: the frozen discovery/path contracts and native file-dialog smoke tests pass.
 
-#### 21c. Add options and validation
+#### 21c. Add options and validation (complete)
 
-- Add render options, background validation, output naming, and overwrite confirmation.
+##### 21c.1. Add option controls bound to plain request state (complete)
+
+Gate: defaults, enablement, tab order, and request snapshots match frozen fixtures.
+
+##### 21c.2. Add background validation and stale-result rejection (complete)
+
+Gate: selection/options changes invalidate older validation without blocking the UI thread.
+
+##### 21c.3. Add output naming and overwrite confirmation (complete)
 
 Gate: option/validation contracts pass and only state/progress crosses to the UI thread.
 
-#### 21d. Add the base preview swap chain
+#### 21d. Add the base preview swap chain (complete)
 
-- Present the retained preview through a child-window D3D12 swap chain.
-- Handle resize, occlusion, and device loss without interactive overlays.
+##### 21d.1. Add the child window and swap-chain lifetime without panorama content (complete)
+
+Gate: create, clear, present, resize, occlude, destroy, and repeated create pass.
+
+##### 21d.2. Present the retained panorama texture (complete)
+
+Gate: base preview pixel hashes match retained-renderer output without host readback.
+
+##### 21d.3. Add resize, occlusion, and device-loss recovery (complete)
 
 Gate: base preview pixels, resize, close, and device-loss recovery pass.
 
-#### 21e. Add preview crop and selection interaction
+#### 21e. Add preview crop and selection interaction (complete)
 
-- Add crop/scale, hover, target selection, and pose boundaries using the proven retained renderer.
+##### 21e.1. Add overview/hover scale and crop transforms (complete)
+
+Gate: pointer enter/leave and resize restore the expected transform and magnification.
+
+##### 21e.2. Add target selection and pose-boundary overlays (complete)
+
+Gate: hit tests, selected target, and overlay pixels match frozen contracts.
+
+##### 21e.3. Measure and tune interaction latency without changing semantics (complete)
 
 Gate: pointer/crop/overlay contracts pass; 95th-percentile latency is below one 60 Hz frame or the
 measured limitation is documented.
 
-#### 21f. Add exposure interaction
+#### 21f. Add exposure interaction (complete)
 
-- Add target exposure, automatic correction, manual matching, discard, and warning states.
+##### 21f.1. Add automatic/target exposure commands and progress (complete)
+
+Gate: stale completion and cancellation cannot update a newer selection.
+
+##### 21f.2. Add manual matching, discard/reset, and warning states (complete)
 
 Gate: frozen exposure-edit contracts and cancellation/close during recompute pass.
 
-#### 21g. Add full render lifecycle
+#### 21g. Add full render lifecycle (complete)
 
-- Add background full render, progress, cancellation, errors, and shutdown during work.
+##### 21g.1. Add background render start/progress/success (complete)
+
+Gate: successful staged output updates history once and never blocks the UI thread.
+
+##### 21g.2. Add cancellation and error recovery (complete)
+
+Gate: controls/progress/preview recover after cancel and every representative failure.
+
+##### 21g.3. Add shutdown during validation, preview, and full render (complete)
 
 Gate: render/cancel/failure contracts pass and the UI thread never performs image work.
 
-#### 21h. Add history, settings, and deletion
+#### 21h. Add history, settings, and deletion (complete)
 
-- Add history updates, settings persistence, and deletion confirmations/actions.
+##### 21h.1. Add settings load/save and history presentation (complete)
+
+Gate: malformed/legacy settings and successful-render history match 17b fixtures.
+
+##### 21h.2. Add deletion target preview and confirmations (complete)
+
+Gate: no file is deleted before the exact target set and confirmation choice are displayed.
+
+##### 21h.3. Add deletion execution and refresh (complete)
 
 Gate: persistence and deletion contracts plus manual keyboard/accessibility checks pass.
+
+#### 21i. Replace the provisional shell with the three-stage native UI
+
+The generated prototypes and their focused specification define the replacement presentation.
+Preserve the proven application/rendering cores; do not attempt to repair the provisional form by
+incrementally styling its global control layout.
+
+##### 21i.1. Correct capped D3D12 admission semantics (complete)
+
+- Keep the existing adapter safety reserve and banded-output planner.
+- Calculate safely available adapter memory as free memory minus the reserve, then clamp that value
+  by the user's application-allocation cap. Do not subtract the adapter reserve from the cap itself.
+- Default the UI cap to `min(50% of adapter memory, 4096 MiB)`, with a 1024 MiB minimum.
+
+Gate: capped/uncapped, low-free-memory, resident, and minimum-32-row-band contracts pass; the known
+natural-resolution session is admitted and remains below a 4096 MiB application cap. The separate
+adapter reserve continues to limit safe system availability but is not charged against that cap.
+
+##### 21i.2. Add the replacement shell and explicit UI state owner (implementation complete)
+
+- Replace the provisional global-HWND form with one application/window state owner and event-driven
+  Input, Preview, and Output views.
+- Use system Win32/Direct2D/DirectWrite facilities, custom drawing where needed, and no
+  redistributable UI runtime. Preserve DPI, keyboard, accessibility, snap, and deterministic-close
+  behavior.
+- Keep source-session ownership resident after D3D12 preview; presentation must submit work only
+  for an actual state/size/pointer change and must perform no periodic idle rendering.
+
+Gate: shell/state contracts, repeated navigation/resize/modal/close, and a 30-second retained-
+preview hold show no stale completion, duplicate worker, idle CPU/GPU activity, or unbounded memory
+growth.
+
+The redesigned presentation, owner teardown contracts, and physical retained-preview hold pass on
+the current NVIDIA system. Controls, settings, worker/result queues, cancellation, and CPU/D3D12
+preview resources are now owned beneath the per-window state stored in `GWLP_USERDATA`; the sole
+namespace-level mutable bridge is a non-owning pointer valid only for that owner's lifetime. Final
+visual/interaction/accessibility inspection remains in the combined D3D12 acceptance run. Standard
+controls and dynamic session rows carry explicit native MSAA and UI Automation names through the
+system accessibility property service; row names include pose count, status, and optional tag and
+are refreshed or cleared with their underlying records. The available managed UI Automation bridge
+misclassifies every standard Win32 control as an unfocusable Pane on this host despite native MSAA
+reporting the correct roles and focusable state, so the final gate must use a real screen reader or
+Accessibility Insights rather than treating that broken proxy as authoritative.
+
+##### 21i.3. Implement Input and modal workflows (implementation complete)
+
+- Add game-directory refresh, the status-colored session table, pose count, one persisted
+  0–64-character UTF-8 tag per session, action menu, screenshots override, and guarded deletion.
+- Add App Settings with the D3D12 allocation cap and debug-only coverage option; add Input Options
+  with allow-incomplete.
+- Changing game/session/screenshots invalidates the selected session and retained preview exactly
+  once; tab navigation alone invalidates nothing.
+
+Gate: discovery, local-time labels, status/tooltips, tag persistence, invalid/incomplete admission,
+delete choices, invalidation generations, and modal keyboard behavior pass.
+
+The native implementation and automated contracts pass. Final visual, tooltip-hover, and modal
+keyboard inspection remains part of the D3D12 redesigned-frontend acceptance run after Steps
+21i.4–21i.5 and before CPU wire-back, so it does not interrupt implementation of the dependent
+panels and CPU work cannot drive the visual design.
+
+##### 21i.4. Implement Preview and exposure workflows (implementation complete)
+
+- Add the retained preview surface, hover magnification/leave reset, overlay interaction, exposure
+  panel, blend and auto-contrast options, and title-bar progress presentation.
+- Preview/options recomputation must use one owned worker operation; tabs and read-only modals remain
+  responsive while mutating controls are locked.
+
+Gate: hard/feather, automatic/manual/discard exposure, overlay selection, hover/leave/resize,
+cancellation, stale completion, and retained-preview resource measurements pass on D3D12.
+
+The native workflow implementation and automated contracts pass. The Preview page now exposes one
+Exposure launcher for a modeless panel docked to the main window; that panel owns the boundaries
+toggle, explicit target-selection mode, pose grid, automatic/manual actions, and a discard action
+enabled only after edits. Panorama hover changes only the crop/magnification view, while pose-grid
+hover, an explicit target, or the boundaries toggle requests overlays. Operation progress uses an
+in-client progress strip plus Windows taskbar progress and completion notification. The retained-
+preview physical resource hold and combined visual/interaction inspection remain in the final
+redesigned-frontend acceptance run.
+
+##### 21i.5. Implement Output and D3D12 render workflows (implementation complete)
+
+- Place output directory and filename before resolution, format, and quality controls.
+- Provide separate `Render` and `Render with thumbnail` actions; move coverage generation to the
+  debug App Settings option.
+- Output-option changes must not invalidate preview. Rendering reuses the retained D3D12 session,
+  publishes transactionally, updates history once, and returns to a usable preview on success,
+  cancellation, or failure.
+
+Gate: natural-resolution hard/feather output, both render buttons, debug coverage, overwrite
+confirmation, progress/cancellation/error recovery, and the headless RAM/VRAM ceilings pass. This
+is the provisional D3D12 UI gate; continue immediately to CPU wire-back.
+
+The native implementation and automated contracts pass, including compatible mutation of the
+retained owner's output plan. Output scale and JPEG quality have 36-DIP fixed-length slider thumbs
+and synchronized editable numeric fields; pixel width is capped to five input digits; format
+choices are left-packed and mutually exclusive. Natural-resolution and combined GUI acceptance
+must pass on the D3D12 redesigned candidate before CPU wire-back begins.
+
+##### 21i.6. Wire the CPU path back after the D3D12 redesign
+
+- Assemble the already-ported CPU primitives into production CPU preview and full-session render
+  coordinators only after the D3D12 redesign in 21i.1–21i.5 passes its automated and manual visual,
+  interaction, natural-resolution, and retained-resource acceptance.
+- Preserve the fixed 2048 MiB CPU budget. Present the default-size CPU preview without hover
+  magnification, and retain the same validation, exposure, output, cancellation, publication, and
+  recovery behavior wherever the CPU implementation supports it.
+- Automatically use CPU when D3D12 is unavailable or not admitted; preserve explicit GPU-strict
+  rejection and never create WARP as a product fallback.
+
+Gate: a no-D3D12 test path produces CPU preview and full output within the fixed memory limit;
+render options and output tolerances match the frozen Python CPU behavior; cancellation/failure
+leaves no partial output or live worker. The native UI redesign/rewrite is not complete until this
+CPU wire-back gate passes.
+
+###### 21i.6.1. Make backend selection explicit at preview admission
+
+- Keep D3D12 as the default. If product adapter/device creation or D3D12 preview admission fails,
+  select CPU for that preview operation unless GPU-strict was explicitly requested.
+- Preserve the original D3D12 error for strict rejection and for diagnostics; never create WARP as
+  a product fallback. A CPU-selected plan uses the fixed 2048 MiB coordinator budget rather than
+  reinterpreting the D3D12 allocation cap.
+
+Gate: injected unavailable-device and rejected-admission paths select CPU exactly once; GPU-strict
+returns the original D3D12 category; no failed D3D12 handle or duplicate worker remains.
+
+###### 21i.6.2. Route preview creation through the existing CPU coordinator
+
+- Run `create_cpu_native_preview` on the existing owned preview worker with the same generation,
+  cancellation, stale-completion, and shutdown rules as D3D12.
+- Store exactly one backend owner in the result/runtime state, query its dimensions, and restore
+  controls/status consistently on success, cancellation, allocation failure, and stale completion.
+
+Gate: forced-CPU preview reaches ready state, cancellation and stale completion publish nothing,
+and repeated CPU/D3D12 rebuilds leave one retained owner and no live worker.
+
+###### 21i.6.3. Present the fixed CPU preview without D3D12
+
+- Paint the retained BGRA CPU pixels through the preview child window using system GDI, preserving
+  aspect ratio and repaint/resize behavior without creating a D3D12 device or swap chain.
+- Disable hover magnification, pose hit testing, and exposure-selection interaction for the CPU
+  presentation until a CPU coordinator supports those mutations. Tab navigation and repaint must
+  not recompute the preview or create an idle timer.
+
+Gate: a forced-CPU preview remains visible across cover/uncover, resize, tab-away/tab-back, and a
+30-second idle hold with no GPU allocation, no periodic CPU work, and bounded host memory.
+
+###### 21i.6.4. Route retained CPU sessions through full render
+
+- Apply compatible Output-plan mutations with `update_cpu_native_preview_render_plan`, then call
+  `render_cpu_native_session` from the existing render worker. Reuse shared progress, overwrite
+  confirmation, both render buttons, debug coverage, history, publication, and recovery paths.
+- Cancellation must use the existing operation token/check and preserve the retained CPU preview;
+  failure or publication rejection must leave no partial output and return the UI to a usable state.
+
+Gate: hard and feather, SDR auto-contrast, explicit resolution, thumbnail, coverage, cancellation,
+existing-output rejection/confirmation, and retry pass through forced CPU with no D3D12 device.
+
+###### 21i.6.5. Run forced-no-D3D12 frontend acceptance
+
+- Add a test-only deterministic no-D3D12 switch/injection point; do not expose WARP or a new product
+  setting. Exercise preview, render, cancellation, failure, shutdown, and repeated backend changes.
+- Measure the retained CPU preview and a representative low-resolution full render against the
+  fixed 2048 MiB budget, then compare output dimensions/artifacts and focused pixels against the
+  frozen Python CPU fixtures.
+
+Gate: portable contracts and Windows MSVC `/W4 /WX`/CTest pass; the Windows forced-CPU GUI produces
+preview and full output with zero D3D12 live counts, stays within 2048 MiB, and leaves no worker or
+partial file. Record any unavailable CPU exposure interaction as an explicit parity limitation,
+not as implicit D3D12 behavior.
 
 ### 22. Switch the release and remove Python
 
 #### 22a. Run dual-frontend parity
 
-- Run Python and native frontends against the same fixture corpus, CPU/GPU matrix, failures, and
-  accessibility checklist.
+##### 22a.1. Run headless contract and output parity (complete)
+
+- Run Python and native cores against the same metadata/options, CPU/GPU, codec, failure, and
+  publication fixtures.
+
+Gate: structured plans/results, output tolerances, error categories, and cleanup match.
+
+##### 22a.1.1. Isolate and measure the headless D3D12 backend (complete)
+
+- Add a Windows test-only executable that calls the production native preview/exposure/render
+  coordinator without creating an HWND or entering the GUI message loop.
+- Run the known 30-frame session through realistic retained preview, natural-resolution hard and
+  feather output, automatic exposure, thumbnail, coverage, and forced-banded planning.
+- Sample per-process physical working set, private commit, normalized CPU, dedicated/shared GPU
+  memory, and GPU-engine utilization. Treat a counter interval spanning two published phases as a
+  transition sample, never as stable idle.
+- Reject existing destinations, remove generated output after measurement, and verify native live
+  counts return to their pre-run values.
+
+Gate: physical working set remains below the original decimal 1,000,000,000-byte requirement;
+dedicated VRAM remains below the measured 2560 MiB ceiling for this session; stable preview idle is
+below 5% CPU and GPU; active normalized CPU is below 25%; hard and feather natural-resolution runs
+publish every requested artifact and leave no process or render output behind.
+
+##### 22a.2. Run frontend interaction and accessibility parity
+
+- Run both frontends through the same workflow checklist on the available Windows 11/NVIDIA host.
 
 Gate: feature, output, error-category, cleanup, and interaction parity are recorded with no open
 release-blocking difference.
 
 #### 22b. Switch the archive entry point
 
-- Make the native executable the candidate entry point while retaining the Python frontend in a
-  non-default comparison archive for one acceptance cycle.
+##### 22b.1. Build a comparison archive with both entry points (complete)
 
-Gate: clean-machine install/upgrade, file association, settings migration, and rollback tests pass.
+Gate: both frontends use the same bundled contracts/DLL and do not share mutable runtime state.
+
+##### 22b.2. Make the native executable the default candidate entry point
+
+Gate: clean extraction, paths with spaces/Unicode, settings migration, and rollback to the
+comparison archive pass.
+
+The explicit native candidate now passes clean extraction and the D3D12 runtime probe from a
+Windows path containing spaces and Unicode. Native contract tests also load the existing
+Python-written settings/history shape from the shared `%APPDATA%\PanoramaCapture\gui-settings.json`
+contract. The default switch, manual persisted-settings/interaction comparison, and rollback
+confirmation remain pending Step 22a.2.
 
 #### 22c. Remove Python runtime and build inputs
 
-- Remove Python/Tk first, then NumPy/OpenCV/Pillow/OpenEXR bindings, then PyInstaller and lock/build
-  configuration, verifying the archive after each dependency group.
-- Retain cheap fixture generators/specifications only when they are not shipped.
+##### 22c.1. Remove Python/Tk from the native candidate payload (complete)
 
-Gate: the native archive builds and passes tests after each removal; no shipped file imports or
-collects the removed runtime.
+Gate: archive audit and native acceptance pass while source-side parity tests remain available.
+
+##### 22c.2. Remove NumPy/OpenCV/Pillow/OpenEXR bindings from the candidate payload/build (complete)
+
+Gate: codecs, CPU/D3D12 rendering, and archive dependency audit pass.
+
+##### 22c.3. Remove PyInstaller and obsolete Python release configuration
+
+Gate: the native archive builds reproducibly without collecting a Python runtime.
+
+##### 22c.4. Remove obsolete Python product sources and dependencies
+
+- Retain only cheap fixture generators/reference specifications needed by tests, with no shipped
+  Python entry point.
+
+Gate: source/build searches and the archive prove no product code imports or collects the removed
+runtime; the committed fixture corpus still runs against the native application.
 
 #### 22d. Accept the native-only release
 
-- Repeat the clean-machine, hardware, CPU-fallback, format, failure, and accessibility matrix on
-  the exact signed archive.
-- Record size and dependency differences from the transitional archive.
+- Rebuild twice, audit hashes/dependencies, and run clean extraction, runtime verification, formats,
+  resident/banded rendering, CPU fallback contracts, failures, cancellation, GUI, and accessibility
+  on the available Windows 11/NVIDIA host.
+- Record size and dependency differences from the transitional archive. Add Windows 10, AMD, Intel,
+  and a physical CPU-only host to the existing deferred non-blocking checklist.
 
-Gate: the archive is materially smaller, contains no Python or CUDA payload, and passes the full
-matrix. Only then retire the transitional release.
+Gate: the archive is materially smaller, contains no Python or CUDA payload, and passes all locally
+available automated checks plus the recorded Windows 11/NVIDIA acceptance. Only then retire the
+transitional release; unavailable cross-device checks remain deferred.
+
+### 23. Replace the imperative GUI renderer with WebView2
+
+This post-migration UI packet changes presentation technology, not the application/rendering
+contracts. Keep the existing native shell available as an explicit rollback until the WebView
+frontend passes the same interaction, resource, CPU-fallback, publication, and accessibility gates.
+The native core remains authoritative for discovery, validation, settings, mutation locking,
+workers, cancellation, preview/exposure state, rendering, and publication.
+
+#### 23a. Add the build and runtime boundary
+
+1. Pin the release WebView2 SDK as a build-only input and statically link its loader. Do not ship
+   the SDK or a loose loader DLL.
+2. Detect the separate Evergreen WebView2 Runtime before creating the browser environment. When it
+   is absent, show a native Win32 dialog that can open Microsoft's download page, retry, or exit.
+   Microsoft Edge Stable alone is not a supported production runtime.
+3. Store the browser user-data folder under
+   `%LOCALAPPDATA%\PanoramaStitcher\WebView2`; keep application settings under the existing roaming
+   `%APPDATA%` path.
+4. Embed the final HTML/CSS/JavaScript/icon bundle as executable resources. External assets remain
+   permitted only for the inspectable prototype/development switch.
+5. Preserve the existing headless executable, native GUI self-test, delayed `pano_gpu.dll` loading,
+   static MSVC runtime, reproducible release build, and runtime-probe behavior.
+
+#### 23b. Add the owned host and Input bridge
+
+1. Own the WebView environment, controller, browser instance, event tokens, shared buffers, and
+   profile path beneath `GuiShellState`; release them before the owning `HWND` is destroyed.
+2. Use versioned, allow-listed JSON messages. The browser never supplies arbitrary filesystem
+   operations, commands, native identifiers, or render parameters; native state validates every
+   request and returns a complete UI snapshot after each accepted mutation.
+3. Reproduce the Input screen from `C:\dev\native-gui-prototype\proto-1.html`: tabs, editable
+   directories, native folder pickers, refresh, semantic session table, tag and delete actions,
+   App Settings, Input Options, status, and Preview launch.
+4. Keep refresh/validation workers and stale-generation rejection unchanged. Browser callbacks run
+   on the owning UI thread; worker completion continues through posted window messages.
+5. Provide explicit loading, unavailable-runtime, bridge-protocol, and stale-page recovery states.
+
+#### 23c. Preserve the native Preview surface and magnified crop
+
+1. The HTML Preview page exposes a measured placeholder rectangle. Convert its CSS-pixel bounds
+   with the active WebView raster scale and position the existing preview child `HWND` over that
+   rectangle. Reject non-finite, negative, out-of-client, stale-generation, or implausibly large
+   geometry.
+2. Keep `pano_gpu_preview`, `pano_gpu_preview_surface`, and CPU-preview ownership native. Do not
+   transfer a full preview into JavaScript merely to display it.
+3. Keep the existing preview-window mouse procedure authoritative for overview-to-1:1 magnified
+   crop calculation. Pointer leave resets to overview; tab changes, invalidation, cancellation, and
+   rebuild reset the crop exactly once.
+4. Hide the native preview child while an HTML dialog or overlapping flyout is open, while Preview
+   is hidden, or while its placeholder is clipped. Restore and present it only after fresh measured
+   geometry arrives.
+5. Route continuous operation progress into the Preview tab background and persistent completion
+   badge. Preserve taskbar progress, Abort, completion notification, and mutation locking.
+6. Prove at 100% and 150% DPI that the native surface exactly covers the placeholder, magnification
+   follows the pointer, leave restores 1.0 overview, and modal/tab z-order never leaks the surface
+   above HTML.
+
+#### 23d. Move Preview options and exposure controls
+
+1. Implement Preview Options (`blend`, SDR auto contrast) in WebView and reuse native invalidation
+   and rebuild rules.
+2. Implement the docked exposure panel from the focused exposure documentation: boundaries toggle,
+   target-selection mode, pose grid, manual match, automatic correction, and discard enablement.
+3. Pose-grid hover/leave messages update the existing native hovered-frame vector and overlay
+   shader. Image hover controls magnification only; it must not implicitly select or highlight a
+   pose.
+4. Preserve target/source exclusion, runtime generation matching, exposure operation concurrency
+   rejection, retained-session reuse, and error recovery.
+
+#### 23e. Move Output, remaining dialogs, and CPU routing
+
+1. Implement Output directory/name first, scale/explicit-width modes, exclusive format choices,
+   JPEG quality, and separate Render/Render-with-thumbnail actions from the prototype/spec.
+2. Keep native validation, staged publication, overwrite refusal, thumbnail projection, debug
+   coverage setting, cancellation, and failure cleanup authoritative.
+3. Replace tag/delete/settings/options native dialogs only after equivalent HTML dialogs preserve
+   keyboard, focus, validation, destructive confirmation, and persistence behavior.
+4. Complete the deferred CPU preview/full-render frontend routing through the same state bridge and
+   fixed 2048 MiB policy. CPU preview may use an event-driven native/GDI child in the same measured
+   placeholder; it must not introduce periodic browser copies or idle repaint loops.
+
+#### 23f. Make WebView primary only after parity
+
+1. Embed and hash the UI resources, disable development tools/context menus in release, apply a
+   restrictive local content policy, and audit every native message handler.
+2. Repeat native contracts, Windows MSVC `/W4 /WX`, CTest, Python compatibility tests, hidden-GUI
+   teardown, corrupt-DLL/runtime probes, deterministic archive checks, and clean extraction tests.
+3. Repeat retained-preview idle and natural-render resource monitoring. Count the complete WebView
+   process tree; preserve the existing host-RAM/VRAM caps and 0% stable-idle GPU expectation.
+4. Manually verify Input, Preview/magnification/exposure, Output, cancellation/error recovery,
+   settings restart, destructive confirmations on disposable copies, keyboard/focus, screen reader,
+   both local DPI scales, and the missing-WebView2 recovery dialog.
+5. The user approved selecting WebView2 by default after manually confirming the Input and native
+   Preview slice, including magnification and leave reset. Keep `--native-ui` as an explicit
+   rollback while the remaining exposure, Output, CPU, accessibility, resource, and release gates
+   are completed; ordinary launch must fail visibly if WebView2 cannot start and must never expose
+   the Win32 interface as an automatic fallback. Remove the explicit switch only in a later
+   reviewed change.
 
 ## Verification matrix
 

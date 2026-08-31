@@ -72,7 +72,10 @@ void render_preview_overlay(uint3 thread_id : SV_DispatchThreadID)
             continue;
         if (hovered[frame] != 0)
         {
-            const float3 tint = target_mode != 0 ? float3(0, 102, 255) : float3(255, 0, 255);
+            const bool reference = (int)frame == target_pose;
+            const float3 tint = target_mode != 0 || reference
+                ? float3(0, 102, 255)
+                : float3(255, 0, 255);
             color = color * 0.8 + tint * 0.2;
         }
         const bool boundary = !covered_by_frame(frame, left_x, source_y) ||

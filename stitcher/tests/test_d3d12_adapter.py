@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import os
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +14,7 @@ from pano_stitch.d3d12_adapter import (
     D3D12OutputBandScheduler,
     D3D12PreparedSession,
     D3D12RenderCancelledError,
+    _default_library_path,
     _ExposurePairRequest,
     _ExposureProxyRequest,
     _ExposureReport,
@@ -33,6 +35,19 @@ from pano_stitch.d3d12_adapter import (
     load_d3d12_adapter,
     run_d3d12_output_bands,
 )
+
+
+def test_frozen_adapter_falls_back_to_executable_sibling(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    executable = tmp_path / "PanoramaCaptureStitcher-Python.exe"
+    monkeypatch.setattr(
+        "pano_stitch.d3d12_adapter.__file__", str(tmp_path / "internal" / "d3d12_adapter.py")
+    )
+    monkeypatch.setattr("pano_stitch.d3d12_adapter.sys.frozen", True, raising=False)
+    monkeypatch.setattr("pano_stitch.d3d12_adapter.sys.executable", str(executable))
+
+    assert _default_library_path() == tmp_path / "pano_gpu.dll"
 
 
 @pytest.mark.gpu_contract
@@ -140,7 +155,7 @@ class _FakeNativeLibrary:
             "pano_gpu_device_destroy",
         ):
             setattr(self, name, _FakeNativeFunction(calls=self.calls, name=name))
-        self.pano_gpu_abi_version = _FakeNativeFunction(9)
+        self.pano_gpu_abi_version = _FakeNativeFunction(10)
         self.pano_gpu_cancellation_token_create._action = lambda handle, *_args: setattr(
             handle._obj, "value", 303
         )

@@ -1,0 +1,46 @@
+{
+	"sources" : 
+	[
+		{
+			"file" : "/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/imath-subbuild/CMakeFiles/imath-populate"
+		},
+		{
+			"file" : "/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/imath-subbuild/CMakeFiles/imath-populate.rule"
+		},
+		{
+			"file" : "/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/imath-subbuild/CMakeFiles/imath-populate-complete.rule"
+		},
+		{
+			"file" : "/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/imath-subbuild/imath-populate-prefix/src/imath-populate-stamp/imath-populate-build.rule"
+		},
+		{
+			"file" : "/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/imath-subbuild/imath-populate-prefix/src/imath-populate-stamp/imath-populate-configure.rule"
+		},
+		{
+			"file" : "/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/imath-subbuild/imath-populate-prefix/src/imath-populate-stamp/imath-populate-download.rule"
+		},
+		{
+			"file" : "/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/imath-subbuild/imath-populate-prefix/src/imath-populate-stamp/imath-populate-install.rule"
+		},
+		{
+			"file" : "/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/imath-subbuild/imath-populate-prefix/src/imath-populate-stamp/imath-populate-mkdir.rule"
+		},
+		{
+			"file" : "/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/imath-subbuild/imath-populate-prefix/src/imath-populate-stamp/imath-populate-patch.rule"
+		},
+		{
+			"file" : "/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/imath-subbuild/imath-populate-prefix/src/imath-populate-stamp/imath-populate-test.rule"
+		},
+		{
+			"file" : "/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/imath-subbuild/imath-populate-prefix/src/imath-populate-stamp/imath-populate-update.rule"
+		}
+	],
+	"target" : 
+	{
+		"labels" : 
+		[
+			"imath-populate"
+		],
+		"name" : "imath-populate"
+	}
+}

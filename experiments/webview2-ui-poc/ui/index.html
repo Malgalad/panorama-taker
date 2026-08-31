@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cyberpunk Panorama Stitcher — WebView2 POC</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: "Segoe UI", sans-serif;
+      font-size: 16px;
+      color: #d1d5db;
+      background: #030712;
+      --yellow: #fcd34d;
+      --green: #22c55e;
+      --gray-950: #030712;
+      --gray-900: #111827;
+      --gray-800: #1f2937;
+      --gray-700: #374151;
+      --gray-600: #4b5563;
+      --gray-500: #6b7280;
+      --gray-400: #9ca3af;
+      --gray-300: #d1d5db;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { width: 100%; min-width: 760px; min-height: 100%; margin: 0; }
+    body { overflow: auto; }
+    button, input { font: inherit; }
+    button { color: inherit; }
+
+    .app {
+      width: 100%;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+      padding: 16px;
+      background: var(--gray-950);
+    }
+
+    .row { display: flex; align-items: center; gap: 16px; }
+    .grow { flex: 1 1 auto; min-width: 0; }
+
+    .button {
+      min-height: 42px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 8px 16px;
+      border: 1px solid var(--gray-400);
+      border-radius: 12px;
+      color: var(--gray-300);
+      background: transparent;
+      cursor: pointer;
+      transition: border-color 100ms ease, background 100ms ease,
+                  color 100ms ease, transform 50ms ease;
+    }
+    .button:hover { border-color: var(--gray-300); background: var(--gray-800); }
+    .button:active { transform: translateY(1px); background: var(--gray-900); }
+    .button:focus-visible { outline: 2px solid white; outline-offset: 2px; }
+    .button.primary { border-color: var(--yellow); background: var(--yellow); color: #0f0f0f; }
+    .button.primary:hover { background: #fde68a; }
+    .button.icon-only { width: 50px; padding: 8px; }
+    .button.small { min-height: 34px; padding: 4px 8px; border-radius: 9px; }
+    .button.tab { flex: 1 1 0; justify-content: flex-start; }
+    .button.tab[aria-current="step"] { border: 2px solid var(--yellow); color: var(--yellow); font-weight: 600; }
+
+    .badge {
+      width: 24px;
+      height: 24px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      flex: 0 0 24px;
+      border-radius: 50%;
+      color: #0f0f0f;
+      background: var(--gray-400);
+      font-size: 13px;
+      font-weight: 600;
+    }
+    [aria-current="step"] .badge { background: var(--yellow); }
+    .icon { font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets"; font-size: 18px; line-height: 1; }
+
+    .card {
+      display: flex;
+      flex: 1 1 auto;
+      min-height: 500px;
+      flex-direction: column;
+      gap: 16px;
+      padding: 16px;
+      border: 1px solid var(--gray-500);
+      border-radius: 6px;
+    }
+    .field { display: flex; flex-direction: column; gap: 8px; }
+    .input {
+      width: 100%;
+      height: 42px;
+      padding: 8px;
+      border: 1px solid var(--gray-500);
+      border-radius: 0;
+      color: var(--gray-300);
+      background: var(--gray-900);
+    }
+    .input:hover { border-color: var(--gray-400); }
+    .input:focus { outline: 2px solid white; outline-offset: -2px; }
+
+    .table-wrap { height: 288px; overflow: auto; border: 1px solid var(--gray-500); }
+    table { width: 100%; border-collapse: collapse; }
+    th { position: sticky; top: 0; z-index: 1; padding: 8px; text-align: left; background: var(--gray-600); }
+    td { height: 45px; padding: 8px; border-top: 1px solid var(--gray-500); }
+    tbody tr { background: var(--gray-900); cursor: pointer; }
+    tbody tr:nth-child(even) { background: var(--gray-800); }
+    tbody tr:hover { background: #293548; }
+    tbody tr[aria-selected="true"] { outline: 1px solid white; outline-offset: -2px; }
+    .warning { color: #fbbf24; }
+    .invalid { color: #ef4444; }
+    .stitched { color: var(--green); }
+    .separator { width: 1px; height: 24px; border-left: 1px solid var(--gray-400); }
+
+    footer { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+
+    #benchmark-overlay {
+      position: fixed;
+      inset: 16px;
+      z-index: 20;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      background: var(--gray-950);
+      border: 1px solid var(--gray-500);
+      border-radius: 6px;
+    }
+    #benchmark-overlay.visible { display: flex; }
+    #benchmark-canvas { width: min(100%, 900px); height: auto; image-rendering: auto; }
+    dialog {
+      width: min(480px, calc(100vw - 48px));
+      padding: 0;
+      color: var(--text);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      box-shadow: 0 24px 72px #000c;
+    }
+    dialog::backdrop { background: #0009; backdrop-filter: blur(2px); }
+    .modal-header, .modal-body, .modal-footer { padding: 18px 20px; }
+    .modal-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--border);
+    }
+    .modal-header h2 { margin: 0; font-size: 17px; }
+    .modal-body { display: grid; gap: 16px; }
+    .modal-footer {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      border-top: 1px solid var(--border);
+    }
+    .checkbox { display: flex; align-items: center; gap: 10px; }
+    .checkbox input { width: 18px; height: 18px; accent-color: var(--accent); }
+    select.input { appearance: auto; }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <nav class="row" aria-label="Workflow">
+      <button class="button tab" aria-current="step"><span class="badge">1</span>Input</button>
+      <button class="button tab"><span class="badge">2</span>Preview</button>
+      <button class="button tab"><span class="badge">3</span>Output</button>
+      <button id="settings-button" class="button icon-only" aria-label="App settings" title="App settings"><span class="icon">&#xE713;</span></button>
+    </nav>
+
+    <section class="card" aria-label="Input settings">
+      <label class="field">
+        <span>Game directory:</span>
+        <span class="row">
+          <input id="game-directory" class="input grow" aria-label="Game directory" value="F:\GoG Games\Cyberpunk 2077">
+          <button class="button icon-only" data-directory-target="game" aria-label="Browse game directory" title="Browse"><span class="icon">&#xED25;</span></button>
+          <button class="button icon-only" aria-label="Refresh sessions" title="Refresh"><span class="icon">&#xEDAB;</span></button>
+        </span>
+      </label>
+
+      <div class="table-wrap">
+        <table aria-label="Panorama sessions">
+          <thead><tr><th>Session</th><th>#</th><th>Tag</th><th>Actions</th></tr></thead>
+          <tbody>
+            <tr tabindex="0" aria-selected="true"><td>2026-08-30 15:52:43&nbsp; #2</td><td>30</td><td></td><td><button class="button small">Actions<span class="separator"></span><span class="icon">&#xE70D;</span></button></td></tr>
+            <tr tabindex="0" aria-selected="false"><td class="warning" title="Incomplete">2026-08-30 15:52:17&nbsp; #1</td><td>6</td><td></td><td><button class="button small">Actions<span class="separator"></span><span class="icon">&#xE70D;</span></button></td></tr>
+            <tr tabindex="0" aria-selected="false"><td class="invalid" title="Invalid">2026-08-28 11:25:06&nbsp; #1</td><td>0</td><td>invalid</td><td><button class="button small">Actions<span class="separator"></span><span class="icon">&#xE70D;</span></button></td></tr>
+            <tr tabindex="0" aria-selected="false"><td class="stitched">2026-08-28 09:06:25&nbsp; #2</td><td>30</td><td>glen apt exposure torture</td><td><button class="button small">Actions<span class="separator"></span><span class="icon">&#xE70D;</span></button></td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <label class="field">
+        <span>Screenshots directory:</span>
+        <span class="row">
+          <input id="screenshots-directory" class="input grow" aria-label="Screenshots directory" value="E:\Pictures\Cyberpunk 2077">
+          <button class="button icon-only" data-directory-target="screenshots" aria-label="Browse screenshots directory" title="Browse"><span class="icon">&#xED25;</span></button>
+        </span>
+      </label>
+    </section>
+
+    <footer>
+      <span role="status">Session and options are valid</span>
+      <span class="row">
+        <button id="options-button" class="button"><span class="icon">&#xE70F;</span>Options</button>
+        <button class="button primary">Preview</button>
+      </span>
+    </footer>
+  </main>
+
+  <dialog id="settings-dialog" aria-labelledby="settings-title">
+    <form method="dialog">
+      <header class="modal-header">
+        <h2 id="settings-title">App settings</h2>
+        <button class="button icon-only" value="cancel" aria-label="Close app settings"><span class="icon">&#xE711;</span></button>
+      </header>
+      <section class="modal-body">
+        <label class="checkbox"><input type="checkbox">Write coverage diagnostic image</label>
+        <span class="muted">Diagnostic output is disabled during normal panorama rendering.</span>
+      </section>
+      <footer class="modal-footer">
+        <button class="button" value="cancel">Cancel</button>
+        <button class="button primary" value="save">Save</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog id="options-dialog" aria-labelledby="options-title">
+    <form method="dialog">
+      <header class="modal-header">
+        <h2 id="options-title">Capture options</h2>
+        <button class="button icon-only" value="cancel" aria-label="Close capture options"><span class="icon">&#xE711;</span></button>
+      </header>
+      <section class="modal-body">
+        <label class="field"><span>Blend mode:</span><select class="input"><option>Hard composite</option><option>Feather</option></select></label>
+        <label class="checkbox"><input type="checkbox" checked>Automatic exposure</label>
+      </section>
+      <footer class="modal-footer">
+        <button class="button" value="cancel">Cancel</button>
+        <button class="button primary" value="apply">Apply</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <div id="benchmark-overlay" aria-hidden="true"><canvas id="benchmark-canvas"></canvas></div>
+  <script>
+    for (const row of document.querySelectorAll('tbody tr')) {
+      row.addEventListener('click', event => {
+        if (event.target.closest('button')) return;
+        for (const candidate of document.querySelectorAll('tbody tr')) candidate.setAttribute('aria-selected', 'false');
+        row.setAttribute('aria-selected', 'true');
+      });
+    }
+
+    for (const [buttonId, dialogId] of [
+      ['settings-button', 'settings-dialog'],
+      ['options-button', 'options-dialog']
+    ]) {
+      const dialog = document.getElementById(dialogId);
+      document.getElementById(buttonId).addEventListener('click', () => dialog.showModal());
+      dialog.addEventListener('click', event => {
+        if (event.target === dialog) dialog.close('cancel');
+      });
+    }
+
+    if (window.chrome?.webview) {
+      for (const button of document.querySelectorAll('[data-directory-target]')) {
+        button.addEventListener('click', () => {
+          chrome.webview.postMessage(JSON.stringify({
+            kind: 'select-directory',
+            target: button.dataset.directoryTarget
+          }));
+        });
+      }
+      chrome.webview.addEventListener('message', event => {
+        if (event.data?.kind !== 'directory-selected') return;
+        const input = document.getElementById(`${event.data.target}-directory`);
+        if (input) {
+          input.value = event.data.path;
+          input.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      });
+      chrome.webview.addEventListener('sharedbufferreceived', event => {
+        const metadata = event.additionalData;
+        const started = performance.now();
+        const pixels = new Uint8ClampedArray(event.getBuffer());
+        const canvas = document.getElementById('benchmark-canvas');
+        canvas.width = metadata.width;
+        canvas.height = metadata.height;
+        const context = canvas.getContext('2d', { alpha: false });
+        context.putImageData(new ImageData(pixels, metadata.width, metadata.height), 0, 0);
+        document.getElementById('benchmark-overlay').classList.add('visible');
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          chrome.webview.postMessage(JSON.stringify({
+            kind: 'preview-transfer-complete',
+            bytes: pixels.byteLength,
+            js_copy_and_present_ms: performance.now() - started,
+            width: metadata.width,
+            height: metadata.height
+          }));
+          event.releaseBuffer();
+        }));
+      });
+      requestAnimationFrame(() => requestAnimationFrame(() => {
+        chrome.webview.postMessage(JSON.stringify({ kind: 'dom-ready' }));
+      }));
+    }
+  </script>
+</body>
+</html>

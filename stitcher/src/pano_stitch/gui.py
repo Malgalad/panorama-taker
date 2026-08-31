@@ -19,6 +19,17 @@ from typing import Any, cast
 import numpy as np
 from PIL import Image, ImageTk
 
+from pano_stitch.application import (
+    ApplicationSettings,
+    ExposureEdits,
+    begin_operation,
+    cancellation_requested,
+    default_output_name,
+    finish_operation,
+    plan_outputs,
+    requested_render_operation,
+    validate_session_request,
+)
 from pano_stitch.compositor import (
     AutomaticExposureAmbiguousError,
     ExposureReport,
@@ -30,9 +41,7 @@ from pano_stitch.compositor import (
     frame_coverage_masks,
     render_preview,
     render_session,
-    renderable_session,
     thumbnail_output_path,
-    validate_images,
 )
 from pano_stitch.metadata import SessionMetadata, load_session
 from pano_stitch.sessions import (
@@ -238,13 +247,12 @@ class StitcherApp:
     def _load_settings(self) -> None:
         try:
             with self._settings_path().open(encoding="utf-8") as stream:
-                settings = json.load(stream)
-            self.game_dir_var.set(self._display_path(settings.get("game_dir", "")))
-            self.image_dir_var.set(self._display_path(settings.get("image_dir", "")))
-            self.output_dir_var.set(self._display_path(settings.get("output_dir", "")))
-            self.auto_contrast_var.set(settings.get("auto_contrast", True))
-            history = settings.get("stitched_sessions", {})
-            self._history = history if isinstance(history, dict) else {}
+                settings = ApplicationSettings.from_mapping(json.load(stream))
+            self.game_dir_var.set(self._display_path(settings.game_dir))
+            self.image_dir_var.set(self._display_path(settings.image_dir))
+            self.output_dir_var.set(self._display_path(settings.output_dir))
+            self.auto_contrast_var.set(settings.auto_contrast)
+            self._history = dict(settings.stitched_sessions)
         except (OSError, ValueError):
             pass
 
@@ -255,13 +263,13 @@ class StitcherApp:
             temporary = path.with_suffix(".partial")
             temporary.write_text(
                 json.dumps(
-                    {
-                        "game_dir": self.game_dir_var.get(),
-                        "image_dir": self.image_dir_var.get(),
-                        "output_dir": self.output_dir_var.get(),
-                        "stitched_sessions": self._history,
-                        "auto_contrast": self.auto_contrast_var.get(),
-                    },
+                    ApplicationSettings(
+                        self.game_dir_var.get(),
+                        self.image_dir_var.get(),
+                        self.output_dir_var.get(),
+                        self._history,
+                        self.auto_contrast_var.get(),
+                    ).to_mapping(),
                     indent=2,
                 ),
                 encoding="utf-8",
@@ -811,10 +819,7 @@ class StitcherApp:
         self._output_name_dirty = False
 
     def _default_output_name(self, session_id: str, suffix: str) -> str:
-        current = self.output_name_var.get().strip()
-        if current and current != "panorama.png":
-            return current
-        return f"panorama-{session_id}{suffix}"
+        return default_output_name(self.output_name_var.get(), session_id, suffix)
 
     def _output_path_preview(self) -> Path | None:
         session_text = self.session_var.get().strip()
@@ -868,11 +873,12 @@ class StitcherApp:
             self._start_worker("validate")
 
     def _start_worker(self, operation: str) -> None:
-        if self._state in {UiState.BUSY, UiState.CLOSING}:
+        transition = begin_operation(self._state.name.lower(), operation)
+        if transition is None:
             return
         if operation not in {"validate", "render"}:
             self._close_gpu_preview_display()
-        self._state_before_busy = self._state
+        self._state_before_busy = UiState[transition.previous_state.upper()]
         self._state = UiState.BUSY
         self._active_operation = operation
         self._set_busy(True)
@@ -884,11 +890,8 @@ class StitcherApp:
         self._events.put((kind, payload))
 
     def _requested_render_operation(self) -> str | None:
-        if self._state is UiState.READY:
-            return "preview"
-        if self._state is UiState.PREVIEW:
-            return "render"
-        return None
+        operation = requested_render_operation(self._state.name.lower())
+        return operation.value if operation is not None else None
 
     def render(self) -> None:
         operation = self._requested_render_operation()
@@ -901,21 +904,18 @@ class StitcherApp:
             self._start_worker("preview")
             return
         output_path = self._output_path_preview()
-        coverage_path = (
-            output_path.with_name(f"{output_path.stem}-coverage.png")
-            if output_path is not None and self.coverage_var.get()
+        output_plan = (
+            plan_outputs(
+                output_path.parent,
+                output_path.name,
+                output_path.suffix,
+                coverage=self.coverage_var.get(),
+                thumbnail=self.session_thumbnail_var.get(),
+            )
+            if output_path is not None
             else None
         )
-        thumbnail_path = (
-            thumbnail_output_path(output_path)
-            if output_path is not None and self.session_thumbnail_var.get()
-            else None
-        )
-        existing = [
-            path
-            for path in (output_path, coverage_path, thumbnail_path)
-            if path is not None and path.exists()
-        ]
+        existing = output_plan.existing() if output_plan is not None else ()
         if existing:
             if not messagebox.askyesno(
                 "Overwrite existing file?",
@@ -1164,14 +1164,15 @@ class StitcherApp:
 
     def _discard_exposure_changes(self) -> None:
         if self._manual_gains:
-            self._manual_gains = (1.0,) * len(self._manual_gains)
+            self._manual_gains = ExposureEdits(self._manual_gains).discard().gains
             self.discard_exposure_button.pack_forget()
             self.exposure_status_label.configure(text="")
             self.exposure_status_label.grid_remove()
             self._start_worker("preview")
 
     def cancel(self) -> None:
-        if self._cancel_event is not None:
+        if cancellation_requested(self._cancel_event is not None):
+            assert self._cancel_event is not None
             self._cancel_event.set()
             self.status_var.set("Cancellation requested…")
 
@@ -1180,14 +1181,14 @@ class StitcherApp:
             LOGGER.info("%s started", operation)
             self._emit_event("backend", ("selecting", "checking GPU availability and VRAM"))
             session_path, image_dir = self._input_paths()
-            session = load_session(session_path, image_directory=image_dir)
             allow_incomplete = self.allow_incomplete_var.get()
-            validate_images(session, image_dir, allow_incomplete, self._cancel_event)
+            session = validate_session_request(
+                session_path, image_dir, allow_incomplete, self._cancel_event
+            )
             if operation == "validate":
                 if self._cancel_event is not None and self._cancel_event.is_set():
                     raise RenderCancelledError("render cancelled")
-                renderable = renderable_session(session, image_dir, allow_incomplete)
-                native = estimate_render_resources(renderable, image_dir, None, 1024 * MIB, None)
+                native = estimate_render_resources(session, image_dir, None, 1024 * MIB, None)
                 self._emit_event(
                     "resolution",
                     (
@@ -1198,7 +1199,6 @@ class StitcherApp:
                 self._emit_event("validated", f"Valid session: {session.session_id}")
                 return
             output_dir = self._output_directory()
-            session = renderable_session(session, image_dir, allow_incomplete)
             manual_gains = (
                 self._manual_gains
                 if len(self._manual_gains) == len(session.frames)
@@ -1224,10 +1224,15 @@ class StitcherApp:
                         else ()
                     ),
                 )
-                updated = list(manual_gains)
-                for position in self._selected_poses:
-                    updated[position] *= gain
-                manual_gains = tuple(updated)
+                manual_gains = (
+                    ExposureEdits(
+                        manual_gains,
+                        self._target_pose,
+                        frozenset(self._selected_poses),
+                    )
+                    .apply_match(gain)
+                    .gains
+                )
             elif operation == "automatic_exposure":
                 if self._target_pose is None:
                     raise ValueError("select a target exposure pose")
@@ -1522,8 +1527,10 @@ class StitcherApp:
                     self.discard_preview()
                     self.status_var.set(payload)
                 elif kind == "idle":
-                    if self._state is UiState.BUSY:
-                        self._state = self._state_before_busy
+                    restored = finish_operation(
+                        self._state.name.lower(), self._state_before_busy.name.lower()
+                    )
+                    self._state = UiState[restored.upper()]
                     self._active_operation = None
                     self._set_busy(False)
                     if self._close_when_idle:

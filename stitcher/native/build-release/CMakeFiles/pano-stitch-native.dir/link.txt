@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/pano-stitch-native.dir/src/pano_app_main.cpp.o -o pano-stitch-native  -Wl,-rpath,/home/pogorelov/panorama-taker/stitcher/native/build-release libpano_app_core.a libyyjson.a _deps/openexr-build/src/lib/OpenEXRCore/libOpenEXRCore-3_4.a _deps/imath-build/src/Imath/libImath-3_2.a -lm -ldl -lm libpano_gpu.so 

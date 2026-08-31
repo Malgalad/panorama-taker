@@ -40,14 +40,14 @@ def test_release_versions_are_synchronized() -> None:
         assert declaration in (project_root / relative_path).read_text()
 
 
-def test_windows_release_script_builds_one_cross_vendor_archive() -> None:
+def test_windows_release_script_builds_python_comparison_and_native_archives() -> None:
     script = (
         Path(__file__).resolve().parents[2] / "release" / "build-windows-release.ps1"
     ).read_text(encoding="utf-8")
 
     assert '.venv-release"' in script
     assert '"$projectRoot\\stitcher[bundle]"' in script
-    assert "PanoramaCapture-Stitcher-$Version-win-x64.zip" in script
+    assert '"PanoramaCapture-Stitcher-$Version-$archiveSuffix.zip"' in script
     assert "function New-DeterministicZip" in script
     assert "Sort-Object" in script
     assert "2000, 1, 1, 0, 0, 0" in script
@@ -55,18 +55,29 @@ def test_windows_release_script_builds_one_cross_vendor_archive() -> None:
     assert '$env:SOURCE_DATE_EPOCH = "946684800"' in script
     assert "$maximumBundleBytes" in script
     assert "$maximumArchiveBytes" in script
-    assert (
-        'Copy-Item (Join-Path $pyInstallerDist "PanoramaCaptureStitcher") $stitcherStage' in script
-    )
+    assert '[ValidateSet("python", "comparison", "native")]' in script
+    assert '[string]$StitcherFrontend = "python"' in script
+    assert '"PanoramaCaptureStitcher-Python"' in script
+    assert '"PanoramaCaptureStitcher-Native.exe"' in script
+    assert '"comparison-win-x64"' in script
+    assert '"native-candidate-win-x64"' in script
+    assert 'if ($StitcherFrontend -eq "native")' in script
+    assert 'Copy-Item $nativeGui (Join-Path $stitcherStage "PanoramaCaptureStitcher.exe")' in script
+    assert 'Copy-Item $nativeDll (Join-Path $stitcherStage "pano_gpu.dll")' in script
+    assert 'Copy-Item "$projectRoot\\stitcher\\native\\third_party\\licenses"' in script
+    assert "foreach ($probeExecutable in $probeExecutables)" in script
     assert '"--specpath", $pyInstallerSpec' in script
     assert "Remove-Item -LiteralPath $buildRoot -Recurse -Force" in script
     assert "Removed temporary release build files from $buildRoot" in script
     assert 'cmake -S (Join-Path $projectRoot "stitcher\\native")' in script
     assert "cmake --build $nativeBuild --config Release" in script
     assert "ctest --test-dir $nativeBuild -C Release --output-on-failure" in script
+    assert 'if ($StitcherFrontend -eq "python")' in script
     assert '"--add-binary", "$nativeDll;pano_stitch"' in script
     assert "bundle must contain exactly one pano_gpu.dll" in script
-    assert '"--verify-gpu-runtime", $probeResult' in script
+    assert '$quotedProbeResult = "`"$probeResult`""' in script
+    assert '"--verify-gpu-runtime", $quotedProbeResult' in script
+    assert 'ArgumentList @("--verify-gpu-runtime", $probeResult)' not in script
     assert "Start-Process" in script
     assert "-Wait -PassThru" in script
     assert "$probeProcess.ExitCode -notin @(0, 2)" in script
@@ -96,14 +107,25 @@ def test_windows_archive_audit_covers_runtime_dependencies_hashes_and_spaces() -
     ).read_text(encoding="utf-8")
 
     assert '"build\\Panorama Capture Release Audit"' in script
-    assert '"--verify-gpu-runtime", $probeResult' in script
+    assert '$quotedProbeResult = "`"$probeResult`""' in script
+    assert script.count('"--verify-gpu-runtime", $quotedProbeResult') == 2
+    assert 'ArgumentList @("--verify-gpu-runtime", $probeResult)' not in script
     assert "Start-Process" in script
     assert "-Wait -PassThru" in script
     assert "dumpbin.exe /dependents" in script
     assert "archive_sha256=" in script
-    assert "executable_sha256=" in script
+    assert '"executables:"' in script
+    assert '"PanoramaCaptureStitcher-Python.exe"' in script
+    assert '"PanoramaCaptureStitcher-Native.exe"' in script
     assert "native_dll_sha256=" in script
-    assert "Corrupted native DLL must produce runtime-failure exit 3" in script
+    assert "[switch]$RequireNativeOnly" in script
+    assert '"payload_mode=$(if ($RequireNativeOnly)' in script
+    assert "Native-only archive contains Python runtime payload" in script
+    assert "Native-only archive depends on an external MSVC redistributable" in script
+    assert (
+        "Corrupted native DLL must make $($executable.Name) produce runtime-failure exit 3"
+        in script
+    )
     assert "shader_source_sha256:" in script
     assert "d3dcompiler|nvrtc|cudart|cupy|cuda" in script
     assert "\\.(hlsl|cso|pdb)" in script

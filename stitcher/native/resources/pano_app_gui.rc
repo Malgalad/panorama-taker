@@ -1,0 +1,5 @@
+#include "pano_app_resource.h"
+
+PANO_APP_ICON ICON "@PANO_APP_ICON@"
+PANO_APP_UI_HTML RCDATA "pano_app_ui_embedded.html"
+PANO_APP_EXPOSURE_HTML RCDATA "pano_app_exposure_embedded.html"

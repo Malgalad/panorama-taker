@@ -1,0 +1,8 @@
+#ifndef PANO_APP_RESOURCE_H
+#define PANO_APP_RESOURCE_H
+
+#define PANO_APP_UI_HTML 201
+#define PANO_APP_ICON 202
+#define PANO_APP_EXPOSURE_HTML 203
+
+#endif

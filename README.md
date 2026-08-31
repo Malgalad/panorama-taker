@@ -40,6 +40,14 @@ For a D3D12 smoke test, leave **Use GPU acceleration** enabled, select a
 completed session, and render a preview. The status must identify the D3D12 adapter rather than a
 CPU fallback.
 
+The native stitcher requires and uses its embedded WebView2 interface by default; it does not
+silently fall back to the previous Win32 interface. Launch it from a console with `--native-ui`
+to opt into that interface during the transition period.
+
+The editable WebView sources are `stitcher/native/resources/pano_app_ui.html`,
+`pano_app_ui.css`, and `pano_app_ui.js`. The native build inlines all three into one generated
+HTML resource; those source files are not shipped beside the executable.
+
 Release diagnostics can be written without opening the GUI:
 
 ```text

@@ -1,0 +1,67 @@
+execute_process(
+    COMMAND "${GUI_EXECUTABLE}" --self-test
+    RESULT_VARIABLE result)
+
+if(result EQUAL 11)
+    set(detail "cannot create the hidden Win32 window")
+elseif(result EQUAL 12)
+    set(detail "96/144/192-DPI layout metrics differ")
+elseif(result EQUAL 13)
+    set(detail "a required control is missing or lacks WS_TABSTOP")
+elseif(result EQUAL 14)
+    set(detail "the first window close failed")
+elseif(result EQUAL 15)
+    set(detail "the repeated window close unexpectedly succeeded")
+elseif(result EQUAL 16)
+    set(detail "stale refresh rejection or current row presentation failed")
+elseif(result EQUAL 21)
+    set(detail "InitCommonControlsEx failed")
+elseif(result EQUAL 22)
+    set(detail "RegisterClassExW failed")
+elseif(result EQUAL 23)
+    set(detail "the visible-window path was entered and window creation failed")
+elseif(result EQUAL 24)
+    set(detail "COM apartment initialization failed")
+elseif(NOT result EQUAL 0)
+    set(detail "unexpected loader or self-test exit ${result}")
+endif()
+
+if(DEFINED detail)
+    message(FATAL_ERROR "pano-stitch-native-gui self-test failed: ${detail}")
+endif()
+
+set(probe_result "${CMAKE_CURRENT_BINARY_DIR}/pano-app-gui-runtime-probe.txt")
+file(REMOVE "${probe_result}")
+execute_process(
+    COMMAND "${GUI_EXECUTABLE}" --verify-gpu-runtime "${probe_result}"
+    RESULT_VARIABLE probe_exit)
+if(NOT EXISTS "${probe_result}")
+    message(FATAL_ERROR "native GUI runtime probe produced no diagnostic file")
+endif()
+file(READ "${probe_result}" probe_detail)
+file(REMOVE "${probe_result}")
+if(NOT probe_exit EQUAL 0 AND NOT probe_exit EQUAL 2)
+    message(FATAL_ERROR
+            "native GUI runtime probe failed with exit ${probe_exit}: ${probe_detail}")
+endif()
+
+set(corrupt_root "${CMAKE_CURRENT_BINARY_DIR}/pano-app-gui-corrupt-probe")
+file(REMOVE_RECURSE "${corrupt_root}")
+file(MAKE_DIRECTORY "${corrupt_root}")
+file(COPY "${GUI_EXECUTABLE}" DESTINATION "${corrupt_root}")
+get_filename_component(gui_name "${GUI_EXECUTABLE}" NAME)
+file(WRITE "${corrupt_root}/pano_gpu.dll" "invalid")
+set(corrupt_result "${corrupt_root}/result.txt")
+execute_process(
+    COMMAND "${corrupt_root}/${gui_name}" --verify-gpu-runtime "${corrupt_result}"
+    RESULT_VARIABLE corrupt_exit)
+if(EXISTS "${corrupt_result}")
+    file(READ "${corrupt_result}" corrupt_detail)
+else()
+    set(corrupt_detail "no diagnostic file")
+endif()
+file(REMOVE_RECURSE "${corrupt_root}")
+if(NOT corrupt_exit EQUAL 3)
+    message(FATAL_ERROR
+            "corrupt native DLL probe returned ${corrupt_exit}: ${corrupt_detail}")
+endif()

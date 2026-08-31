@@ -11,6 +11,13 @@
 #include <numeric>
 #include <vector>
 
+#if defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace
 {
 bool expect(const bool condition, const char *const expression, const int line)
@@ -64,6 +71,10 @@ int main(const int argc, char **const argv)
     EXPECT(sizeof(pano_gpu_preview_diagnostics) == 72);
     EXPECT(sizeof(pano_gpu_preview_render_request) == 48);
     EXPECT(sizeof(pano_gpu_preview_overlay_request) == 80);
+    EXPECT(sizeof(pano_gpu_preview_surface_create_options) == 24);
+    EXPECT(sizeof(pano_gpu_preview_surface_diagnostics) == 48);
+    EXPECT(sizeof(pano_gpu_preview_surface_present_request) == 28);
+    EXPECT(sizeof(pano_gpu_preview_surface_overlay_request) == 64);
     EXPECT(sizeof(pano_gpu_exposure_pair_scratch_diagnostics) == 48);
     EXPECT(sizeof(pano_gpu_exposure_pair_reduction) == 40);
 
@@ -122,6 +133,20 @@ int main(const int argc, char **const argv)
     EXPECT(memory_plan.readback_bytes == 64 * 1024);
     EXPECT(memory_plan.required_bytes == 384 * 1024);
     EXPECT(memory_plan.required_bytes <= memory_plan.available_bytes);
+    pano_gpu_memory_request capped_request = request;
+    capped_request.free_bytes = 31ULL * 1024 * 1024 * 1024;
+    capped_request.total_bytes = 32ULL * 1024 * 1024 * 1024;
+    capped_request.requested_budget_bytes = 512ULL * 1024 * 1024;
+    EXPECT(pano_gpu_plan_memory(
+               &capped_request, &memory_plan, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(memory_plan.available_bytes == capped_request.requested_budget_bytes);
+    pano_gpu_memory_request low_free_request = capped_request;
+    low_free_request.free_bytes = 4ULL * 1024 * 1024 * 1024;
+    low_free_request.requested_budget_bytes = 8ULL * 1024 * 1024 * 1024;
+    EXPECT(pano_gpu_plan_memory(
+               &low_free_request, &memory_plan, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_UNAVAILABLE);
     uint32_t pair_count = 99;
     EXPECT(pano_gpu_exposure_pair_count(
                0, &pair_count, error.data(), static_cast<uint32_t>(error.size())) == PANO_GPU_INVALID_ARGUMENT);
@@ -190,6 +215,35 @@ int main(const int argc, char **const argv)
            PANO_GPU_SUCCESS);
     EXPECT(memory_plan.output_band_rows == 32);
     EXPECT(memory_plan.required_bytes <= memory_plan.available_bytes);
+    pano_gpu_memory_request natural_request {};
+    natural_request.size = sizeof(natural_request);
+    natural_request.abi_version = PANO_GPU_ABI_VERSION;
+    natural_request.frame_count = 30;
+    natural_request.source_width = 3840;
+    natural_request.source_height = 2160;
+    natural_request.source_sample_bytes = 2;
+    natural_request.output_width = 17552;
+    natural_request.output_height = 8776;
+    natural_request.output_sample_bytes = 1;
+    natural_request.needs_sdr_conversion = 1;
+    natural_request.free_bytes = 31ULL * 1024 * 1024 * 1024;
+    natural_request.total_bytes = 32ULL * 1024 * 1024 * 1024;
+    natural_request.requested_budget_bytes = 4096ULL * 1024 * 1024;
+    natural_request.preview_cache_bytes = 24ULL * 1024 * 1024;
+    natural_request.session_workspace_bytes = 64ULL * 1024;
+    natural_request.output_workspace_bytes_per_pixel = 62 + 21 * 30;
+    natural_request.output_workspace_fixed_bytes =
+        4096ULL * sizeof(uint32_t) + (4ULL * 30 + 16) * 64 * 1024;
+    natural_request.upload_bytes = 100ULL * 1024 * 1024;
+    natural_request.readback_bytes_per_pixel = 12;
+    natural_request.descriptor_count = 34;
+    EXPECT(pano_gpu_plan_memory(
+               &natural_request, &memory_plan, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(memory_plan.available_bytes == natural_request.requested_budget_bytes);
+    EXPECT(memory_plan.output_band_rows >= 32);
+    EXPECT(memory_plan.output_band_rows % 32 == 0);
+    EXPECT(memory_plan.required_bytes <= natural_request.requested_budget_bytes);
     pano_gpu_diagnostics diagnostics {};
     diagnostics.size = sizeof(diagnostics);
     diagnostics.abi_version = PANO_GPU_ABI_VERSION;
@@ -514,6 +568,155 @@ int main(const int argc, char **const argv)
     EXPECT(read_preview == retained_preview_pixels);
     EXPECT(read_overview == retained_overview_pixels);
     EXPECT(read_masks == retained_compact_masks);
+    HWND preview_window = CreateWindowExW(
+        0, L"STATIC", L"", WS_POPUP, 0, 0, 4, 2, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    EXPECT(preview_window != nullptr);
+    pano_gpu_preview_surface_create_options surface_options {};
+    surface_options.size = sizeof(surface_options);
+    surface_options.abi_version = PANO_GPU_ABI_VERSION;
+    surface_options.native_window = static_cast<uint64_t>(
+        reinterpret_cast<uintptr_t>(preview_window));
+    surface_options.width = 4;
+    surface_options.height = 2;
+    pano_gpu_preview_surface *surface = nullptr;
+    EXPECT(pano_gpu_preview_surface_create(
+               device, &surface_options, &surface, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    pano_gpu_preview_surface_present_request surface_request {};
+    surface_request.size = sizeof(surface_request);
+    surface_request.abi_version = PANO_GPU_ABI_VERSION;
+    surface_request.use_overview = 1;
+    EXPECT(pano_gpu_preview_surface_present_base(
+               surface, retained_preview, &surface_request, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    std::array<uint8_t, 32> surface_pixels {};
+    EXPECT(pano_gpu_test_read_preview_surface(
+               surface, surface_pixels.data(), surface_pixels.size(),
+               error.data(), static_cast<uint32_t>(error.size())) ==
+           PANO_GPU_SUCCESS);
+    std::array<uint8_t, 32> expected_surface {};
+    for (size_t pixel = 0; pixel < 8; ++pixel)
+    {
+        std::copy_n(retained_overview_pixels.begin() + pixel * 3, 3,
+                    expected_surface.begin() + pixel * 4);
+        expected_surface[pixel * 4 + 3] = 255;
+    }
+    EXPECT(surface_pixels == expected_surface);
+    surface_request.use_overview = 0;
+    surface_request.crop_left = 2;
+    surface_request.crop_top = 1;
+    surface_request.crop_width = 4;
+    surface_request.crop_height = 2;
+    EXPECT(pano_gpu_preview_surface_present_base(
+               surface, retained_preview, &surface_request, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(pano_gpu_test_read_preview_surface(
+               surface, surface_pixels.data(), surface_pixels.size(),
+               error.data(), static_cast<uint32_t>(error.size())) ==
+           PANO_GPU_SUCCESS);
+    for (uint32_t y = 0; y < 2; ++y)
+        for (uint32_t x = 0; x < 4; ++x)
+        {
+            const size_t source = ((1U + y) * 8U + 2U + x) * 3U;
+            const size_t destination = (y * 4U + x) * 4U;
+            std::copy_n(retained_preview_pixels.begin() + source, 3,
+                        expected_surface.begin() + destination);
+            expected_surface[destination + 3] = 255;
+        }
+    EXPECT(surface_pixels == expected_surface);
+    std::array<uint8_t, 1> surface_hovered {1};
+    std::array<uint8_t, 24> expected_overlay_rgb {};
+    pano_gpu_preview_overlay_request expected_overlay {};
+    expected_overlay.size = sizeof(expected_overlay);
+    expected_overlay.abi_version = PANO_GPU_ABI_VERSION;
+    expected_overlay.use_overview = 1;
+    expected_overlay.hovered_frames = surface_hovered.data();
+    expected_overlay.hovered_frame_bytes = surface_hovered.size();
+    expected_overlay.target_pose = 0;
+    expected_overlay.target_mode = 1;
+    expected_overlay.show_boundaries = 1;
+    expected_overlay.output_rgb8 = expected_overlay_rgb.data();
+    expected_overlay.output_rgb8_bytes = expected_overlay_rgb.size();
+    EXPECT(pano_gpu_preview_render_overlay(
+               retained_preview, &expected_overlay, nullptr, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    pano_gpu_preview_surface_overlay_request surface_overlay {};
+    surface_overlay.size = sizeof(surface_overlay);
+    surface_overlay.abi_version = PANO_GPU_ABI_VERSION;
+    surface_overlay.use_overview = 1;
+    surface_overlay.hovered_frames = surface_hovered.data();
+    surface_overlay.hovered_frame_bytes = surface_hovered.size();
+    surface_overlay.target_pose = 0;
+    surface_overlay.target_mode = 1;
+    surface_overlay.show_boundaries = 1;
+    EXPECT(pano_gpu_preview_surface_present_overlay(
+               surface, retained_preview, &surface_overlay, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(pano_gpu_test_read_preview_surface(
+               surface, surface_pixels.data(), surface_pixels.size(),
+               error.data(), static_cast<uint32_t>(error.size())) ==
+           PANO_GPU_SUCCESS);
+    for (size_t pixel = 0; pixel < 8; ++pixel)
+    {
+        EXPECT(std::equal(expected_overlay_rgb.begin() + pixel * 3,
+                          expected_overlay_rgb.begin() + pixel * 3 + 3,
+                          surface_pixels.begin() + pixel * 4));
+        EXPECT(surface_pixels[pixel * 4 + 3] == 255);
+    }
+    if (hardware_full)
+    {
+        std::vector<double> surface_latencies_ms;
+        surface_latencies_ms.reserve(31);
+        for (unsigned iteration = 0; iteration < 31; ++iteration)
+        {
+            surface_hovered[0] = static_cast<uint8_t>(iteration & 1U);
+            const auto started = std::chrono::steady_clock::now();
+            EXPECT(pano_gpu_preview_surface_present_overlay(
+                       surface, retained_preview, &surface_overlay,
+                       error.data(), static_cast<uint32_t>(error.size())) ==
+                   PANO_GPU_SUCCESS);
+            surface_latencies_ms.push_back(
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - started)
+                    .count());
+        }
+        std::sort(surface_latencies_ms.begin(), surface_latencies_ms.end());
+        const double p95 = surface_latencies_ms[29];
+        std::fprintf(stderr,
+                     "physical swap-chain preview latency: median=%.3fms "
+                     "p95=%.3fms\n",
+                     surface_latencies_ms[15], p95);
+        EXPECT(p95 < 1000.0 / 60.0);
+    }
+    pano_gpu_test_fail_next_preview_surface_device_removed();
+    EXPECT(pano_gpu_preview_surface_present_base(
+               surface, retained_preview, &surface_request, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_UNAVAILABLE);
+    pano_gpu_preview_surface_diagnostics lost_diagnostics {};
+    lost_diagnostics.size = sizeof(lost_diagnostics);
+    lost_diagnostics.abi_version = PANO_GPU_ABI_VERSION;
+    EXPECT(pano_gpu_preview_surface_query_diagnostics(
+               surface, &lost_diagnostics, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(lost_diagnostics.device_lost == 1U);
+    pano_gpu_preview_surface_destroy(&surface);
+    pano_gpu_preview_surface_destroy(&surface);
+    EXPECT(surface == nullptr);
+    EXPECT(pano_gpu_preview_surface_create(
+               device, &surface_options, &surface, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(pano_gpu_preview_surface_present_base(
+               surface, retained_preview, &surface_request, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    lost_diagnostics.device_lost = 1U;
+    EXPECT(pano_gpu_preview_surface_query_diagnostics(
+               surface, &lost_diagnostics, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(lost_diagnostics.device_lost == 0U &&
+           lost_diagnostics.live_surface_count == 1U);
+    pano_gpu_preview_surface_destroy(&surface);
+    EXPECT(DestroyWindow(preview_window) != FALSE);
     std::array<uint8_t, 24> viewport_pixels {};
     pano_gpu_preview_render_request preview_render {};
     preview_render.size = sizeof(preview_render);
@@ -587,8 +790,24 @@ int main(const int argc, char **const argv)
     EXPECT(viewport_pixels[0] == 0);
     EXPECT(viewport_pixels[1] == 102);
     EXPECT(viewport_pixels[2] == 255);
-    hovered_frames[0] = 0;
+    std::array<uint8_t, 8> solid_masks {};
+    solid_masks.fill(1);
+    preview_options.compact_masks = solid_masks.data();
+    pano_gpu_preview *solid_preview = nullptr;
+    EXPECT(pano_gpu_preview_create(
+               session, &preview_options, &solid_preview, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
     overlay_request.target_mode = 0;
+    overlay_request.show_boundaries = 0;
+    EXPECT(pano_gpu_preview_render_overlay(
+               solid_preview, &overlay_request, nullptr, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(viewport_pixels[0] < 16);
+    EXPECT(viewport_pixels[1] > 20);
+    EXPECT(viewport_pixels[2] > 50);
+    pano_gpu_preview_destroy(&solid_preview);
+    preview_options.compact_masks = retained_compact_masks.data();
+    hovered_frames[0] = 0;
     overlay_request.show_boundaries = 1;
     EXPECT(pano_gpu_preview_render_overlay(
                retained_preview, &overlay_request, nullptr, error.data(),
@@ -3247,6 +3466,32 @@ int main(const int argc, char **const argv)
         EXPECT(reduced_equations[index].right_frame_index == graph_pairs[index][1]);
         EXPECT(std::fabs(reduced_equations[index].difference - direct_graph_reduction.difference) < 1.0e-6);
         EXPECT(std::fabs(reduced_equations[index].weight - direct_graph_reduction.weight) < 1.0e-6);
+    }
+    pano_gpu_session_clear_exposure_graph(session);
+    EXPECT(pano_gpu_session_prepare_exposure_graph(
+               session, 3, error.data(), static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(pano_gpu_session_enumerate_exposure_pairs(
+               session, error.data(), static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(pano_gpu_session_reduce_reference_exposure_graph(
+               session, &graph_pair_request, error.data(), static_cast<uint32_t>(error.size())) ==
+           PANO_GPU_SUCCESS);
+    reduced_graph_diagnostics = {};
+    reduced_graph_diagnostics.size = sizeof(reduced_graph_diagnostics);
+    reduced_graph_diagnostics.abi_version = PANO_GPU_ABI_VERSION;
+    EXPECT(pano_gpu_session_query_exposure_graph(
+               session, &reduced_graph_diagnostics, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(reduced_graph_diagnostics.pair_report_count == 3);
+    EXPECT(reduced_graph_diagnostics.equation_count == 3);
+    EXPECT(pano_gpu_session_copy_exposure_equations(
+               session, reduced_equations.data(), sizeof(reduced_equations), error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    for (size_t index = 0; index < graph_pairs.size(); ++index)
+    {
+        EXPECT(reduced_equations[index].left_frame_index == graph_pairs[index][0]);
+        EXPECT(reduced_equations[index].right_frame_index == graph_pairs[index][1]);
+        EXPECT(std::isfinite(reduced_equations[index].difference));
+        EXPECT(reduced_equations[index].weight > 0.0);
     }
     std::array<float, 192> classification_samples = sampled_pair_values;
     std::array<uint8_t, 32> classification_overlap = saved_pair_overlap;

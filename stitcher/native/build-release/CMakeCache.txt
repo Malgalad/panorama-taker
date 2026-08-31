@@ -14,8 +14,14 @@
 # EXTERNAL cache entries
 ########################
 
+//Build shared library
+BUILD_SHARED_LIBS:BOOL=OFF
+
 //Build the testing tree.
 BUILD_TESTING:BOOL=ON
+
+//Set ON to build website source
+BUILD_WEBSITE:BOOL=OFF
 
 //Path to a program.
 CMAKE_ADDR2LINE:FILEPATH=/usr/bin/addr2line
@@ -44,6 +50,9 @@ CMAKE_CXX_COMPILER_RANLIB:FILEPATH=/usr/bin/gcc-ranlib-11
 //Flags used by the CXX compiler during all build types.
 CMAKE_CXX_FLAGS:STRING=
 
+//Flags used by the C++ compiler during AddressSanitizer builds.
+CMAKE_CXX_FLAGS_ASAN:STRING=-fsanitize=address -fno-optimize-sibling-calls -fsanitize-address-use-after-scope -fno-omit-frame-pointer -g -O1
+
 //Flags used by the CXX compiler during DEBUG builds.
 CMAKE_CXX_FLAGS_DEBUG:STRING=-g
 
@@ -55,6 +64,35 @@ CMAKE_CXX_FLAGS_RELEASE:STRING=-O3 -DNDEBUG
 
 //Flags used by the CXX compiler during RELWITHDEBINFO builds.
 CMAKE_CXX_FLAGS_RELWITHDEBINFO:STRING=-O2 -g -DNDEBUG
+
+//C compiler
+CMAKE_C_COMPILER:FILEPATH=/usr/bin/cc
+
+//A wrapper around 'ar' adding the appropriate '--plugin' option
+// for the GCC compiler
+CMAKE_C_COMPILER_AR:FILEPATH=/usr/bin/gcc-ar-11
+
+//A wrapper around 'ranlib' adding the appropriate '--plugin' option
+// for the GCC compiler
+CMAKE_C_COMPILER_RANLIB:FILEPATH=/usr/bin/gcc-ranlib-11
+
+//Flags used by the C compiler during all build types.
+CMAKE_C_FLAGS:STRING=
+
+//Flags used by the C compiler during DEBUG builds.
+CMAKE_C_FLAGS_DEBUG:STRING=-g
+
+//Flags used by the C compiler during MINSIZEREL builds.
+CMAKE_C_FLAGS_MINSIZEREL:STRING=-Os -DNDEBUG
+
+//Flags used by the C compiler during RELEASE builds.
+CMAKE_C_FLAGS_RELEASE:STRING=-O3 -DNDEBUG
+
+//Flags used by the C compiler during RELWITHDEBINFO builds.
+CMAKE_C_FLAGS_RELWITHDEBINFO:STRING=-O2 -g -DNDEBUG
+
+//Suffix for debug builds
+CMAKE_DEBUG_POSTFIX:STRING=_d
 
 //Path to a program.
 CMAKE_DLLTOOL:FILEPATH=CMAKE_DLLTOOL-NOTFOUND
@@ -77,8 +115,56 @@ CMAKE_EXE_LINKER_FLAGS_RELWITHDEBINFO:STRING=
 //Enable/Disable output of compile commands during generation.
 CMAKE_EXPORT_COMPILE_COMMANDS:BOOL=
 
+//User executables (bin)
+CMAKE_INSTALL_BINDIR:PATH=bin
+
+//Read-only architecture-independent data (DATAROOTDIR)
+CMAKE_INSTALL_DATADIR:PATH=
+
+//Read-only architecture-independent data root (share)
+CMAKE_INSTALL_DATAROOTDIR:PATH=share
+
+//Documentation root (DATAROOTDIR/doc/PROJECT_NAME)
+CMAKE_INSTALL_DOCDIR:PATH=
+
+//C header files (include)
+CMAKE_INSTALL_INCLUDEDIR:PATH=include
+
+//Info documentation (DATAROOTDIR/info)
+CMAKE_INSTALL_INFODIR:PATH=
+
+//Object code libraries (lib)
+CMAKE_INSTALL_LIBDIR:PATH=lib
+
+//Program executables (libexec)
+CMAKE_INSTALL_LIBEXECDIR:PATH=libexec
+
+//Locale-dependent data (DATAROOTDIR/locale)
+CMAKE_INSTALL_LOCALEDIR:PATH=
+
+//Modifiable single-machine data (var)
+CMAKE_INSTALL_LOCALSTATEDIR:PATH=var
+
+//Man documentation (DATAROOTDIR/man)
+CMAKE_INSTALL_MANDIR:PATH=
+
+//C header files for non-gcc (/usr/include)
+CMAKE_INSTALL_OLDINCLUDEDIR:PATH=/usr/include
+
 //Install path prefix, prepended onto install directories.
 CMAKE_INSTALL_PREFIX:PATH=/usr/local
+
+//Run-time variable data (LOCALSTATEDIR/run)
+CMAKE_INSTALL_RUNSTATEDIR:PATH=
+
+//System admin executables (sbin)
+CMAKE_INSTALL_SBINDIR:PATH=sbin
+
+//Modifiable architecture-independent data (com)
+CMAKE_INSTALL_SHAREDSTATEDIR:PATH=com
+
+//Read-only single-machine data (etc)
+CMAKE_INSTALL_SYSCONFDIR:PATH=etc
 
 //Path to a program.
 CMAKE_LINKER:FILEPATH=/usr/bin/ld
@@ -123,6 +209,21 @@ CMAKE_PROJECT_HOMEPAGE_URL:STATIC=
 
 //Value Computed by CMake
 CMAKE_PROJECT_NAME:STATIC=PanoramaStitchNative
+
+//Value Computed by CMake
+CMAKE_PROJECT_VERSION:STATIC=3.2.2
+
+//Value Computed by CMake
+CMAKE_PROJECT_VERSION_MAJOR:STATIC=3
+
+//Value Computed by CMake
+CMAKE_PROJECT_VERSION_MINOR:STATIC=2
+
+//Value Computed by CMake
+CMAKE_PROJECT_VERSION_PATCH:STATIC=2
+
+//Value Computed by CMake
+CMAKE_PROJECT_VERSION_TWEAK:STATIC=
 
 //Path to a program.
 CMAKE_RANLIB:FILEPATH=/usr/bin/ranlib
@@ -202,6 +303,121 @@ CTEST_SUBMIT_RETRY_DELAY:STRING=5
 //Maximum time allowed before CTest will kill the test.
 DART_TESTING_TIMEOUT:STRING=1500
 
+//Directory under which to collect all populated content
+FETCHCONTENT_BASE_DIR:PATH=/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps
+
+//Disables all attempts to download or update content and assumes
+// source dirs already exist
+FETCHCONTENT_FULLY_DISCONNECTED:BOOL=OFF
+
+//Enables QUIET option for all content population
+FETCHCONTENT_QUIET:BOOL=ON
+
+//When not empty, overrides where to find pre-populated content
+// for imath
+FETCHCONTENT_SOURCE_DIR_IMATH:PATH=
+
+//When not empty, overrides where to find pre-populated content
+// for openexr
+FETCHCONTENT_SOURCE_DIR_OPENEXR:PATH=
+
+//Enables UPDATE_DISCONNECTED behavior for all content population
+FETCHCONTENT_UPDATES_DISCONNECTED:BOOL=OFF
+
+//Enables UPDATE_DISCONNECTED behavior just for population of imath
+FETCHCONTENT_UPDATES_DISCONNECTED_IMATH:BOOL=OFF
+
+//Enables UPDATE_DISCONNECTED behavior just for population of openexr
+FETCHCONTENT_UPDATES_DISCONNECTED_OPENEXR:BOOL=OFF
+
+//Real namespace for Iex that will end up in compiled symbols
+IEX_INTERNAL_NAMESPACE:STRING=Iex_3_4
+
+//Public namespace alias for Iex
+IEX_NAMESPACE:STRING=Iex
+
+//Whether the namespace has been customized (so external users
+// know)
+IEX_NAMESPACE_CUSTOM:STRING=0
+
+//Real namespace for IlmThread that will end up in compiled symbols
+ILMTHREAD_INTERNAL_NAMESPACE:STRING=IlmThread_3_4
+
+//Public namespace alias for IlmThread
+ILMTHREAD_NAMESPACE:STRING=IlmThread
+
+//Whether the namespace has been customized (so external users
+// know)
+ILMTHREAD_NAMESPACE_CUSTOM:STRING=0
+
+//Do not build Imath tests
+IMATH_BUILD_TESTS:BOOL=OFF
+
+//C++ standard to compile against
+IMATH_CXX_STANDARD:STRING=14
+
+//Enables code to take advantage of large stack support
+IMATH_ENABLE_LARGE_STACK:BOOL=OFF
+
+//Convert half-to-float using a lookup table (on by default)
+IMATH_HALF_USE_LOOKUP_TABLE:BOOL=ON
+
+//Install Imath library
+IMATH_INSTALL:BOOL=OFF
+
+//Install Imath.pc file
+IMATH_INSTALL_PKG_CONFIG:BOOL=ON
+
+//Create symbolic links for shared objects
+IMATH_INSTALL_SYM_LINK:BOOL=ON
+
+//Real namespace for Imath that will end up in compiled symbols
+IMATH_INTERNAL_NAMESPACE:STRING=Imath_3_2
+
+//string added to the end of all the libraries
+IMATH_LIB_SUFFIX:STRING=-3_2
+
+//Public namespace alias for Imath
+IMATH_NAMESPACE:STRING=Imath
+
+//Whether the namespace has been customized (so external users
+// know)
+IMATH_NAMESPACE_CUSTOM:STRING=0
+
+//Destination sub-folder of the include path for install
+IMATH_OUTPUT_SUBDIR:STRING=Imath
+
+//Public string / label for displaying package
+IMATH_PACKAGE_NAME:STRING=Imath 3.2.2
+
+//name to append to static library (in addition to normal suffix)
+IMATH_STATIC_LIB_SUFFIX:STRING=_static
+
+//Check if clang-tidy is available, and enable that
+IMATH_USE_CLANG_TIDY:BOOL=OFF
+
+//Makes the compile use default visibility (by default compiles
+// tidy, hidden-by-default)
+IMATH_USE_DEFAULT_VISIBILITY:BOOL=OFF
+
+//Compile with noexcept specifier
+IMATH_USE_NOEXCEPT:BOOL=ON
+
+//Extra version tag string for Imath build, such as -dev, -beta1,
+// etc.
+IMATH_VERSION_RELEASE_TYPE:STRING=
+
+//Value Computed by CMake
+Imath_BINARY_DIR:STATIC=/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/imath-build
+
+Imath_DIR:PATH=/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/imath-build/config
+
+//Value Computed by CMake
+Imath_IS_TOP_LEVEL:STATIC=OFF
+
+//Value Computed by CMake
+Imath_SOURCE_DIR:STATIC=/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/imath-src
+
 //Command to build the project
 MAKECOMMAND:STRING=/usr/bin/cmake --build . --config "${CTEST_CONFIGURATION_TYPE}"
 
@@ -210,6 +426,183 @@ MEMORYCHECK_COMMAND:FILEPATH=MEMORYCHECK_COMMAND-NOTFOUND
 
 //File that contains suppressions for the memory checker
 MEMORYCHECK_SUPPRESSIONS_FILE:FILEPATH=
+
+//Enables building command line executables
+OJPH_BUILD_EXECUTABLES:BOOL=OFF
+
+//Enables building ojph_stream_expand executable
+OJPH_BUILD_STREAM_EXPAND:BOOL=OFF
+
+//Enables building test code
+OJPH_BUILD_TESTS:BOOL=OFF
+
+//Disables the use of AVX SIMD instructions and associated files
+OJPH_DISABLE_AVX:BOOL=OFF
+
+//Disables the use of AVX2 SIMD instructions and associated files
+OJPH_DISABLE_AVX2:BOOL=OFF
+
+//Disables the use of AVX512 SIMD instructions and associated files
+OJPH_DISABLE_AVX512:BOOL=OFF
+
+//Disables the use of NEON SIMD instructions and associated files
+OJPH_DISABLE_NEON:BOOL=OFF
+
+//Disables the use of SIMD instructions -- agnostic to architectures
+OJPH_DISABLE_SIMD:BOOL=OFF
+
+//Disables the use of SSE SIMD instructions and associated files
+OJPH_DISABLE_SSE:BOOL=OFF
+
+//Disables the use of SSE2 SIMD instructions and associated files
+OJPH_DISABLE_SSE2:BOOL=OFF
+
+//Disables the use of SSE4 SIMD instructions and associated files
+OJPH_DISABLE_SSE4:BOOL=OFF
+
+//Disables the use of SSSE3 SIMD instructions and associated files
+OJPH_DISABLE_SSSE3:BOOL=OFF
+
+//Enables input and output support for TIFF files
+OJPH_ENABLE_TIFF_SUPPORT:BOOL=ON
+
+//Install OpenJPH libraries, headers, and CMake config
+OJPH_INSTALL:BOOL=OFF
+
+//Bundled OpenJPH library type
+OJPH_LIB_TYPE:STRING=OBJECT
+
+//Build and install OpenEXR examples
+OPENEXR_BUILD_EXAMPLES:BOOL=OFF
+
+//Enables building of main libraries
+OPENEXR_BUILD_LIBS:BOOL=ON
+
+//Build the oss-fuzz fuzzers
+OPENEXR_BUILD_OSS_FUZZ:BOOL=OFF
+
+//Build python bindings
+OPENEXR_BUILD_PYTHON:BOOL=OFF
+
+//Enables building of utility programs
+OPENEXR_BUILD_TOOLS:BOOL=OFF
+
+//C++ standard to compile against
+OPENEXR_CXX_STANDARD:STRING=17
+
+//Enables code to take advantage of large stack support
+OPENEXR_ENABLE_LARGE_STACK:BOOL=OFF
+
+//Enables threaded processing of requests
+OPENEXR_ENABLE_THREADING:BOOL=ON
+
+//Path to a library.
+OPENEXR_EXTRA_MATH_LIB:FILEPATH=/usr/lib/x86_64-linux-gnu/libm.so
+
+//Force using an internal libdeflate
+OPENEXR_FORCE_INTERNAL_DEFLATE:BOOL=ON
+
+//Force using an internal imath
+OPENEXR_FORCE_INTERNAL_IMATH:BOOL=ON
+
+//Force downloading OpenJPH from a git repo
+OPENEXR_FORCE_INTERNAL_OPENJPH:BOOL=OFF
+
+//Repo for auto-build of Imath
+OPENEXR_IMATH_REPO:STRING=https://github.com/AcademySoftwareFoundation/Imath.git
+
+//Tag for auto-build of Imath (branch, tag, or SHA)
+OPENEXR_IMATH_TAG:STRING=v3.2.2
+
+//Public namespace alias for OpenEXR
+OPENEXR_IMF_NAMESPACE:STRING=Imf
+
+//Install OpenEXR libraries/binaries/bindings
+OPENEXR_INSTALL:BOOL=OFF
+
+//Install OpenEXR developer tools
+OPENEXR_INSTALL_DEVELOPER_TOOLS:BOOL=OFF
+
+//Set ON to install tool manpages
+OPENEXR_INSTALL_DOCS:BOOL=OFF
+
+//Install OpenEXR.pc file
+OPENEXR_INSTALL_PKG_CONFIG:BOOL=OFF
+
+//Install OpenEXR tools
+OPENEXR_INSTALL_TOOLS:BOOL=OFF
+
+//Real namespace for OpenEXR that will end up in compiled symbols
+OPENEXR_INTERNAL_IMF_NAMESPACE:STRING=Imf_3_4
+
+//string added to the end of all the libraries
+OPENEXR_LIB_SUFFIX:STRING=-3_4
+
+//Whether the namespace has been customized (so external users
+// know)
+OPENEXR_NAMESPACE_CUSTOM:STRING=0
+
+//Destination sub-folder of the include path for install
+OPENEXR_OUTPUT_SUBDIR:STRING=OpenEXR
+
+//Public string / label for displaying package
+OPENEXR_PACKAGE_NAME:STRING=OpenEXR 3.4.13
+
+//When building both static and shared, name to append to static
+// library (in addition to normal suffix)
+OPENEXR_STATIC_LIB_SUFFIX:STRING=_static
+
+//Run library tests
+OPENEXR_TEST_LIBRARIES:BOOL=ON
+
+//Run python binding tests
+OPENEXR_TEST_PYTHON:BOOL=ON
+
+//Run tool tests
+OPENEXR_TEST_TOOLS:BOOL=ON
+
+//Check if clang-tidy is available, and enable that
+OPENEXR_USE_CLANG_TIDY:BOOL=OFF
+
+//Makes the compile use default visibility (by default compiles
+// tidy, hidden-by-default)
+OPENEXR_USE_DEFAULT_VISIBILITY:BOOL=OFF
+
+//Switch internals of IlmThreadPool to use TBB by default
+OPENEXR_USE_TBB:BOOL=OFF
+
+//Extra version tag string for OpenEXR build, such as -dev, -beta1,
+// etc.
+OPENEXR_VERSION_RELEASE_TYPE:STRING=
+
+//Value Computed by CMake
+OpenEXR_BINARY_DIR:STATIC=/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/openexr-build
+
+OpenEXR_DIR:PATH=/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/openexr-build/cmake
+
+//Value Computed by CMake
+OpenEXR_IS_TOP_LEVEL:STATIC=OFF
+
+//Value Computed by CMake
+OpenEXR_SOURCE_DIR:STATIC=/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/openexr-src
+
+//Application contract fixture directory
+PANO_APP_FIXTURE_DIR:PATH=/home/pogorelov/panorama-taker/stitcher/native/../tests/fixtures/application_contracts
+
+//Codec contract fixture directory
+PANO_CODEC_FIXTURE_DIR:PATH=/home/pogorelov/panorama-taker/stitcher/native/../tests/fixtures/codecs
+
+//Arguments to supply to pkg-config
+PKG_CONFIG_ARGN:STRING=
+
+//pkg-config executable
+PKG_CONFIG_EXECUTABLE:FILEPATH=PKG_CONFIG_EXECUTABLE-NOTFOUND
+
+//Set ON to compile pybind11 PyImath bindings
+PYBIND11:BOOL=OFF
+
+//Set ON to compile boost PyImath bindings
+PYTHON:BOOL=OFF
 
 //Value Computed by CMake
 PanoramaStitchNative_BINARY_DIR:STATIC=/home/pogorelov/panorama-taker/stitcher/native/build-release
@@ -222,6 +615,18 @@ PanoramaStitchNative_SOURCE_DIR:STATIC=/home/pogorelov/panorama-taker/stitcher/n
 
 //Name of the computer/site where compile is being run
 SITE:STRING=DESKTOP-MFE1N0B
+
+//Value Computed by CMake
+openjph_BINARY_DIR:STATIC=/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/openexr-build/external/OpenJPH
+
+//The directory containing a CMake configuration file for openjph.
+openjph_DIR:PATH=openjph_DIR-NOTFOUND
+
+//Value Computed by CMake
+openjph_IS_TOP_LEVEL:STATIC=OFF
+
+//Value Computed by CMake
+openjph_SOURCE_DIR:STATIC=/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/openexr-src/external/OpenJPH
 
 
 ########################
@@ -266,6 +671,22 @@ CMAKE_CXX_FLAGS_MINSIZEREL-ADVANCED:INTERNAL=1
 CMAKE_CXX_FLAGS_RELEASE-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CMAKE_CXX_FLAGS_RELWITHDEBINFO
 CMAKE_CXX_FLAGS_RELWITHDEBINFO-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_C_COMPILER
+CMAKE_C_COMPILER-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_C_COMPILER_AR
+CMAKE_C_COMPILER_AR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_C_COMPILER_RANLIB
+CMAKE_C_COMPILER_RANLIB-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_C_FLAGS
+CMAKE_C_FLAGS-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_C_FLAGS_DEBUG
+CMAKE_C_FLAGS_DEBUG-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_C_FLAGS_MINSIZEREL
+CMAKE_C_FLAGS_MINSIZEREL-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_C_FLAGS_RELEASE
+CMAKE_C_FLAGS_RELEASE-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_C_FLAGS_RELWITHDEBINFO
+CMAKE_C_FLAGS_RELWITHDEBINFO-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CMAKE_DLLTOOL
 CMAKE_DLLTOOL-ADVANCED:INTERNAL=1
 //Executable file format
@@ -292,11 +713,47 @@ CMAKE_GENERATOR_INSTANCE:INTERNAL=
 CMAKE_GENERATOR_PLATFORM:INTERNAL=
 //Name of generator toolset.
 CMAKE_GENERATOR_TOOLSET:INTERNAL=
+//Test CMAKE_HAVE_LIBC_PTHREAD
+CMAKE_HAVE_LIBC_PTHREAD:INTERNAL=1
+//Have include pthread.h
+CMAKE_HAVE_PTHREAD_H:INTERNAL=1
 //Source directory with the top level CMakeLists.txt file for this
 // project
 CMAKE_HOME_DIRECTORY:INTERNAL=/home/pogorelov/panorama-taker/stitcher/native
+//ADVANCED property for variable: CMAKE_INSTALL_BINDIR
+CMAKE_INSTALL_BINDIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_INSTALL_DATADIR
+CMAKE_INSTALL_DATADIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_INSTALL_DATAROOTDIR
+CMAKE_INSTALL_DATAROOTDIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_INSTALL_DOCDIR
+CMAKE_INSTALL_DOCDIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_INSTALL_INCLUDEDIR
+CMAKE_INSTALL_INCLUDEDIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_INSTALL_INFODIR
+CMAKE_INSTALL_INFODIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_INSTALL_LIBDIR
+CMAKE_INSTALL_LIBDIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_INSTALL_LIBEXECDIR
+CMAKE_INSTALL_LIBEXECDIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_INSTALL_LOCALEDIR
+CMAKE_INSTALL_LOCALEDIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_INSTALL_LOCALSTATEDIR
+CMAKE_INSTALL_LOCALSTATEDIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_INSTALL_MANDIR
+CMAKE_INSTALL_MANDIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_INSTALL_OLDINCLUDEDIR
+CMAKE_INSTALL_OLDINCLUDEDIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_INSTALL_RUNSTATEDIR
+CMAKE_INSTALL_RUNSTATEDIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_INSTALL_SBINDIR
+CMAKE_INSTALL_SBINDIR-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: CMAKE_INSTALL_SHAREDSTATEDIR
+CMAKE_INSTALL_SHAREDSTATEDIR-ADVANCED:INTERNAL=1
 //Install .so files without execute permission.
 CMAKE_INSTALL_SO_NO_EXE:INTERNAL=1
+//ADVANCED property for variable: CMAKE_INSTALL_SYSCONFDIR
+CMAKE_INSTALL_SYSCONFDIR-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CMAKE_LINKER
 CMAKE_LINKER-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CMAKE_MAKE_PROGRAM
@@ -314,7 +771,7 @@ CMAKE_MODULE_LINKER_FLAGS_RELWITHDEBINFO-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CMAKE_NM
 CMAKE_NM-ADVANCED:INTERNAL=1
 //number of local generators
-CMAKE_NUMBER_OF_MAKEFILES:INTERNAL=1
+CMAKE_NUMBER_OF_MAKEFILES:INTERNAL=14
 //ADVANCED property for variable: CMAKE_OBJCOPY
 CMAKE_OBJCOPY-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: CMAKE_OBJDUMP
@@ -367,12 +824,42 @@ CTEST_SUBMIT_RETRY_COUNT-ADVANCED:INTERNAL=1
 CTEST_SUBMIT_RETRY_DELAY-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: DART_TESTING_TIMEOUT
 DART_TESTING_TIMEOUT-ADVANCED:INTERNAL=1
+//Details about finding Threads
+FIND_PACKAGE_MESSAGE_DETAILS_Threads:INTERNAL=[TRUE][v()]
+//Have library m
+HAVE_LIB_M:INTERNAL=1
+//Test IEX_HAVE_CONTROL_REGISTER_SUPPORT
+IEX_HAVE_CONTROL_REGISTER_SUPPORT:INTERNAL=1
+//Have include ucontext.h
+IEX_HAVE_UCONTEXT_H:INTERNAL=1
+//Have include semaphore.h
+ILMTHREAD_HAVE_SEMAPHORE_H:INTERNAL=1
+IMATH_CONFIG_DIR:INTERNAL=/home/pogorelov/panorama-taker/stitcher/native/build-release/_deps/imath-build/config
 //ADVANCED property for variable: MAKECOMMAND
 MAKECOMMAND-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: MEMORYCHECK_COMMAND
 MEMORYCHECK_COMMAND-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: MEMORYCHECK_SUPPRESSIONS_FILE
 MEMORYCHECK_SUPPRESSIONS_FILE-ADVANCED:INTERNAL=1
+//Have symbol aligned_alloc
+OJPH_ALIGNED_ALLOC_EXISTS:INTERNAL=1
+//ADVANCED property for variable: OPENEXR_EXTRA_MATH_LIB
+OPENEXR_EXTRA_MATH_LIB-ADVANCED:INTERNAL=1
+//Test OPENEXR_IMF_HAVE_GCC_INLINE_ASM_AVX
+OPENEXR_IMF_HAVE_GCC_INLINE_ASM_AVX:INTERNAL=1
+//Test OPENEXR_IMF_HAVE_SYSCONF_NPROCESSORS_ONLN
+OPENEXR_IMF_HAVE_SYSCONF_NPROCESSORS_ONLN:INTERNAL=1
+//Whether OpenEXR bundles vendored OpenJPH into OpenEXRCore (0
+// or 1)
+OPENEXR_USE_INTERNAL_OPENJPH:INTERNAL=1
+//ADVANCED property for variable: PKG_CONFIG_ARGN
+PKG_CONFIG_ARGN-ADVANCED:INTERNAL=1
+//ADVANCED property for variable: PKG_CONFIG_EXECUTABLE
+PKG_CONFIG_EXECUTABLE-ADVANCED:INTERNAL=1
 //ADVANCED property for variable: SITE
 SITE-ADVANCED:INTERNAL=1
+//CMAKE_INSTALL_PREFIX during last run
+_GNUInstallDirs_LAST_CMAKE_INSTALL_PREFIX:INTERNAL=/usr/local
+//Result of TRY_COMPILE
+compile_result_unused:INTERNAL=FALSE
 

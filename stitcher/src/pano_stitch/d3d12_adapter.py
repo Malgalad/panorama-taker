@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 from collections.abc import Callable, Iterable, Sequence
 from pathlib import Path
 from threading import Lock
@@ -13,7 +14,7 @@ import numpy as np
 
 from pano_stitch.gpu import GpuBandScheduler
 
-PANO_GPU_ABI_VERSION: Final = 9
+PANO_GPU_ABI_VERSION: Final = 10
 PANO_GPU_UNAVAILABLE: Final = 1
 PANO_GPU_CANCELLED: Final = 2
 
@@ -1597,13 +1598,35 @@ class D3D12Adapter:
                 token.close()
 
 
+def _default_library_path() -> Path:
+    package_path = Path(__file__).with_name("pano_gpu.dll")
+    if package_path.is_file() or not getattr(sys, "frozen", False):
+        return package_path
+    return Path(sys.executable).with_name("pano_gpu.dll")
+
+
+def _load_windows_library(path: Path) -> ctypes.CDLL:
+    windows_library: Any = getattr(ctypes, "WinDLL")
+    kernel32 = windows_library("kernel32", use_last_error=True)
+    set_thread_error_mode = kernel32.SetThreadErrorMode
+    set_thread_error_mode.argtypes = [ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32)]
+    set_thread_error_mode.restype = ctypes.c_int
+    previous_mode = ctypes.c_uint32()
+    changed = bool(set_thread_error_mode(0x0001 | 0x8000, ctypes.byref(previous_mode)))
+    try:
+        return ctypes.CDLL(str(path))
+    finally:
+        if changed:
+            set_thread_error_mode(previous_mode.value, None)
+
+
 def load_d3d12_adapter(library_path: Path | None = None) -> D3D12Adapter:
     """Load the Windows DLL without making import on other platforms fail."""
 
     if os.name != "nt":
         raise D3D12AdapterUnavailableError("D3D12 is available only on Windows")
-    path = library_path or Path(__file__).with_name("pano_gpu.dll")
+    path = library_path or _default_library_path()
     try:
-        return D3D12Adapter(ctypes.CDLL(str(path)))
+        return D3D12Adapter(_load_windows_library(path))
     except OSError as error:
         raise D3D12AdapterUnavailableError(f"cannot load native D3D12 core: {error}") from error
