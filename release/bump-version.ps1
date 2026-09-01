@@ -13,7 +13,7 @@ if ($Version -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$') {
 if (-not $ProjectRoot) {
     $ProjectRoot = Join-Path $PSScriptRoot ".."
 }
-$projectRoot = (Resolve-Path -LiteralPath $ProjectRoot).Path
+$projectRoot = (Resolve-Path -LiteralPath $ProjectRoot).ProviderPath
 $components = $Version.Split(".")
 $targets = @(
     [PSCustomObject]@{
