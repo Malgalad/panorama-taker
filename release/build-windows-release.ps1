@@ -72,8 +72,28 @@ $buildRoot = Join-Path $projectRoot "build\release"
 Remove-Item -LiteralPath $buildRoot -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $buildRoot, $outputRoot | Out-Null
 
+$fxcCommand = Get-Command fxc.exe -CommandType Application -ErrorAction SilentlyContinue
+$fxc = if ($fxcCommand) { $fxcCommand.Source } else { "" }
+if (-not $fxc) {
+    $windowsKits = Get-ItemProperty `
+        -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows Kits\Installed Roots" `
+        -Name KitsRoot10 -ErrorAction SilentlyContinue
+    if ($windowsKits.KitsRoot10) {
+        $fxc = Get-ChildItem `
+            -Path (Join-Path $windowsKits.KitsRoot10 "bin\*\x64\fxc.exe") `
+            -File -ErrorAction SilentlyContinue |
+            Sort-Object FullName -Descending |
+            Select-Object -First 1 -ExpandProperty FullName
+    }
+}
+if (-not $fxc -or -not (Test-Path -LiteralPath $fxc -PathType Leaf)) {
+    throw "Cannot locate the x64 Windows SDK shader compiler fxc.exe"
+}
+Write-Host "Using FXC: $fxc"
+
 $nativeBuild = Join-Path $buildRoot "stitcher-native"
-& cmake -S (Join-Path $projectRoot "stitcher\native") -B $nativeBuild -A x64
+& cmake -S (Join-Path $projectRoot "stitcher\native") -B $nativeBuild -A x64 `
+    "-DFXC_EXECUTABLE=$fxc"
 if ($LASTEXITCODE -ne 0) {
     throw "Failed to configure the native D3D12 stitcher"
 }
