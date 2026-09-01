@@ -1,6 +1,8 @@
 foreach(required_variable
         INPUT_HTML INPUT_CSS INPUT_JS INPUT_EXPOSURE_HTML INPUT_EXPOSURE_JS
-        INPUT_RC INPUT_ICON OUTPUT_HTML OUTPUT_EXPOSURE_HTML OUTPUT_RC)
+        INPUT_RC INPUT_ICON PANO_APP_VERSION PANO_APP_VERSION_MAJOR
+        PANO_APP_VERSION_MINOR PANO_APP_VERSION_PATCH OUTPUT_HTML
+        OUTPUT_EXPOSURE_HTML OUTPUT_RC)
     if(NOT DEFINED ${required_variable} OR "${${required_variable}}" STREQUAL "")
         message(FATAL_ERROR "${required_variable} is required")
     endif()
@@ -45,6 +47,12 @@ string(REPLACE "${exposure_script_reference}"
 file(TO_CMAKE_PATH "${INPUT_ICON}" resource_icon)
 string(REPLACE "@PANO_APP_ICON@" "${resource_icon}"
        resource_script "${resource_script}")
+foreach(version_variable
+        PANO_APP_VERSION PANO_APP_VERSION_MAJOR PANO_APP_VERSION_MINOR
+        PANO_APP_VERSION_PATCH)
+    string(REPLACE "@${version_variable}@" "${${version_variable}}"
+           resource_script "${resource_script}")
+endforeach()
 
 get_filename_component(output_directory "${OUTPUT_HTML}" DIRECTORY)
 file(MAKE_DIRECTORY "${output_directory}")

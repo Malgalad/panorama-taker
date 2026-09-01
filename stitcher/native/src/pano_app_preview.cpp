@@ -916,6 +916,18 @@ bool make_masks(const RenderPlan &plan, const ImageInfo &source,
   }
 }
 
+int report_exposure_pair_progress(void *const user_data,
+                                  const std::uint32_t completed,
+                                  const std::uint32_t total) {
+  const auto &options = *static_cast<const NativePreviewOptions *>(user_data);
+  if (total != 0U) {
+    const auto progress =
+        25U + static_cast<unsigned>(14ULL * completed / total);
+    report_progress(options, progress, "Measuring exposure overlaps");
+  }
+  return cancelled(options) ? 0 : 1;
+}
+
 bool measure_exposure_graph(NativePreview &preview,
                             const NativePreviewOptions &options,
                             std::string &error) {
@@ -972,8 +984,10 @@ bool measure_exposure_graph(NativePreview &preview,
       static_cast<float>(preview.plan.session.horizontal_fov_deg);
   request.vertical_fov_degrees =
       static_cast<float>(preview.plan.session.vertical_fov_deg);
-  if (!gpu_ok(pano_gpu_session_reduce_reference_exposure_graph(
-                  preview.session, &request, gpu_error.data(),
+  if (!gpu_ok(pano_gpu_session_reduce_reference_exposure_graph_progress(
+                  preview.session, &request, report_exposure_pair_progress,
+                  const_cast<NativePreviewOptions *>(&options),
+                  gpu_error.data(),
                   static_cast<std::uint32_t>(gpu_error.size())),
               gpu_error, "cannot reduce native exposure graph", error) ||
       cancelled(options)) {
@@ -1010,8 +1024,7 @@ bool measure_exposure_graph(NativePreview &preview,
 
 bool solve_automatic_exposure(NativePreview &preview, const unsigned target,
                               const NativePreviewOptions &options,
-                              std::vector<float> &gains,
-                              std::string &error) {
+                              std::vector<float> &gains, std::string &error) {
   if (!measure_exposure_graph(preview, options, error))
     return false;
   report_progress(options, 45U, "Propagating exposure");
@@ -1022,9 +1035,8 @@ bool solve_automatic_exposure(NativePreview &preview, const unsigned target,
       equations.push_back(CpuExposureEquation{
           equation.left_frame_index, equation.right_frame_index,
           equation.difference, equation.weight});
-    if (!solve_reference_exposure_gains(
-            preview.diagnostics.frame_count, target, equations, preview.gains,
-            gains, error))
+    if (!solve_reference_exposure_gains(preview.diagnostics.frame_count, target,
+                                        equations, preview.gains, gains, error))
       return false;
   } catch (const std::bad_alloc &) {
     error = "cannot allocate native exposure solution";
@@ -1136,16 +1148,17 @@ NativeRenderOptions ranged_render_options(const NativeRenderOptions &options,
 }
 
 bool render_dimensions(const NativePreview &preview, unsigned &width,
-                       unsigned &height, std::string &error) {
-  if (preview.plan.output_width.has_value()) {
+                       unsigned &height, std::string &error,
+                       const bool maximum = false) {
+  if (!maximum && preview.plan.output_width.has_value()) {
     width = *preview.plan.output_width;
   } else {
     constexpr double pi = 3.14159265358979323846;
     const double focal =
         preview.source.width /
         (2.0 * std::tan(preview.plan.session.horizontal_fov_deg * pi / 360.0));
-    const double scaled =
-        std::round(2.0 * pi * focal * preview.plan.resolution);
+    const double scaled = std::round(2.0 * pi * focal *
+                                     (maximum ? 1.0 : preview.plan.resolution));
     if (!std::isfinite(scaled) ||
         scaled > std::numeric_limits<unsigned>::max()) {
       error = "native render dimensions overflow";
@@ -1262,9 +1275,7 @@ bool stream_gpu_output(NativePreview &preview, ImageWriter *writer,
                   error);
   };
   const bool auto_contrast = sdr && preview.plan.auto_contrast;
-  const bool histogram_required =
-      sdr && (auto_contrast || !preview.plan.allow_incomplete);
-  if (histogram_required &&
+  if (auto_contrast &&
       !gpu_ok(pano_gpu_output_prepare_auto_contrast_histogram(
                   output, gpu_error.data(),
                   static_cast<std::uint32_t>(gpu_error.size())),
@@ -1341,8 +1352,9 @@ bool stream_gpu_output(NativePreview &preview, ImageWriter *writer,
   }
   std::vector<std::uint8_t> pixels(static_cast<std::size_t>(band_bytes));
   std::vector<std::uint8_t> coverage(
-      coverage_writer == nullptr ? 0U
-                                 : static_cast<std::size_t>(band_rows) * width);
+      coverage_writer == nullptr && preview.plan.allow_incomplete
+          ? 0U
+          : static_cast<std::size_t>(band_rows) * width);
   CodecErrorCategory category{};
   for (unsigned row = 0; row < height; row += band_rows) {
     if (cancelled(options)) {
@@ -1355,12 +1367,6 @@ bool stream_gpu_output(NativePreview &preview, ImageWriter *writer,
       frame.row_count = rows;
     }
     if (!compose())
-      return false;
-    if (histogram_required && !auto_contrast &&
-        !gpu_ok(pano_gpu_output_accumulate_auto_contrast_histogram_srgb(
-                    output, gpu_error.data(),
-                    static_cast<std::uint32_t>(gpu_error.size())),
-                gpu_error, "cannot validate native render coverage", error))
       return false;
     if (sdr) {
       if (pq) {
@@ -1421,7 +1427,7 @@ bool stream_gpu_output(NativePreview &preview, ImageWriter *writer,
                           static_cast<std::uint64_t>(width) * 3U * sample_bytes,
                           options.cancellation, category, error))
       return false;
-    if (coverage_writer != nullptr) {
+    if (!coverage.empty()) {
       download.data = coverage.data();
       download.data_bytes = static_cast<std::uint64_t>(rows) * width;
       if (!gpu_ok(pano_gpu_output_download_coverage(
@@ -1429,26 +1435,22 @@ bool stream_gpu_output(NativePreview &preview, ImageWriter *writer,
                       gpu_error.data(),
                       static_cast<std::uint32_t>(gpu_error.size())),
                   gpu_error, "cannot download native render coverage", error) ||
+          (!preview.plan.allow_incomplete &&
+           std::find(coverage.begin(),
+                     coverage.begin() + static_cast<std::size_t>(rows) * width,
+                     std::uint8_t{0}) !=
+               coverage.begin() + static_cast<std::size_t>(rows) * width)) {
+        if (error.empty())
+          error = "capture does not cover every output pixel";
+        return false;
+      }
+      if (coverage_writer != nullptr &&
           !write_image_rows(coverage_writer, coverage.data(), rows, width,
                             options.cancellation, category, error))
         return false;
     }
     render_progress(options, (auto_contrast ? height : 0U) + row + rows,
                     total_progress, rectilinear ? "thumbnail" : "render");
-  }
-  if (histogram_required && !auto_contrast) {
-    pano_gpu_auto_contrast_levels levels{};
-    levels.size = sizeof(levels);
-    levels.abi_version = PANO_GPU_ABI_VERSION;
-    if (!gpu_ok(pano_gpu_output_select_auto_contrast_levels(
-                    output, &levels, gpu_error.data(),
-                    static_cast<std::uint32_t>(gpu_error.size())),
-                gpu_error, "cannot validate native render coverage", error) ||
-        levels.processed_pixels != static_cast<std::uint64_t>(width) * height) {
-      if (error.empty())
-        error = "capture does not cover every output pixel";
-      return false;
-    }
   }
   return true;
 }
@@ -1565,6 +1567,26 @@ bool discard_native_exposure_edits(NativePreview *const preview,
     error = "cannot allocate native exposure reset";
     return false;
   }
+}
+
+bool query_native_render_dimensions(const NativePreview *const preview,
+                                    unsigned &width, unsigned &height,
+                                    std::string &error) {
+  if (preview == nullptr) {
+    error = "native preview is not available";
+    return false;
+  }
+  return render_dimensions(*preview, width, height, error);
+}
+
+bool query_native_maximum_render_width(const NativePreview *const preview,
+                                       unsigned &width, std::string &error) {
+  if (preview == nullptr) {
+    error = "native preview is not available";
+    return false;
+  }
+  unsigned height = 0U;
+  return render_dimensions(*preview, width, height, error, true);
 }
 
 bool render_native_session(NativePreview *const preview,

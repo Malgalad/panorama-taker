@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <exception>
 #include <initializer_list>
 #include <limits>
 #include <sstream>
@@ -127,7 +128,54 @@ bool parse_webview_command_json(const std::string_view json,
       simple("equalize-exposure", WebViewCommandKind::equalize_exposure) ||
       simple("abort", WebViewCommandKind::abort_operation) ||
       simple("start-preview", WebViewCommandKind::start_preview) ||
-      simple("finalize", WebViewCommandKind::finalize_preview)) {
+      simple("finalize", WebViewCommandKind::finalize_preview) ||
+      simple("toggle-resolution-mode",
+             WebViewCommandKind::toggle_resolution_mode) ||
+      simple("render", WebViewCommandKind::render) ||
+      simple("render-with-thumbnail",
+             WebViewCommandKind::render_with_thumbnail)) {
+    error.clear();
+    return true;
+  }
+  if (name == "set-modal-value" || name == "set-modal-toggle" ||
+      name == "submit-modal" || name == "dismiss-modal") {
+    const bool sets_value = name == "set-modal-value";
+    const bool sets_toggle = name == "set-modal-toggle";
+    const bool valid_shape =
+        sets_value
+            ? exact_object_shape(root, {"version", "kind", "pageGeneration",
+                                        "modalGeneration", "value"})
+        : sets_toggle
+            ? exact_object_shape(root, {"version", "kind", "pageGeneration",
+                                        "modalGeneration", "enabled"})
+            : exact_object_shape(root, {"version", "kind", "pageGeneration",
+                                        "modalGeneration"});
+    yyjson_val *const generation_value =
+        yyjson_obj_get(root, "modalGeneration");
+    yyjson_val *const value = yyjson_obj_get(root, "value");
+    yyjson_val *const enabled = yyjson_obj_get(root, "enabled");
+    if (!valid_shape || !yyjson_is_uint(generation_value) ||
+        (sets_value && !yyjson_is_str(value)) ||
+        (sets_toggle && !yyjson_is_bool(enabled))) {
+      error = "invalid WebView modal command";
+      return false;
+    }
+    command.kind = sets_value    ? WebViewCommandKind::set_modal_value
+                   : sets_toggle ? WebViewCommandKind::set_modal_toggle
+                   : name == "submit-modal" ? WebViewCommandKind::submit_modal
+                                            : WebViewCommandKind::dismiss_modal;
+    command.modal_generation = yyjson_get_uint(generation_value);
+    if (sets_value) {
+      const std::string_view bytes(yyjson_get_str(value),
+                                   yyjson_get_len(value));
+      command.value = utf8_to_wide(bytes);
+      if (!bytes.empty() && command.value.empty()) {
+        error = "invalid UTF-8 WebView modal value";
+        return false;
+      }
+    }
+    if (sets_toggle)
+      command.enabled = yyjson_get_bool(enabled);
     error.clear();
     return true;
   }
@@ -189,6 +237,8 @@ bool parse_webview_command_json(const std::string_view json,
         command.kind = WebViewCommandKind::navigate_input;
       else if (target_name == "preview")
         command.kind = WebViewCommandKind::navigate_preview;
+      else if (target_name == "output")
+        command.kind = WebViewCommandKind::navigate_output;
       else {
         error = "unknown WebView navigation target";
         return false;
@@ -200,6 +250,9 @@ bool parse_webview_command_json(const std::string_view json,
       command.kind = sets_value
                          ? WebViewCommandKind::set_screenshots_directory
                          : WebViewCommandKind::browse_screenshots_directory;
+    } else if (target_name == "output") {
+      command.kind = sets_value ? WebViewCommandKind::set_output_directory
+                                : WebViewCommandKind::browse_output_directory;
     } else {
       error = "unknown WebView directory target";
       return false;
@@ -212,6 +265,48 @@ bool parse_webview_command_json(const std::string_view json,
         error = "invalid UTF-8 WebView command value";
         return false;
       }
+    }
+    error.clear();
+    return true;
+  }
+  if (name == "set-output-value") {
+    if (!exact_object_shape(
+            root, {"version", "kind", "pageGeneration", "target", "value"})) {
+      error = "unexpected WebView output command fields";
+      return false;
+    }
+    yyjson_val *const target = yyjson_obj_get(root, "target");
+    yyjson_val *const value = yyjson_obj_get(root, "value");
+    if (!yyjson_is_str(target) || !yyjson_is_str(value)) {
+      error = "invalid WebView output command value";
+      return false;
+    }
+    const std::string_view target_name(yyjson_get_str(target),
+                                       yyjson_get_len(target));
+    if (target_name == "name")
+      command.kind = WebViewCommandKind::set_output_name;
+    else if (target_name == "scale")
+      command.kind = WebViewCommandKind::set_resolution_percent;
+    else if (target_name == "width")
+      command.kind = WebViewCommandKind::set_output_width;
+    else if (target_name == "format")
+      command.kind = WebViewCommandKind::set_output_format;
+    else if (target_name == "quality")
+      command.kind = WebViewCommandKind::set_jpeg_quality;
+    else {
+      error = "unknown WebView output value target";
+      return false;
+    }
+    const std::string_view bytes(yyjson_get_str(value), yyjson_get_len(value));
+    if (command.kind == WebViewCommandKind::set_output_format &&
+        bytes != "jpeg" && bytes != "png" && bytes != "exr") {
+      error = "unknown WebView output format";
+      return false;
+    }
+    command.value = utf8_to_wide(bytes);
+    if (!bytes.empty() && command.value.empty()) {
+      error = "invalid UTF-8 WebView output command value";
+      return false;
     }
     error.clear();
     return true;
@@ -295,6 +390,19 @@ bool parse_webview_command_json(const std::string_view json,
   }
   error = "unknown WebView command";
   return false;
+}
+
+bool webview_command_is_current(const bool ready,
+                                const std::uint64_t page_generation,
+                                const WebViewCommand &command) noexcept {
+  return ready && command.page_generation == page_generation;
+}
+
+bool webview_modal_command_is_current(const bool modal_open,
+                                      const std::uint64_t modal_generation,
+                                      const WebViewCommand &command) noexcept {
+  return modal_open && command.modal_generation.has_value() &&
+         *command.modal_generation == modal_generation;
 }
 
 bool calculate_webview_preview_bounds(const WebViewPreviewGeometry &geometry,
@@ -491,8 +599,8 @@ HRESULT create_controller(const std::shared_ptr<WebViewHostState> &state,
             if (command.kind == WebViewCommandKind::ready) {
               state->ready = true;
               command.page_generation = state->page_generation;
-            } else if (!state->ready ||
-                       command.page_generation != state->page_generation) {
+            } else if (!webview_command_is_current(
+                           state->ready, state->page_generation, command)) {
               return S_OK;
             }
             if (state->handler)
@@ -538,7 +646,14 @@ bool WebViewHost::start(std::wstring &error) {
     error = L"WebView2 host is closed";
     return false;
   }
-  const std::wstring profile = webview_user_data_folder().wstring();
+  std::wstring profile;
+  try {
+    profile = webview_user_data_folder().wstring();
+  } catch (const std::exception &exception) {
+    error = L"Cannot locate WebView2 profile: " +
+            utf8_to_wide(exception.what());
+    return false;
+  }
   const std::shared_ptr<WebViewHostState> state = state_;
   const HRESULT status = CreateCoreWebView2EnvironmentWithOptions(
       nullptr, profile.c_str(), nullptr,

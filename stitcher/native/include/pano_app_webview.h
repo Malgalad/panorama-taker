@@ -5,6 +5,7 @@
 
 #include <windows.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
@@ -33,14 +34,23 @@ enum class WebViewCommandKind {
   ready,
   set_game_directory,
   set_screenshots_directory,
+  set_output_directory,
   browse_game_directory,
   browse_screenshots_directory,
+  browse_output_directory,
   refresh,
   select_session,
   edit_tag,
   delete_session,
   navigate_input,
   navigate_preview,
+  navigate_output,
+  set_output_name,
+  toggle_resolution_mode,
+  set_resolution_percent,
+  set_output_width,
+  set_output_format,
+  set_jpeg_quality,
   open_settings,
   open_options,
   open_exposure,
@@ -54,10 +64,89 @@ enum class WebViewCommandKind {
   abort_operation,
   start_preview,
   finalize_preview,
+  render,
+  render_with_thumbnail,
+  set_modal_value,
+  set_modal_toggle,
+  submit_modal,
+  dismiss_modal,
   content_size,
   preview_geometry,
   host_failed
 };
+
+enum class WebViewCommandDomain {
+  host,
+  directories,
+  sessions,
+  navigation,
+  output,
+  modal,
+  exposure,
+  operation,
+  layout
+};
+
+inline constexpr std::size_t webview_command_kind_count =
+    static_cast<std::size_t>(WebViewCommandKind::host_failed) + 1U;
+
+[[nodiscard]] constexpr WebViewCommandDomain
+webview_command_domain(const WebViewCommandKind kind) noexcept {
+  switch (kind) {
+  case WebViewCommandKind::ready:
+  case WebViewCommandKind::host_failed:
+    return WebViewCommandDomain::host;
+  case WebViewCommandKind::set_game_directory:
+  case WebViewCommandKind::set_screenshots_directory:
+  case WebViewCommandKind::set_output_directory:
+  case WebViewCommandKind::browse_game_directory:
+  case WebViewCommandKind::browse_screenshots_directory:
+  case WebViewCommandKind::browse_output_directory:
+    return WebViewCommandDomain::directories;
+  case WebViewCommandKind::refresh:
+  case WebViewCommandKind::select_session:
+  case WebViewCommandKind::edit_tag:
+  case WebViewCommandKind::delete_session:
+    return WebViewCommandDomain::sessions;
+  case WebViewCommandKind::navigate_input:
+  case WebViewCommandKind::navigate_preview:
+  case WebViewCommandKind::navigate_output:
+    return WebViewCommandDomain::navigation;
+  case WebViewCommandKind::set_output_name:
+  case WebViewCommandKind::toggle_resolution_mode:
+  case WebViewCommandKind::set_resolution_percent:
+  case WebViewCommandKind::set_output_width:
+  case WebViewCommandKind::set_output_format:
+  case WebViewCommandKind::set_jpeg_quality:
+    return WebViewCommandDomain::output;
+  case WebViewCommandKind::open_settings:
+  case WebViewCommandKind::open_options:
+  case WebViewCommandKind::set_modal_value:
+  case WebViewCommandKind::set_modal_toggle:
+  case WebViewCommandKind::submit_modal:
+  case WebViewCommandKind::dismiss_modal:
+    return WebViewCommandDomain::modal;
+  case WebViewCommandKind::open_exposure:
+  case WebViewCommandKind::set_exposure_overlay:
+  case WebViewCommandKind::hover_exposure_pose:
+  case WebViewCommandKind::clear_exposure_hover:
+  case WebViewCommandKind::set_exposure_reference:
+  case WebViewCommandKind::toggle_exposure_selection:
+  case WebViewCommandKind::reset_exposure:
+  case WebViewCommandKind::equalize_exposure:
+    return WebViewCommandDomain::exposure;
+  case WebViewCommandKind::abort_operation:
+  case WebViewCommandKind::start_preview:
+  case WebViewCommandKind::finalize_preview:
+  case WebViewCommandKind::render:
+  case WebViewCommandKind::render_with_thumbnail:
+    return WebViewCommandDomain::operation;
+  case WebViewCommandKind::content_size:
+  case WebViewCommandKind::preview_geometry:
+    return WebViewCommandDomain::layout;
+  }
+  return WebViewCommandDomain::host;
+}
 
 struct WebViewPreviewGeometry {
   double x = 0.0;
@@ -81,6 +170,7 @@ struct WebViewCommand {
   std::optional<std::size_t> session_index;
   std::optional<unsigned> pose_index;
   std::optional<bool> enabled;
+  std::optional<std::uint64_t> modal_generation;
   std::optional<std::uint64_t> layout_generation;
   std::optional<double> content_height;
   std::optional<WebViewPreviewGeometry> preview;
@@ -90,6 +180,13 @@ struct WebViewCommand {
 [[nodiscard]] bool parse_webview_command_json(std::string_view json,
                                               WebViewCommand &command,
                                               std::string &error);
+[[nodiscard]] bool
+webview_command_is_current(bool ready, std::uint64_t page_generation,
+                           const WebViewCommand &command) noexcept;
+[[nodiscard]] bool
+webview_modal_command_is_current(bool modal_open,
+                                 std::uint64_t modal_generation,
+                                 const WebViewCommand &command) noexcept;
 enum class WebViewPage { main, exposure };
 
 [[nodiscard]] std::wstring

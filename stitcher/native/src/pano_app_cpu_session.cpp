@@ -19,6 +19,24 @@ namespace fs = std::filesystem;
 constexpr std::uint64_t cpu_budget_bytes = 2048ULL * 1024ULL * 1024ULL;
 constexpr double pi = 3.14159265358979323846;
 
+struct CpuCancellationBridge {
+  CancellationCheck cancellation;
+  const pano_gpu_cancellation_token *gpu_cancellation = nullptr;
+};
+
+bool cpu_cancelled(void *const user_data) {
+  const auto &bridge = *static_cast<const CpuCancellationBridge *>(user_data);
+  return (bridge.cancellation.callback != nullptr &&
+          bridge.cancellation.callback(bridge.cancellation.user_data)) ||
+         (bridge.gpu_cancellation != nullptr &&
+          pano_gpu_cancellation_token_is_cancelled(
+              bridge.gpu_cancellation) != 0);
+}
+
+CancellationCheck combined_cancellation(CpuCancellationBridge &bridge) {
+  return {cpu_cancelled, &bridge};
+}
+
 bool cancelled(const NativePreviewOptions &options) {
   return (options.cancellation.callback != nullptr &&
           options.cancellation.callback(options.cancellation.user_data)) ||
@@ -138,14 +156,16 @@ std::array<float, 9> world_to_camera(const FrameSummary &frame) {
 }
 
 bool render_dimensions(const RenderPlan &plan, const ImageInfo &source,
-                       unsigned &width, unsigned &height, std::string &error) {
-  if (plan.output_width.has_value()) {
+                       unsigned &width, unsigned &height, std::string &error,
+                       const bool maximum = false) {
+  if (!maximum && plan.output_width.has_value()) {
     width = *plan.output_width;
   } else {
     const double focal =
         source.width /
         (2.0 * std::tan(plan.session.horizontal_fov_deg * pi / 360.0));
-    const double scaled = std::round(2.0 * pi * focal * plan.resolution);
+    const double scaled =
+        std::round(2.0 * pi * focal * (maximum ? 1.0 : plan.resolution));
     if (!std::isfinite(scaled) || scaled < 1.0 ||
         scaled > std::numeric_limits<unsigned>::max()) {
       error = "CPU render dimensions overflow";
@@ -210,6 +230,14 @@ bool compose_band(const RenderPlan &plan, const ImageInfo &source,
                   const std::vector<float> &gains,
                   const CancellationCheck &cancellation, Band &band,
                   std::string &error) {
+  const auto is_cancelled = [&] {
+    return cancellation.callback != nullptr &&
+           cancellation.callback(cancellation.user_data);
+  };
+  if (is_cancelled()) {
+    error = "CPU render cancelled";
+    return false;
+  }
   const std::uint64_t pixel_count64 =
       static_cast<std::uint64_t>(width) * row_count;
   if (pixel_count64 == 0U ||
@@ -242,6 +270,10 @@ bool compose_band(const RenderPlan &plan, const ImageInfo &source,
     if (!generate_cpu_world_rays(rays, band.rays.data(),
                                  band.rays.size() * sizeof(float), error))
       return false;
+    if (is_cancelled()) {
+      error = "CPU render cancelled";
+      return false;
+    }
     const unsigned bytes = sample_bytes(source.encoding);
     const std::uint64_t row_stride =
         static_cast<std::uint64_t>(source.width) * 3U * bytes;
@@ -254,8 +286,7 @@ bool compose_band(const RenderPlan &plan, const ImageInfo &source,
     CodecErrorCategory category{};
     for (std::size_t frame_index = 0; frame_index < plan.session.frames.size();
          ++frame_index) {
-      if (cancellation.callback != nullptr &&
-          cancellation.callback(cancellation.user_data)) {
+      if (is_cancelled()) {
         error = "CPU render cancelled";
         return false;
       }
@@ -327,6 +358,12 @@ bool compose_band(const RenderPlan &plan, const ImageInfo &source,
         !normalize_cpu_feather(pixel_count, band.color.data(),
                                band.weight.data(), band.coverage.data(), error))
       return false;
+    if (!plan.allow_incomplete &&
+        std::find(band.coverage.begin(), band.coverage.end(), 0U) !=
+            band.coverage.end()) {
+      error = "capture does not cover every output pixel";
+      return false;
+    }
     if (plan.allow_incomplete &&
         !mark_cpu_incomplete(pixel_count, band.color.data(), band.weight.data(),
                              error))
@@ -379,7 +416,200 @@ public:
   NativePreviewDiagnostics diagnostics;
   std::vector<std::uint8_t> pixels;
   std::vector<float> gains;
+  std::vector<CpuExposureEquation> exposure_equations;
+  bool exposure_graph_measured = false;
 };
+
+namespace {
+void preview_progress(const NativePreviewOptions &options,
+                      const unsigned completed, const char *const phase) {
+  if (options.progress != nullptr)
+    options.progress(options.progress_user_data, completed, 100U, phase);
+}
+
+bool recompose_cpu_preview(CpuNativePreview &preview,
+                           const std::vector<float> &gains,
+                           const NativePreviewOptions &options,
+                           NativeExposureResult &result,
+                           std::string &error) {
+  CpuCancellationBridge cancellation_bridge{options.cancellation,
+                                            options.gpu_cancellation};
+  Band band;
+  if (!compose_band(preview.plan, preview.source,
+                    preview.diagnostics.preview_width,
+                    preview.diagnostics.preview_height, 0U,
+                    preview.diagnostics.preview_height, false, 90.0F, gains,
+                    combined_cancellation(cancellation_bridge), band, error))
+    return false;
+  CpuAutoContrastLevels levels;
+  CpuSdrConversionRequest conversion;
+  const unsigned pixel_count = preview.diagnostics.preview_width *
+                               preview.diagnostics.preview_height;
+  make_conversion_request(preview.source, false, levels, pixel_count,
+                          conversion);
+  if (preview.plan.auto_contrast) {
+    std::array<std::uint64_t, 4096> histogram{};
+    if (!accumulate_cpu_auto_contrast_histogram(
+            conversion, band.color.data(), band.coverage.data(), histogram,
+            error) ||
+        !select_cpu_auto_contrast_levels(histogram, levels, error))
+      return false;
+    conversion.apply_auto_contrast = true;
+    conversion.levels = levels;
+  }
+  std::vector<std::uint8_t> rgb(static_cast<std::size_t>(pixel_count) * 3U);
+  if (!convert_cpu_sdr8_band(conversion, band.color.data(), rgb.data(), error))
+    return false;
+  std::vector<std::uint8_t> pixels(static_cast<std::size_t>(pixel_count) * 4U);
+  for (std::size_t pixel = 0; pixel < pixel_count; ++pixel) {
+    pixels[pixel * 4U] = rgb[pixel * 3U + 2U];
+    pixels[pixel * 4U + 1U] = rgb[pixel * 3U + 1U];
+    pixels[pixel * 4U + 2U] = rgb[pixel * 3U];
+    pixels[pixel * 4U + 3U] = 255U;
+  }
+  preview.pixels.swap(pixels);
+  preview.gains = gains;
+  result.gains = gains;
+  result.edge_count = static_cast<unsigned>(preview.exposure_equations.size());
+  result.warning = preview.diagnostics.frame_count > 1U &&
+                   result.edge_count < preview.diagnostics.frame_count - 1U;
+  preview_progress(options, 95U, "Retaining CPU preview");
+  error.clear();
+  return true;
+}
+
+bool measure_cpu_exposure_graph(CpuNativePreview &preview,
+                                const NativePreviewOptions &options,
+                                std::string &error) {
+  if (preview.exposure_graph_measured) {
+    preview_progress(options, 40U, "Exposure samples ready");
+    return true;
+  }
+  if (cancelled(options)) {
+    error = "CPU exposure measurement cancelled";
+    return false;
+  }
+  const unsigned frame_count = preview.diagnostics.frame_count;
+  const unsigned proxy_width = std::min(preview.source.width, 256U);
+  const unsigned proxy_height = std::min(preview.source.height, 256U);
+  const std::uint64_t source_stride =
+      static_cast<std::uint64_t>(preview.source.width) * 3U *
+      sample_bytes(preview.source.encoding);
+  const std::uint64_t source_bytes = source_stride * preview.source.height;
+  const std::size_t proxy_values =
+      static_cast<std::size_t>(proxy_width) * proxy_height * 3U;
+  try {
+    std::vector<std::vector<float>> proxies(
+        frame_count, std::vector<float>(proxy_values));
+    std::vector<std::uint8_t> decoded(static_cast<std::size_t>(source_bytes));
+    CpuExposureProxyRequest proxy_request;
+    proxy_request.source.sample_type = sample_type(preview.source.encoding);
+    proxy_request.source.transfer_function = transfer(preview.source.encoding);
+    proxy_request.source.source_width = preview.source.width;
+    proxy_request.source.source_height = preview.source.height;
+    proxy_request.source.source_row_stride_bytes = source_stride;
+    proxy_request.source.pixel_count =
+        preview.source.width * preview.source.height;
+    proxy_request.proxy_width = proxy_width;
+    proxy_request.proxy_height = proxy_height;
+    CodecErrorCategory category{};
+    CpuCancellationBridge cancellation_bridge{options.cancellation,
+                                              options.gpu_cancellation};
+    const CancellationCheck cancellation =
+        combined_cancellation(cancellation_bridge);
+    for (unsigned frame = 0; frame < frame_count; ++frame) {
+      if (cancelled(options)) {
+        error = "CPU exposure measurement cancelled";
+        return false;
+      }
+      if (!decode_image(preview.plan.session.frames[frame].filename,
+                        preview.source, decoded.data(), source_stride,
+                        source_bytes, cancellation, category, error) ||
+          !build_cpu_exposure_proxy(
+              proxy_request, decoded.data(), decoded.size(),
+              proxies[frame].data(),
+              proxies[frame].size() * sizeof(float), error))
+        return false;
+    }
+    preview_progress(options, 15U, "Sampling poses");
+    const unsigned pair_count = frame_count * (frame_count - 1U) / 2U;
+    std::vector<CpuFramePair> pairs(pair_count);
+    unsigned enumerated = 0U;
+    if (!enumerate_cpu_exposure_pairs(frame_count, pairs.data(), pair_count,
+                                      enumerated, error))
+      return false;
+    constexpr unsigned sample_width = 256U;
+    constexpr unsigned sample_height = 128U;
+    constexpr unsigned sample_count = sample_width * sample_height;
+    std::vector<float> coordinates(sample_count * 4U);
+    std::vector<std::uint8_t> overlap(sample_count);
+    std::vector<float> samples(sample_count * 6U);
+    std::vector<float> luminance(sample_count * 2U);
+    std::vector<std::uint8_t> accepted(sample_count);
+    std::vector<float> gradients(sample_count * 2U);
+    std::vector<CpuExposurePairMeasurement> measurements(pair_count);
+    CpuExposurePairRequest request;
+    request.sample_width = sample_width;
+    request.sample_height = sample_height;
+    request.proxy_width = proxy_width;
+    request.proxy_height = proxy_height;
+    request.latitude_span_degrees = static_cast<float>(
+        preview.plan.session.capture_mode == "full_sphere"
+            ? 180.0
+            : preview.plan.session.vertical_fov_deg);
+    request.horizontal_fov_degrees =
+        static_cast<float>(preview.plan.session.horizontal_fov_deg);
+    request.vertical_fov_degrees =
+        static_cast<float>(preview.plan.session.vertical_fov_deg);
+    for (unsigned index = 0; index < enumerated; ++index) {
+      if (cancelled(options)) {
+        error = "CPU exposure measurement cancelled";
+        return false;
+      }
+      const auto pair = pairs[index];
+      request.left_world_to_camera =
+          world_to_camera(preview.plan.session.frames[pair.left]);
+      request.right_world_to_camera =
+          world_to_camera(preview.plan.session.frames[pair.right]);
+      std::array<float, 2> limits{};
+      if (!project_cpu_exposure_pair(request, coordinates.data(),
+                                     overlap.data(), error) ||
+          !sample_cpu_exposure_pair(request, proxies[pair.left].data(),
+                                    proxies[pair.right].data(),
+                                    coordinates.data(), samples.data(), error) ||
+          !classify_cpu_exposure_samples(
+              sample_count, transfer(preview.source.encoding), samples.data(),
+              overlap.data(), luminance.data(), accepted.data(), error) ||
+          !calculate_cpu_exposure_gradients(sample_width, sample_height,
+                                            luminance.data(), gradients.data(),
+                                            error) ||
+          !filter_cpu_exposure_gradients(sample_count, gradients.data(),
+                                         accepted.data(), limits, error))
+        return false;
+      measurements[index].pair = pair;
+      measurements[index].geometric_count = static_cast<unsigned>(
+          std::count(overlap.begin(), overlap.end(), std::uint8_t{1}));
+      if (!reduce_cpu_exposure_pair(sample_count, luminance.data(),
+                                    accepted.data(),
+                                    measurements[index].reduction, error))
+        return false;
+      preview_progress(options, 25U + (index + 1U) * 15U /
+                                            std::max(1U, enumerated),
+                       "Measuring exposure overlaps");
+    }
+    if (!build_cpu_exposure_solve_graph(
+            frame_count, measurements.data(), enumerated,
+            preview.exposure_equations, error))
+      return false;
+    preview.exposure_graph_measured = true;
+    preview_progress(options, 40U, "Exposure samples ready");
+    return true;
+  } catch (const std::bad_alloc &) {
+    error = "cannot allocate CPU exposure measurement storage";
+    return false;
+  }
+}
+} // namespace
 
 bool create_cpu_native_preview(const RenderPlan &plan,
                                const NativePreviewOptions &options,
@@ -394,6 +624,7 @@ bool create_cpu_native_preview(const RenderPlan &plan,
     error = "CPU preview creation cancelled";
     return false;
   }
+  preview_progress(options, 0U, "Preparing CPU preview");
   try {
     auto owner = std::make_unique<CpuNativePreview>();
     CodecErrorCategory category{};
@@ -414,8 +645,12 @@ bool create_cpu_native_preview(const RenderPlan &plan,
       width = std::max(2U, width - width % 2U);
     Band band;
     owner->gains.assign(plan.session.frames.size(), 1.0F);
+    CpuCancellationBridge cancellation_bridge{options.cancellation,
+                                              options.gpu_cancellation};
     if (!compose_band(plan, owner->source, width, height, 0U, height, false,
-                      90.0F, owner->gains, options.cancellation, band, error))
+                      90.0F, owner->gains,
+                      combined_cancellation(cancellation_bridge), band,
+                      error))
       return false;
     CpuAutoContrastLevels levels;
     CpuSdrConversionRequest conversion;
@@ -495,6 +730,101 @@ bool update_cpu_native_preview_render_plan(CpuNativePreview *const preview,
   }
 }
 
+bool apply_cpu_native_automatic_exposure(
+    CpuNativePreview *const preview, const unsigned target,
+    const NativePreviewOptions &options, NativeExposureResult &result,
+    std::string &error) {
+  if (preview == nullptr || target >= preview->diagnostics.frame_count) {
+    error = "invalid CPU automatic exposure target";
+    return false;
+  }
+  if (!measure_cpu_exposure_graph(*preview, options, error))
+    return false;
+  preview_progress(options, 45U, "Propagating exposure");
+  std::vector<float> gains;
+  if (!solve_reference_exposure_gains(
+          preview->diagnostics.frame_count, target,
+          preview->exposure_equations, preview->gains, gains, error) ||
+      !recompose_cpu_preview(*preview, gains, options, result, error))
+    return false;
+  result.anchor_frame = target;
+  return true;
+}
+
+bool apply_cpu_native_manual_exposure_match(
+    CpuNativePreview *const preview, const unsigned target,
+    const std::vector<unsigned> &selected,
+    const NativePreviewOptions &options, NativeExposureResult &result,
+    std::string &error) {
+  if (preview == nullptr || target >= preview->diagnostics.frame_count ||
+      selected.empty() ||
+      std::any_of(selected.begin(), selected.end(), [&](const unsigned frame) {
+        return frame >= preview->diagnostics.frame_count || frame == target;
+      })) {
+    error = "invalid CPU manual exposure selection";
+    return false;
+  }
+  if (!measure_cpu_exposure_graph(*preview, options, error))
+    return false;
+  try {
+    std::vector<double> shifts;
+    for (const unsigned selected_frame : selected) {
+      for (const auto &equation : preview->exposure_equations) {
+        double raw_shift = 0.0;
+        if (equation.left == target && equation.right == selected_frame)
+          raw_shift = equation.difference;
+        else if (equation.right == target && equation.left == selected_frame)
+          raw_shift = -equation.difference;
+        else
+          continue;
+        shifts.push_back(raw_shift + std::log(preview->gains[target]) -
+                         std::log(preview->gains[selected_frame]));
+      }
+    }
+    if (shifts.empty()) {
+      error = "target pose must overlap at least one selected pose";
+      return false;
+    }
+    std::sort(shifts.begin(), shifts.end());
+    const std::size_t middle = shifts.size() / 2U;
+    const double shift = shifts.size() % 2U == 0U
+                             ? 0.5 * (shifts[middle - 1U] + shifts[middle])
+                             : shifts[middle];
+    const float multiplier = static_cast<float>(std::exp(shift));
+    if (!std::isfinite(multiplier) || multiplier <= 0.0F) {
+      error = "CPU manual exposure gain is invalid";
+      return false;
+    }
+    auto gains = preview->gains;
+    for (const unsigned frame : selected)
+      gains[frame] *= multiplier;
+    if (!recompose_cpu_preview(*preview, gains, options, result, error))
+      return false;
+    result.anchor_frame = target;
+    return true;
+  } catch (const std::bad_alloc &) {
+    error = "cannot allocate CPU manual exposure state";
+    return false;
+  }
+}
+
+bool discard_cpu_native_exposure_edits(
+    CpuNativePreview *const preview, const NativePreviewOptions &options,
+    NativeExposureResult &result, std::string &error) {
+  if (preview == nullptr) {
+    error = "CPU preview is not available";
+    return false;
+  }
+  preview_progress(options, 0U, "Resetting CPU exposure preview");
+  try {
+    std::vector<float> gains(preview->diagnostics.frame_count, 1.0F);
+    return recompose_cpu_preview(*preview, gains, options, result, error);
+  } catch (const std::bad_alloc &) {
+    error = "cannot allocate CPU exposure reset";
+    return false;
+  }
+}
+
 namespace {
 bool render_cpu_target(CpuNativePreview &preview, const OutputTarget &target,
                        const std::optional<OutputTarget> &coverage_target,
@@ -503,6 +833,10 @@ bool render_cpu_target(CpuNativePreview &preview, const OutputTarget &target,
                        const NativeRenderOptions &options,
                        OutputStage **const output_stage,
                        OutputStage **const coverage_stage, std::string &error) {
+  CpuCancellationBridge cancellation_bridge{options.cancellation,
+                                            options.gpu_cancellation};
+  const CancellationCheck cancellation =
+      combined_cancellation(cancellation_bridge);
   CodecErrorCategory category{};
   if (!create_output_stage(target.final_path, output_stage, category, error) ||
       (coverage_target.has_value() &&
@@ -563,7 +897,7 @@ bool render_cpu_target(CpuNativePreview &preview, const OutputTarget &target,
       Band band;
       if (!compose_band(preview.plan, preview.source, width, height, row, rows,
                         rectilinear, vertical_fov, preview.gains,
-                        options.cancellation, band, error))
+                        cancellation, band, error))
         return false;
       CpuSdrConversionRequest conversion;
       make_conversion_request(preview.source, false, levels, width * rows,
@@ -586,7 +920,7 @@ bool render_cpu_target(CpuNativePreview &preview, const OutputTarget &target,
     Band band;
     if (!compose_band(preview.plan, preview.source, width, height, row, rows,
                       rectilinear, vertical_fov, preview.gains,
-                      options.cancellation, band, error))
+                      cancellation, band, error))
       return false;
     CpuSdrConversionRequest conversion;
     make_conversion_request(preview.source, auto_contrast, levels, width * rows,
@@ -600,20 +934,43 @@ bool render_cpu_target(CpuNativePreview &preview, const OutputTarget &target,
                 : CpuOutputBandSample::linear_float32,
             conversion, width, rows, band.color.data(),
             sdr ? static_cast<void *>(scratch.data()) : nullptr,
-            sdr ? scratch.size() : 0U, options.cancellation, category, error) ||
+            sdr ? scratch.size() : 0U, cancellation, category, error) ||
         (coverage_writer != nullptr &&
          !write_image_rows(coverage_writer, band.coverage.data(), rows, width,
-                           options.cancellation, category, error)))
+                           cancellation, category, error)))
       return false;
     progress(options, (auto_contrast ? height : 0U) + row + rows,
              height * (auto_contrast ? 2U : 1U), "CPU render");
   }
-  return finish_image_writer(&writer, options.cancellation, category, error) &&
+  return finish_image_writer(&writer, cancellation, category, error) &&
          (coverage_writer == nullptr ||
-          finish_image_writer(&coverage_writer, options.cancellation, category,
+          finish_image_writer(&coverage_writer, cancellation, category,
                               error));
 }
 } // namespace
+
+bool query_cpu_native_render_dimensions(const CpuNativePreview *const preview,
+                                        unsigned &width, unsigned &height,
+                                        std::string &error) {
+  if (preview == nullptr) {
+    error = "CPU preview is not available";
+    return false;
+  }
+  return render_dimensions(preview->plan, preview->source, width, height,
+                           error);
+}
+
+bool query_cpu_native_maximum_render_width(
+    const CpuNativePreview *const preview, unsigned &width,
+    std::string &error) {
+  if (preview == nullptr) {
+    error = "CPU preview is not available";
+    return false;
+  }
+  unsigned height = 0U;
+  return render_dimensions(preview->plan, preview->source, width, height, error,
+                           true);
+}
 
 bool render_cpu_native_session(CpuNativePreview *const preview,
                                const NativeRenderOptions &options,

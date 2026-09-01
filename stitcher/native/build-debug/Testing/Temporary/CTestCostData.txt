@@ -1,4 +1,0 @@
-pano_gpu_contract 4 0.000767698
-pano_gpu_contract_check_failure 4 0.000320575
-pano_gpu_cancellation_token 4 0.000326162
----

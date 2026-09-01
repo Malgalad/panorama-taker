@@ -1,10 +1,11 @@
 #include "pano_app.h"
+#include "pano_app_version.h"
 
 #include <ostream>
 
 namespace pano::app {
 namespace {
-constexpr const char *version = "1.0.4";
+constexpr const char *version = PANO_APP_VERSION;
 
 void write_help(std::ostream &output) {
   output

@@ -1,3 +1,0 @@
-repository='external project URL'
-module='https://github.com/AcademySoftwareFoundation/openexr/archive/c1194b2cb23a1bdf76fe5e756b22e8436b9a98c9.tar.gz'
-tag='SHA256=c4a5fb903facf83a1bffcce25a8fed931bfa4d179b3aa8d0541069f56644d7aa'

@@ -2,8 +2,8 @@
 
 #include <algorithm>
 #include <cctype>
-#include <filesystem>
 #include <cmath>
+#include <filesystem>
 #include <utility>
 
 namespace pano::app {
@@ -14,8 +14,7 @@ std::string trimmed(std::string value) {
   const auto content = [](const unsigned char character) {
     return std::isspace(character) == 0;
   };
-  value.erase(value.begin(),
-              std::find_if(value.begin(), value.end(), content));
+  value.erase(value.begin(), std::find_if(value.begin(), value.end(), content));
   value.erase(std::find_if(value.rbegin(), value.rend(), content).base(),
               value.end());
   return value;
@@ -35,8 +34,7 @@ gui_option_enablement(const GuiRenderRequestState &state) noexcept {
 }
 
 bool snapshot_gui_render_request(const GuiRenderRequestState &state,
-                                 RenderOptions &options,
-                                 std::string &error) {
+                                 RenderOptions &options, std::string &error) {
   error.clear();
   if (state.session.empty()) {
     error = "choose a session file";
@@ -71,15 +69,25 @@ bool snapshot_gui_render_request(const GuiRenderRequestState &state,
     error = "memory budget must be between 1 and 8192 MiB";
     return false;
   }
+  if (state.gpu_memory_mib.has_value() &&
+      (*state.gpu_memory_mib < 1U || *state.gpu_memory_mib > 8192U)) {
+    error = "GPU memory budget must be between 1 and 8192 MiB";
+    return false;
+  }
+  if (!state.gpu && state.gpu_memory_mib.has_value()) {
+    error = "GPU memory budget requires GPU rendering";
+    return false;
+  }
 
   std::string output_name = trimmed(state.output_name);
   if (output_name.empty() || output_name == "panorama.png") {
-    const std::string identity = state.session_id.empty()
-                                     ? fs::u8path(state.session).stem().u8string()
-                                     : state.session_id;
+    const std::string identity =
+        state.session_id.empty() ? fs::u8path(state.session).stem().u8string()
+                                 : state.session_id;
     output_name = "panorama-" + identity;
   }
-  fs::path output = fs::u8path(state.output_directory) / fs::u8path(output_name);
+  fs::path output =
+      fs::u8path(state.output_directory) / fs::u8path(output_name);
   output.replace_extension(format_extension(state.format));
 
   RenderOptions snapshot;
@@ -96,6 +104,7 @@ bool snapshot_gui_render_request(const GuiRenderRequestState &state,
   snapshot.memory_mib = state.memory_mib;
   snapshot.workers = state.workers;
   snapshot.gpu = state.gpu;
+  snapshot.gpu_memory_mib = state.gpu_memory_mib;
   snapshot.gpu_strict = state.gpu && state.gpu_strict;
   snapshot.allow_incomplete = state.allow_incomplete;
   snapshot.auto_contrast = state.auto_contrast;
@@ -131,7 +140,8 @@ std::vector<std::string> gui_existing_output_paths(const RenderPlan &plan) {
   return paths;
 }
 
-void navigate_gui_stage(GuiWorkflowState &state, const GuiStage stage) noexcept {
+void navigate_gui_stage(GuiWorkflowState &state,
+                        const GuiStage stage) noexcept {
   state.stage = stage;
 }
 
@@ -167,11 +177,11 @@ GuiInvalidation apply_gui_change(GuiWorkflowState &state,
   return invalidation;
 }
 
-bool begin_gui_operation(GuiWorkflowState &state,
-                         const GuiOperation operation,
+bool begin_gui_operation(GuiWorkflowState &state, const GuiOperation operation,
                          std::uint64_t &generation,
                          std::string &error) noexcept {
-  if (operation == GuiOperation::idle || state.operation != GuiOperation::idle) {
+  if (operation == GuiOperation::idle ||
+      state.operation != GuiOperation::idle) {
     error = "GUI operation is already active";
     return false;
   }
@@ -195,12 +205,57 @@ void cancel_gui_operation(GuiWorkflowState &state) noexcept {
   state.operation = GuiOperation::idle;
 }
 
+GuiPresentationState derive_gui_presentation(
+    const GuiWorkflowState &state, const bool exposure_available,
+    const bool exposure_target_selected, const bool exposure_sources_selected,
+    const bool exposure_edits_applied, const unsigned operation_progress,
+    const bool output_complete) noexcept {
+  GuiPresentationState result;
+  result.busy = state.operation != GuiOperation::idle;
+  result.input_enabled = !result.busy;
+  result.preview_enabled = state.validation_ready && !result.busy;
+  result.preview_ready = state.preview_ready;
+  result.exposure_enabled =
+      state.preview_ready && exposure_available && !result.busy;
+  result.automatic_exposure_enabled =
+      result.exposure_enabled && exposure_target_selected;
+  result.match_exposure_enabled =
+      result.automatic_exposure_enabled && exposure_sources_selected;
+  result.discard_exposure_enabled =
+      result.exposure_enabled && exposure_edits_applied;
+  result.output_enabled = state.preview_ready && !result.busy;
+  result.render_enabled =
+      state.validation_ready && state.preview_ready && !result.busy;
+  result.rendering = state.operation == GuiOperation::render;
+  if (state.operation == GuiOperation::preview ||
+      state.operation == GuiOperation::exposure)
+    result.preview_progress = operation_progress;
+  if (result.rendering)
+    result.output_progress = operation_progress;
+  result.output_complete = output_complete && !result.rendering;
+  return result;
+}
+
+GuiBackendDecision select_gui_backend(const bool request_gpu,
+                                      const bool require_gpu,
+                                      const bool d3d12_available,
+                                      const bool cpu_available) noexcept {
+  if (!request_gpu)
+    return cpu_available ? GuiBackendDecision::cpu_forced
+                         : GuiBackendDecision::unavailable;
+  if (d3d12_available)
+    return GuiBackendDecision::d3d12;
+  if (require_gpu)
+    return GuiBackendDecision::strict_d3d12_rejection;
+  return cpu_available ? GuiBackendDecision::cpu_fallback
+                       : GuiBackendDecision::unavailable;
+}
+
 bool calculate_gui_preview_crop(const unsigned source_width,
                                 const unsigned source_height,
                                 const unsigned viewport_width,
                                 const unsigned viewport_height,
-                                const double pointer_x,
-                                const double pointer_y,
+                                const double pointer_x, const double pointer_y,
                                 GuiPreviewViewState &state,
                                 std::string &error) {
   if (source_width == 0 || source_height == 0 || viewport_width == 0 ||
@@ -211,8 +266,8 @@ bool calculate_gui_preview_crop(const unsigned source_width,
     return false;
   }
   const auto center = [](const double pointer, const unsigned extent) {
-    return static_cast<unsigned>(std::nearbyint(
-        std::clamp(pointer, 0.0, 1.0) * static_cast<double>(extent)));
+    return static_cast<unsigned>(std::nearbyint(std::clamp(pointer, 0.0, 1.0) *
+                                                static_cast<double>(extent)));
   };
   const unsigned center_x = center(pointer_x, source_width);
   const unsigned center_y = center(pointer_y, source_height);
@@ -227,9 +282,7 @@ bool calculate_gui_preview_crop(const unsigned source_width,
   return true;
 }
 
-void reset_gui_preview_view(GuiPreviewViewState &state) noexcept {
-  state = {};
-}
+void reset_gui_preview_view(GuiPreviewViewState &state) noexcept { state = {}; }
 
 bool gui_preview_hit_test(const GuiPreviewHitRequest &request,
                           const std::vector<std::uint8_t> &compact_masks,
@@ -240,17 +293,17 @@ bool gui_preview_hit_test(const GuiPreviewHitRequest &request,
   if (request.source_width == 0 || request.source_height == 0 ||
       request.mask_width == 0 || request.mask_height == 0 ||
       request.frame_count == 0 || expected != compact_masks.size() ||
-      !std::isfinite(request.pointer_x) ||
-      !std::isfinite(request.pointer_y) ||
+      !std::isfinite(request.pointer_x) || !std::isfinite(request.pointer_y) ||
       (request.target.has_value() && *request.target >= request.frame_count)) {
     error = "invalid preview hit-test request";
     return false;
   }
-  const GuiPreviewCrop crop = request.view.overview
-                                  ? GuiPreviewCrop{0, 0, request.source_width,
-                                                   request.source_height}
-                                  : request.view.crop;
-  if (crop.width == 0 || crop.height == 0 || crop.width > request.source_width ||
+  const GuiPreviewCrop crop =
+      request.view.overview
+          ? GuiPreviewCrop{0, 0, request.source_width, request.source_height}
+          : request.view.crop;
+  if (crop.width == 0 || crop.height == 0 ||
+      crop.width > request.source_width ||
       crop.height > request.source_height ||
       crop.left > request.source_width - crop.width ||
       crop.top > request.source_height - crop.height) {
@@ -258,12 +311,13 @@ bool gui_preview_hit_test(const GuiPreviewHitRequest &request,
     return false;
   }
   const auto coordinate = [](const double pointer, const unsigned extent) {
-    return std::min(
-        extent - 1U,
-        static_cast<unsigned>(std::clamp(pointer, 0.0, 1.0) * extent));
+    return std::min(extent - 1U, static_cast<unsigned>(
+                                     std::clamp(pointer, 0.0, 1.0) * extent));
   };
-  const unsigned source_x = crop.left + coordinate(request.pointer_x, crop.width);
-  const unsigned source_y = crop.top + coordinate(request.pointer_y, crop.height);
+  const unsigned source_x =
+      crop.left + coordinate(request.pointer_x, crop.width);
+  const unsigned source_y =
+      crop.top + coordinate(request.pointer_y, crop.height);
   const unsigned mask_x = std::min(
       request.mask_width - 1U,
       static_cast<unsigned>(static_cast<std::uint64_t>(source_x) *
@@ -336,9 +390,10 @@ bool update_gui_exposure_progress(GuiExposureState &state,
   return true;
 }
 
-bool complete_gui_exposure_operation(
-    GuiExposureState &state, const std::uint64_t generation,
-    std::optional<CpuExposureReport> report, std::string warning) noexcept {
+bool complete_gui_exposure_operation(GuiExposureState &state,
+                                     const std::uint64_t generation,
+                                     std::optional<CpuExposureReport> report,
+                                     std::string warning) noexcept {
   if (!state.busy || generation != state.generation)
     return false;
   if (report.has_value() && report->gains.size() == state.edits.gains.size())
@@ -367,8 +422,7 @@ bool apply_gui_exposure_match(GuiExposureState &state, const float gain,
   return apply_cpu_exposure_match(state.edits, gain, error);
 }
 
-bool discard_gui_exposure_edits(GuiExposureState &state,
-                                std::string &error) {
+bool discard_gui_exposure_edits(GuiExposureState &state, std::string &error) {
   if (state.busy) {
     error = "exposure recomputation is active";
     return false;

@@ -115,7 +115,8 @@ bool convert_sdr_pixel(const CpuSdrConversionRequest &request,
     const float tone_scale = luminance > 0.0F ? mapped / luminance : 0.0F;
     for (float &value : working) value *= tone_scale;
   }
-  if (request.source_primaries == CpuColorPrimaries::rec2020) {
+  if (request.source_transfer == CpuTransferFunction::pq &&
+      request.source_primaries == CpuColorPrimaries::rec2020) {
     working = {
         working[0] * 1.660491F - working[1] * 0.587641F -
             working[2] * 0.072850F,

@@ -15,21 +15,16 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-      - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
-        with:
-          python-version: "3.12"
-      - name: Install stitcher and checks
-        run: python -m pip install -e "./stitcher[dev]"
       - name: Check Lua formatting
         uses: JohnnyMorganz/stylua-action@76fd70c03e6340ceaf673366712db9b20560b402 # v5.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           version: v2.5.2
           args: --check mod/cet/PanoramaCaptureProbe/init.lua
-      - name: Run checks
+      - name: Configure native stitcher
+        run: cmake -S stitcher/native -B build/stitcher-native -DCMAKE_BUILD_TYPE=Release
+      - name: Build native stitcher
+        run: cmake --build build/stitcher-native --config Release --parallel 2
+      - name: Run native contracts
         run: |
-          ruff check stitcher/src stitcher/scripts stitcher/tests reshade-addon/tests
-          ruff format --check stitcher/src stitcher/scripts stitcher/tests reshade-addon/tests
-          mypy stitcher/src
-          pytest -q stitcher/tests reshade-addon/tests
+          ctest --test-dir build/stitcher-native -C Release --output-on-failure

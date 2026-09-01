@@ -1,5 +1,30 @@
 #include "pano_app_resource.h"
 
+1 VERSIONINFO
+FILEVERSION @PANO_APP_VERSION_MAJOR@,@PANO_APP_VERSION_MINOR@,@PANO_APP_VERSION_PATCH@,0
+PRODUCTVERSION @PANO_APP_VERSION_MAJOR@,@PANO_APP_VERSION_MINOR@,@PANO_APP_VERSION_PATCH@,0
+FILEFLAGSMASK 0x3fL
+FILEOS 0x40004L
+FILETYPE 0x1L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "FileDescription", "Panorama Capture Stitcher\0"
+            VALUE "FileVersion", "@PANO_APP_VERSION@\0"
+            VALUE "InternalName", "PanoramaCaptureStitcher.exe\0"
+            VALUE "OriginalFilename", "PanoramaCaptureStitcher.exe\0"
+            VALUE "ProductName", "Panorama Capture Stitcher\0"
+            VALUE "ProductVersion", "@PANO_APP_VERSION@\0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x409, 1200
+    END
+END
+
 PANO_APP_ICON ICON "@PANO_APP_ICON@"
 PANO_APP_UI_HTML RCDATA "pano_app_ui_embedded.html"
 PANO_APP_EXPOSURE_HTML RCDATA "pano_app_exposure_embedded.html"

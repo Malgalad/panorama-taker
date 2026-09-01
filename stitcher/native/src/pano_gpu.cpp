@@ -1989,7 +1989,8 @@ static pano_gpu_result dispatch_reference_exposure_pair_ratios(
 
 static pano_gpu_result reduce_exposure_graph(
     pano_gpu_session *const session, const pano_gpu_exposure_pair_request *const request_template,
-    const bool filter_gradients, char *const error_buffer,
+    const bool filter_gradients, pano_gpu_progress_callback progress,
+    void *const progress_user_data, char *const error_buffer,
     const uint32_t error_buffer_size) noexcept
 {
     if (session == nullptr || request_template == nullptr ||
@@ -2013,6 +2014,7 @@ static pano_gpu_result reduce_exposure_graph(
         std::vector<pano_gpu_exposure_pair_report> reports = session->exposure_pair_reports;
         std::vector<pano_gpu_exposure_equation> equations;
         equations.reserve(reports.size());
+        uint32_t completed = 0;
         for (auto &report : reports)
         {
             pano_gpu_exposure_pair_request request = *request_template;
@@ -2056,6 +2058,15 @@ static pano_gpu_result reduce_exposure_graph(
                     report.left_frame_index, report.right_frame_index,
                     static_cast<double>(reduction.difference),
                     static_cast<double>(reduction.weight)});
+            ++completed;
+            if (progress != nullptr &&
+                progress(progress_user_data, completed,
+                         static_cast<uint32_t>(reports.size())) == 0)
+            {
+                write_error(error_buffer, error_buffer_size,
+                            "D3D12 exposure-graph reduction cancelled");
+                return PANO_GPU_CANCELLED;
+            }
         }
         session->exposure_pair_reports.swap(reports);
         session->exposure_equations.swap(equations);
@@ -2084,7 +2095,8 @@ pano_gpu_result pano_gpu_session_reduce_exposure_graph(
     char *const error_buffer, const uint32_t error_buffer_size) noexcept
 {
     return reduce_exposure_graph(
-        session, request_template, true, error_buffer, error_buffer_size);
+        session, request_template, true, nullptr, nullptr, error_buffer,
+        error_buffer_size);
 }
 
 pano_gpu_result pano_gpu_session_reduce_reference_exposure_graph(
@@ -2092,7 +2104,19 @@ pano_gpu_result pano_gpu_session_reduce_reference_exposure_graph(
     char *const error_buffer, const uint32_t error_buffer_size) noexcept
 {
     return reduce_exposure_graph(
-        session, request_template, false, error_buffer, error_buffer_size);
+        session, request_template, false, nullptr, nullptr, error_buffer,
+        error_buffer_size);
+}
+
+pano_gpu_result pano_gpu_session_reduce_reference_exposure_graph_progress(
+    pano_gpu_session *const session,
+    const pano_gpu_exposure_pair_request *const request_template,
+    pano_gpu_progress_callback progress, void *const progress_user_data,
+    char *const error_buffer, const uint32_t error_buffer_size) noexcept
+{
+    return reduce_exposure_graph(
+        session, request_template, false, progress, progress_user_data,
+        error_buffer, error_buffer_size);
 }
 
 pano_gpu_result pano_gpu_session_query_exposure_graph(

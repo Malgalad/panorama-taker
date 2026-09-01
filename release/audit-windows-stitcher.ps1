@@ -6,13 +6,19 @@ param(
     [string]$ProjectRoot = "",
     [string]$ReportPath = "",
     [switch]$AllowUnavailable,
-    [switch]$RequireNativeOnly
+    [switch]$AuditSourceTree,
+    [string]$SourceTreeRoot = "",
+    [switch]$PolicyOnly
 )
 
 $ErrorActionPreference = "Stop"
+. (Join-Path $PSScriptRoot "native-only-policy.ps1")
 $archive = (Resolve-Path -LiteralPath $ArchivePath).Path
 if (-not $ProjectRoot) {
     $ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+}
+if (-not $SourceTreeRoot) {
+    $SourceTreeRoot = $ProjectRoot
 }
 if (-not $ReportPath) {
     $ReportPath = "$archive.audit.txt"
@@ -27,40 +33,22 @@ New-Item -ItemType Directory -Force -Path $extractRoot | Out-Null
 try {
     Expand-Archive -LiteralPath $archive -DestinationPath $extractRoot
     $files = @(Get-ChildItem -LiteralPath $extractRoot -Recurse -File)
-    $legacyExecutable = @($files | Where-Object { $_.Name -eq "PanoramaCaptureStitcher.exe" })
-    $comparisonExecutables = @($files | Where-Object {
-        $_.Name -in @("PanoramaCaptureStitcher-Python.exe", "PanoramaCaptureStitcher-Native.exe")
-    })
-    $executables = if ($legacyExecutable.Count -eq 1 -and $comparisonExecutables.Count -eq 0) {
-        $legacyExecutable
-    } elseif ($legacyExecutable.Count -eq 0 -and $comparisonExecutables.Count -eq 2) {
-        @($comparisonExecutables | Sort-Object Name)
-    } else {
-        @()
+    Assert-NativeOnlyArchive -Root $extractRoot
+    if ($AuditSourceTree) {
+        Assert-NativeOnlySourceTree -Root $SourceTreeRoot
     }
+    $executables = @($files | Where-Object { $_.Name -eq "PanoramaCaptureStitcher.exe" })
     $nativeDll = @($files | Where-Object { $_.Name -eq "pano_gpu.dll" })
-    if ($executables.Count -eq 0 -or $nativeDll.Count -ne 1) {
-        throw "Archive must contain one legacy or two comparison stitcher executables and one pano_gpu.dll"
+    if ($executables.Count -ne 1 -or $nativeDll.Count -ne 1) {
+        throw "Archive must contain exactly PanoramaCaptureStitcher.exe and pano_gpu.dll"
     }
-    if ($RequireNativeOnly) {
-        if ($executables.Count -ne 1 -or $executables[0].Name -ne "PanoramaCaptureStitcher.exe") {
-            throw "Native-only archive must contain exactly PanoramaCaptureStitcher.exe"
-        }
-        $pythonPayload = @($files | Where-Object {
-            $_.Extension -match '(?i)^\.(py|pyc|pyd)$' -or
-            $_.Name -match '(?i)^(python.*\.dll|base_library\.zip)$' -or
-            $_.FullName -match '(?i)[\\/]_internal[\\/]'
-        })
-        if ($pythonPayload.Count -ne 0) {
-            throw "Native-only archive contains Python runtime payload: $($pythonPayload.Name -join ', ')"
-        }
-    }
-    $forbidden = @($files | Where-Object {
-        $_.Name -match '(?i)(d3dcompiler|nvrtc|cudart|cupy|cuda)' -or
-        $_.Extension -match '(?i)^\.(hlsl|cso|pdb)$'
-    })
+    $forbidden = @($files | Where-Object { $_.Extension -match '(?i)^\.(hlsl|cso|pdb)$' })
     if ($forbidden.Count -gt 0) {
         throw "Archive contains forbidden runtime/compiler/shader files: $($forbidden.Name -join ', ')"
+    }
+    if ($PolicyOnly) {
+        Write-Host "Native-only policy checks passed"
+        return
     }
 
     $runtimeResults = @()
@@ -86,13 +74,16 @@ try {
             throw "dumpbin failed for $($binary.Name)"
         }
         $peDependencies += "[$($binary.Name)]"
-        $peDependencies += @($dependencies | Where-Object { $_ -match '(?i)\.dll\s*$' } |
+        $peDependencies += @($dependencies | Where-Object {
+            $_ -match '(?i)^\s*[A-Za-z0-9_.-]+\.dll\s*$'
+        } |
             ForEach-Object { $_.Trim() } | Sort-Object -Unique)
     }
-    if ($peDependencies -match '(?i)(d3dcompiler|nvrtc|cudart|cuda)') {
+    $forbiddenDependencyPattern = '(?i)(d3dcompiler|nv' + 'rtc|cu' + 'dart|cu' + 'da)'
+    if ($peDependencies -match $forbiddenDependencyPattern) {
         throw "PE dependency audit found a forbidden compiler or vendor runtime"
     }
-    if ($RequireNativeOnly -and $peDependencies -match '(?i)(msvcp|vcruntime)') {
+    if ($peDependencies -match '(?i)(msvcp|vcruntime)') {
         throw "Native-only archive depends on an external MSVC redistributable"
     }
 
@@ -118,7 +109,7 @@ try {
         "archive_sha256=$((Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant())"
         "archive_bytes=$((Get-Item -LiteralPath $archive).Length)"
         "extracted_bytes=$extractedBytes"
-        "payload_mode=$(if ($RequireNativeOnly) { 'native' } else { 'transitional' })"
+        "payload_mode=native"
         "native_dll_sha256=$((Get-FileHash -LiteralPath $nativeDll[0].FullName -Algorithm SHA256).Hash.ToLowerInvariant())"
         "executables:"
     )

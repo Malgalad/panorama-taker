@@ -1,0 +1,3 @@
+#pragma once
+
+#define PANO_APP_VERSION "@PROJECT_VERSION@"

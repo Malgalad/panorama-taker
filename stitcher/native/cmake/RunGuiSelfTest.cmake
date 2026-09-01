@@ -1,5 +1,6 @@
 execute_process(
     COMMAND "${GUI_EXECUTABLE}" --self-test
+            --self-test-codec-dir "${CODEC_FIXTURE_DIR}"
     RESULT_VARIABLE result)
 
 if(result EQUAL 11)
@@ -28,6 +29,15 @@ endif()
 
 if(DEFINED detail)
     message(FATAL_ERROR "pano-stitch-native-gui self-test failed: ${detail}")
+endif()
+
+execute_process(
+    COMMAND "${GUI_EXECUTABLE}" --self-test --no-gpu
+            --self-test-codec-dir "${CODEC_FIXTURE_DIR}"
+    RESULT_VARIABLE cpu_result)
+if(NOT cpu_result EQUAL 0)
+    message(FATAL_ERROR
+            "pano-stitch-native-gui forced-CPU self-test failed: ${cpu_result}")
 endif()
 
 set(probe_result "${CMAKE_CURRENT_BINARY_DIR}/pano-app-gui-runtime-probe.txt")

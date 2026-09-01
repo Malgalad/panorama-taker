@@ -3472,9 +3472,28 @@ int main(const int argc, char **const argv)
                session, 3, error.data(), static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
     EXPECT(pano_gpu_session_enumerate_exposure_pairs(
                session, error.data(), static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
-    EXPECT(pano_gpu_session_reduce_reference_exposure_graph(
-               session, &graph_pair_request, error.data(), static_cast<uint32_t>(error.size())) ==
+    struct ExposureProgress
+    {
+        uint32_t completed = 0;
+        uint32_t total = 0;
+        uint32_t calls = 0;
+    } exposure_progress;
+    const auto record_exposure_progress = [](void *const user_data, const uint32_t completed,
+                                             const uint32_t total) -> int {
+        auto &progress = *static_cast<ExposureProgress *>(user_data);
+        if (completed <= progress.completed || total != 3)
+            return 0;
+        progress.completed = completed;
+        progress.total = total;
+        ++progress.calls;
+        return 1;
+    };
+    EXPECT(pano_gpu_session_reduce_reference_exposure_graph_progress(
+               session, &graph_pair_request, record_exposure_progress, &exposure_progress,
+               error.data(), static_cast<uint32_t>(error.size())) ==
            PANO_GPU_SUCCESS);
+    EXPECT(exposure_progress.completed == 3 && exposure_progress.total == 3 &&
+           exposure_progress.calls == 3);
     reduced_graph_diagnostics = {};
     reduced_graph_diagnostics.size = sizeof(reduced_graph_diagnostics);
     reduced_graph_diagnostics.abi_version = PANO_GPU_ABI_VERSION;

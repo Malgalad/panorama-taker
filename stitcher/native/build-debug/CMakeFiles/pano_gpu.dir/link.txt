@@ -1,1 +1,0 @@
-/usr/bin/c++ -fPIC -g -shared -Wl,-soname,libpano_gpu.so -o libpano_gpu.so CMakeFiles/pano_gpu.dir/src/pano_gpu.cpp.o 

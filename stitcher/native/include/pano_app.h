@@ -362,6 +362,7 @@ struct GuiRenderRequestState {
   unsigned memory_mib = 1024;
   unsigned workers = 0;
   bool gpu = true;
+  std::optional<unsigned> gpu_memory_mib;
   bool gpu_strict = false;
   bool allow_incomplete = false;
   bool auto_contrast = true;
@@ -469,6 +470,31 @@ struct GuiWorkflowState {
   bool session_selected = false;
   bool validation_ready = false;
   bool preview_ready = false;
+};
+
+struct GuiPresentationState {
+  bool busy = false;
+  bool input_enabled = true;
+  bool preview_enabled = false;
+  bool preview_ready = false;
+  bool exposure_enabled = false;
+  bool automatic_exposure_enabled = false;
+  bool match_exposure_enabled = false;
+  bool discard_exposure_enabled = false;
+  bool output_enabled = false;
+  bool render_enabled = false;
+  bool rendering = false;
+  unsigned preview_progress = 0;
+  unsigned output_progress = 0;
+  bool output_complete = false;
+};
+
+enum class GuiBackendDecision {
+  d3d12,
+  cpu_forced,
+  cpu_fallback,
+  strict_d3d12_rejection,
+  unavailable
 };
 
 enum class GuiExposureOperation { automatic, manual_match };
@@ -783,6 +809,16 @@ bool begin_gui_operation(GuiWorkflowState &state, GuiOperation operation,
 bool complete_gui_operation(GuiWorkflowState &state,
                             std::uint64_t generation) noexcept;
 void cancel_gui_operation(GuiWorkflowState &state) noexcept;
+GuiPresentationState derive_gui_presentation(const GuiWorkflowState &state,
+                                             bool exposure_available,
+                                             bool exposure_target_selected,
+                                             bool exposure_sources_selected,
+                                             bool exposure_edits_applied,
+                                             unsigned operation_progress,
+                                             bool output_complete) noexcept;
+GuiBackendDecision select_gui_backend(bool request_gpu, bool require_gpu,
+                                      bool d3d12_available,
+                                      bool cpu_available) noexcept;
 bool calculate_gui_preview_crop(unsigned source_width, unsigned source_height,
                                 unsigned viewport_width,
                                 unsigned viewport_height, double pointer_x,
@@ -820,6 +856,11 @@ bool rebuild_native_preview(NativePreview *preview, const RenderPlan &plan,
 bool query_native_preview(const NativePreview *preview,
                           NativePreviewDiagnostics &diagnostics,
                           std::string &error);
+bool query_native_render_dimensions(const NativePreview *preview,
+                                    unsigned &width, unsigned &height,
+                                    std::string &error);
+bool query_native_maximum_render_width(const NativePreview *preview,
+                                       unsigned &width, std::string &error);
 bool update_native_preview_render_plan(NativePreview *preview,
                                        const RenderPlan &plan,
                                        std::string &error);
@@ -848,11 +889,28 @@ bool create_cpu_native_preview(const RenderPlan &plan,
 bool query_cpu_native_preview(const CpuNativePreview *preview,
                               NativePreviewDiagnostics &diagnostics,
                               std::string &error);
+bool query_cpu_native_render_dimensions(const CpuNativePreview *preview,
+                                        unsigned &width, unsigned &height,
+                                        std::string &error);
+bool query_cpu_native_maximum_render_width(const CpuNativePreview *preview,
+                                           unsigned &width, std::string &error);
 const std::vector<std::uint8_t> &
 cpu_native_preview_pixels(const CpuNativePreview *preview) noexcept;
 bool update_cpu_native_preview_render_plan(CpuNativePreview *preview,
                                            const RenderPlan &plan,
                                            std::string &error);
+bool apply_cpu_native_automatic_exposure(
+    CpuNativePreview *preview, unsigned target,
+    const NativePreviewOptions &options, NativeExposureResult &result,
+    std::string &error);
+bool apply_cpu_native_manual_exposure_match(
+    CpuNativePreview *preview, unsigned target,
+    const std::vector<unsigned> &selected,
+    const NativePreviewOptions &options, NativeExposureResult &result,
+    std::string &error);
+bool discard_cpu_native_exposure_edits(
+    CpuNativePreview *preview, const NativePreviewOptions &options,
+    NativeExposureResult &result, std::string &error);
 bool render_cpu_native_session(CpuNativePreview *preview,
                                const NativeRenderOptions &options,
                                NativeRenderResult &result, std::string &error);
@@ -863,6 +921,8 @@ bool load_application_settings(const std::string &path,
 bool save_application_settings(const std::string &path,
                                const ApplicationSettings &settings,
                                std::string &error);
+bool parse_application_gpu_memory_mib(std::string_view text, unsigned &value,
+                                      std::string &error);
 std::string application_history_key(const std::string &game_directory,
                                     const std::string &session_id);
 void mark_application_session_stitched(ApplicationSettings &settings,
@@ -877,6 +937,10 @@ bool set_application_session_tag(ApplicationSettings &settings,
                                  const std::string &game_directory,
                                  const std::string &session_id,
                                  const std::string &tag, std::string &error);
+bool set_and_save_application_session_tag(
+    ApplicationSettings &settings, const std::string &game_directory,
+    const std::string &session_id, const std::string &tag,
+    const std::optional<std::string> &settings_path, std::string &error);
 std::optional<std::string>
 application_session_tag(const ApplicationSettings &settings,
                         const std::string &game_directory,

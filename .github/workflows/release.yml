@@ -8,7 +8,7 @@ on:
   workflow_dispatch:
     inputs:
       release_version:
-        description: "Version to package; must match stitcher/pyproject.toml (without v)"
+        description: "Version to package; must match stitcher/native/VERSION (without v)"
         required: true
         type: string
         default: "1.0.4"
@@ -32,29 +32,19 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.event_name == 'workflow_dispatch' && inputs.release_version || github.ref }}
-      - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: stitcher/uv.lock
       - name: Verify release version
         shell: pwsh
         run: |
           $expected = $env:RELEASE_VERSION.TrimStart("v")
-          $actual = (Select-String -Path stitcher/pyproject.toml -Pattern '^version = "(.+)"$').Matches.Groups[1].Value
+          $actual = (Get-Content stitcher/native/VERSION -Raw).Trim()
           if ($actual -ne $expected) {
-            throw "Tag $env:RELEASE_VERSION does not match stitcher version $actual"
+            throw "Tag $env:RELEASE_VERSION does not match native stitcher version $actual"
           }
-      - name: Install stitcher and checks
-        shell: pwsh
-        run: python -m pip install -e ".\stitcher[dev]"
-      - name: Run stitcher checks
+      - name: Run native-only policy fixtures
         shell: pwsh
         run: |
-          ruff check stitcher/src stitcher/scripts stitcher/tests reshade-addon/tests
-          mypy stitcher/src
-          pytest -q stitcher/tests reshade-addon/tests
+          .\release\test-native-only-policy.ps1
+          .\release\test-version-policy.ps1
       - name: Build ReShade add-on
         shell: pwsh
         run: |
@@ -63,11 +53,8 @@ jobs:
       - name: Build release archives
         shell: pwsh
         run: |
-          $version = $env:RELEASE_VERSION.TrimStart("v")
           .\release\build-windows-release.ps1 `
-            -AddonPath .\build\reshade-addon\Release\PanoramaCaptureReShade.addon64 `
-            -Version $version `
-            -PythonCommand python
+            -AddonPath .\build\reshade-addon\Release\PanoramaCaptureReShade.addon64
       - name: Verify archive contents and generate checksums
         shell: pwsh
         run: |
@@ -75,14 +62,15 @@ jobs:
           .\release\audit-windows-stitcher.ps1 `
             -ArchivePath "dist\PanoramaCapture-Stitcher-$version-win-x64.zip" `
             -ReportPath "dist\PanoramaCapture-Stitcher-$version-win-x64.audit.txt" `
-            -AllowUnavailable
+            -AllowUnavailable `
+            -AuditSourceTree
           $verify = Join-Path $env:RUNNER_TEMP "panorama-release-verify"
           Expand-Archive "dist\PanoramaCapture-Mod-$version.zip" (Join-Path $verify "mod")
           Expand-Archive "dist\PanoramaCapture-Stitcher-$version-win-x64.zip" (Join-Path $verify "stitcher")
           $cet = Join-Path $verify "mod\bin\x64\plugins\cyber_engine_tweaks\mods\PanoramaCaptureProbe\init.lua"
           $addon = Join-Path $verify "mod\bin\x64\PanoramaCaptureReShade.addon64"
-          $stitcher = Join-Path $verify "stitcher\PanoramaCaptureStitcher\PanoramaCaptureStitcher.exe"
-          $nativeDll = Join-Path $verify "stitcher\PanoramaCaptureStitcher\_internal\pano_stitch\pano_gpu.dll"
+          $stitcher = Join-Path $verify "stitcher\PanoramaCaptureStitcher.exe"
+          $nativeDll = Join-Path $verify "stitcher\pano_gpu.dll"
           $required = [ordered]@{
             cet = $cet
             reshade_addon = $addon
@@ -111,12 +99,9 @@ jobs:
             "commit=$env:GITHUB_SHA"
             "runner_os=$env:RUNNER_OS"
             "runner_image=$env:ImageOS"
-            ""
-            "pip_freeze:"
+            "cmake=$(& cmake --version | Select-Object -First 1)"
+            "msbuild=$(& msbuild -version -nologo | Select-Object -First 1)"
           ) | Set-Content dist\BUILD-INFO.txt
-          "" | Add-Content dist\BUILD-INFO.txt
-          "stitcher_pip_freeze:" | Add-Content dist\BUILD-INFO.txt
-          & .\.venv-release\Scripts\python.exe -m pip freeze | Add-Content dist\BUILD-INFO.txt
       - name: Upload dry-run artifacts
         if: github.event_name == 'workflow_dispatch' && inputs.publish != true
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0

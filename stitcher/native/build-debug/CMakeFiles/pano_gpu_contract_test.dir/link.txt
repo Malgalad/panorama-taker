@@ -1,1 +1,0 @@
-/usr/bin/c++ -g CMakeFiles/pano_gpu_contract_test.dir/tests/pano_gpu_contract_test.cpp.o -o pano_gpu_contract_test  -Wl,-rpath,/home/pogorelov/panorama-taker/stitcher/native/build-debug libpano_gpu.so 

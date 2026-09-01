@@ -1,4 +1,5 @@
 #include "pano_app.h"
+#include "pano_app_version.h"
 #include "pano_gpu.h"
 
 #include <algorithm>
@@ -84,6 +85,12 @@ struct NativeRenderProgress {
   progress.phases.emplace_back(phase == nullptr ? "" : phase);
 }
 
+void cancel_gpu_on_progress(void *const context, unsigned, unsigned,
+                            const char *) {
+  pano_gpu_cancellation_token_cancel(
+      static_cast<pano_gpu_cancellation_token *>(context));
+}
+
 void write_bytes(const fs::path &path, const std::vector<std::uint8_t> &bytes) {
   std::ofstream stream(path, std::ios::binary);
   stream.write(reinterpret_cast<const char *>(bytes.data()),
@@ -121,7 +128,7 @@ void test_dispatch() {
   EXPECT(output.str().find("--auto-exposure") != std::string::npos);
   output.str({});
   EXPECT(pano::app::run({"--version"}, output, error) == 0);
-  EXPECT(output.str().find("1.0.4") != std::string::npos);
+  EXPECT(output.str().find(PANO_APP_VERSION) != std::string::npos);
   EXPECT(pano::app::run({"--unknown"}, output, error) ==
          static_cast<int>(pano::app::ExitCode::invalid_input));
   EXPECT(error.str().find("--unknown") != std::string::npos);
@@ -357,6 +364,8 @@ void test_output_and_render_plans() {
   options.thumbnail = true;
   options.blend = "feather";
   options.width = 4097;
+  options.memory_mib = 768U;
+  options.gpu_memory_mib = 3072U;
   options.automatic_exposure = true;
   pano::app::OutputPlan outputs;
   std::string error;
@@ -379,6 +388,7 @@ void test_output_and_render_plans() {
   EXPECT(plan.output_height == 2048U);
   EXPECT(plan.projection == "equirectangular");
   EXPECT(plan.blend == "feather");
+  EXPECT(plan.memory_mib == 768U && plan.gpu_memory_mib == 3072U);
   EXPECT(plan.automatic_exposure);
 
   options.session = (fixtures() / "cet-incomplete.json").u8string();
@@ -1585,12 +1595,12 @@ void test_reference_exposure_propagation() {
          std::fabs(gains[1] - std::exp(0.2F)) < 1.0e-6F &&
          std::fabs(gains[2] - 1.0F) < 1.0e-7F);
 
-  EXPECT(pano::app::solve_reference_exposure_gains(
-      2, 0, {{0, 1, 2.0, 1.0}}, {1.0F, 1.0F}, gains, error));
+  EXPECT(pano::app::solve_reference_exposure_gains(2, 0, {{0, 1, 2.0, 1.0}},
+                                                   {1.0F, 1.0F}, gains, error));
   EXPECT(gains.size() == 2U && std::fabs(gains[1] - std::exp(2.0F)) < 1.0e-5F);
 
-  EXPECT(pano::app::solve_reference_exposure_gains(
-      2, 0, {{0, 1, 0.2, 1.0}}, {2.0F, 0.5F}, gains, error));
+  EXPECT(pano::app::solve_reference_exposure_gains(2, 0, {{0, 1, 0.2, 1.0}},
+                                                   {2.0F, 0.5F}, gains, error));
   EXPECT(gains.size() == 2U && std::fabs(gains[0] - 2.0F) < 1.0e-7F &&
          std::fabs(gains[1] - 2.0F * std::exp(0.2F)) < 1.0e-6F);
 
@@ -1649,6 +1659,18 @@ void test_cpu_conversion_and_writer_bands() {
                                           sdr8.data(), error));
   EXPECT(sdr8[0] == 128U && sdr8[1] == 128U && sdr8[2] == 128U);
   request.apply_auto_contrast = false;
+  request.source_transfer = pano::app::CpuTransferFunction::linear;
+  request.source_primaries = pano::app::CpuColorPrimaries::rec2020;
+  const std::array<float, 3> linear_rec2020{0.5F, 0.25F, 0.125F};
+  EXPECT(pano::app::convert_cpu_sdr8_band(
+      request, linear_rec2020.data(), sdr8.data(), error));
+  const std::array<std::uint8_t, 3> linear_rec2020_sdr{
+      sdr8[0], sdr8[1], sdr8[2]};
+  request.source_primaries = pano::app::CpuColorPrimaries::srgb;
+  EXPECT(pano::app::convert_cpu_sdr8_band(
+      request, linear_rec2020.data(), sdr8.data(), error));
+  EXPECT(std::equal(linear_rec2020_sdr.begin(), linear_rec2020_sdr.end(),
+                    sdr8.begin()));
   request.source_transfer = pano::app::CpuTransferFunction::pq;
   request.source_primaries = pano::app::CpuColorPrimaries::rec2020;
   request.reference_white_nits = 203.0F;
@@ -1883,7 +1905,8 @@ void test_gui_request_and_validation_state() {
   EXPECT(request.blend == "feather");
   EXPECT(!request.thumbnail && !request.coverage);
   EXPECT(request.memory_mib == 1024U && request.workers == 0U);
-  EXPECT(request.gpu && !request.gpu_strict);
+  EXPECT(request.gpu && !request.gpu_memory_mib.has_value() &&
+         !request.gpu_strict);
   EXPECT(!request.allow_incomplete && request.auto_contrast);
 
   auto enablement = pano::app::gui_option_enablement(request);
@@ -1918,6 +1941,23 @@ void test_gui_request_and_validation_state() {
          std::abs(options.resolution - 0.75) < 1.0e-12);
   EXPECT(options.blend == "feather" && options.thumbnail && options.coverage);
   EXPECT(!options.gpu && !options.gpu_strict);
+  EXPECT(!options.allow_incomplete && options.auto_contrast);
+
+  request.gpu = true;
+  request.memory_mib = 768U;
+  request.gpu_memory_mib = 3072U;
+  EXPECT(pano::app::snapshot_gui_render_request(request, options, error));
+  EXPECT(options.memory_mib == 768U && options.gpu_memory_mib == 3072U);
+  request.gpu_memory_mib = 8193U;
+  EXPECT(!pano::app::snapshot_gui_render_request(request, options, error));
+  EXPECT(error.find("GPU memory") != std::string::npos);
+  request.gpu_memory_mib = 3072U;
+  request.gpu = false;
+  EXPECT(!pano::app::snapshot_gui_render_request(request, options, error));
+  EXPECT(error.find("requires GPU") != std::string::npos);
+  request.gpu = true;
+  request.gpu_memory_mib.reset();
+  request.memory_mib = 1024U;
 
   request.resolution_percent = 0U;
   EXPECT(!pano::app::snapshot_gui_render_request(request, options, error));
@@ -2003,12 +2043,44 @@ void test_gui_preview_crop_state() {
 }
 
 void test_gui_workflow_state() {
+  EXPECT(pano::app::select_gui_backend(true, false, true, true) ==
+         pano::app::GuiBackendDecision::d3d12);
+  EXPECT(pano::app::select_gui_backend(false, false, true, true) ==
+         pano::app::GuiBackendDecision::cpu_forced);
+  EXPECT(pano::app::select_gui_backend(true, false, false, true) ==
+         pano::app::GuiBackendDecision::cpu_fallback);
+  EXPECT(pano::app::select_gui_backend(true, true, false, true) ==
+         pano::app::GuiBackendDecision::strict_d3d12_rejection);
+  EXPECT(pano::app::select_gui_backend(true, false, false, false) ==
+         pano::app::GuiBackendDecision::unavailable);
+
   pano::app::GuiWorkflowState state;
   EXPECT(state.stage == pano::app::GuiStage::input);
   EXPECT(state.operation == pano::app::GuiOperation::idle);
+  auto presentation = pano::app::derive_gui_presentation(
+      state, false, false, false, false, 0U, false);
+  EXPECT(!presentation.busy && presentation.input_enabled);
+  EXPECT(!presentation.preview_enabled && !presentation.preview_ready);
+  EXPECT(!presentation.exposure_enabled && !presentation.output_enabled &&
+         !presentation.render_enabled && !presentation.output_complete);
   state.session_selected = true;
   state.validation_ready = true;
+  presentation = pano::app::derive_gui_presentation(state, false, false, false,
+                                                    false, 0U, false);
+  EXPECT(presentation.preview_enabled && !presentation.render_enabled);
   state.preview_ready = true;
+  presentation = pano::app::derive_gui_presentation(state, false, true, true,
+                                                    true, 0U, true);
+  EXPECT(!presentation.exposure_enabled && presentation.output_enabled &&
+         presentation.render_enabled);
+  presentation = pano::app::derive_gui_presentation(state, true, true, true,
+                                                    true, 0U, true);
+  EXPECT(presentation.preview_ready && presentation.exposure_enabled);
+  EXPECT(presentation.automatic_exposure_enabled &&
+         presentation.match_exposure_enabled &&
+         presentation.discard_exposure_enabled);
+  EXPECT(presentation.output_enabled && presentation.render_enabled &&
+         presentation.output_complete);
 
   pano::app::navigate_gui_stage(state, pano::app::GuiStage::preview);
   pano::app::navigate_gui_stage(state, pano::app::GuiStage::output);
@@ -2057,6 +2129,13 @@ void test_gui_workflow_state() {
   EXPECT(pano::app::begin_gui_operation(state, pano::app::GuiOperation::preview,
                                         generation, error));
   EXPECT(state.operation == pano::app::GuiOperation::preview);
+  presentation = pano::app::derive_gui_presentation(state, true, true, true,
+                                                    true, 37U, true);
+  EXPECT(presentation.busy && !presentation.input_enabled &&
+         !presentation.preview_enabled && !presentation.exposure_enabled &&
+         !presentation.output_enabled && !presentation.render_enabled);
+  EXPECT(presentation.preview_progress == 37U &&
+         presentation.output_progress == 0U && presentation.output_complete);
   std::uint64_t rejected = 0;
   EXPECT(!pano::app::begin_gui_operation(state, pano::app::GuiOperation::render,
                                          rejected, error));
@@ -2067,6 +2146,11 @@ void test_gui_workflow_state() {
                                          rejected, error));
   EXPECT(pano::app::begin_gui_operation(state, pano::app::GuiOperation::render,
                                         generation, error));
+  presentation = pano::app::derive_gui_presentation(state, true, true, true,
+                                                    true, 61U, true);
+  EXPECT(presentation.busy && presentation.rendering);
+  EXPECT(presentation.preview_progress == 0U &&
+         presentation.output_progress == 61U && !presentation.output_complete);
   pano::app::cancel_gui_operation(state);
   EXPECT(state.operation == pano::app::GuiOperation::idle);
   EXPECT(!pano::app::complete_gui_operation(state, generation));
@@ -2324,6 +2408,15 @@ void test_sdr_d3d12_upload() {
     EXPECT(preview_diagnostics.mask_height == 1U);
     EXPECT(pano::app::native_preview_handle(native_preview) != nullptr);
     EXPECT(pano::app::native_preview_masks(native_preview).size() == 4U);
+    unsigned render_width = 0U;
+    unsigned render_height = 0U;
+    EXPECT(pano::app::query_native_render_dimensions(
+        native_preview, render_width, render_height, error));
+    EXPECT(render_width == 8U && render_height == 4U);
+    unsigned maximum_render_width = 0U;
+    EXPECT(pano::app::query_native_maximum_render_width(
+        native_preview, maximum_render_width, error));
+    EXPECT(maximum_render_width != 0U);
     auto recomposed_plan = preview_plan;
     recomposed_plan.blend = "feather";
     recomposed_plan.auto_contrast = true;
@@ -2380,6 +2473,28 @@ void test_sdr_d3d12_upload() {
         (rendered.path() / "native-render-updated.png").u8string();
     updated_plan.outputs.thumbnail.reset();
     updated_plan.jpeg_quality = 92U;
+    EXPECT(pano::app::update_native_preview_render_plan(native_preview,
+                                                        updated_plan, error));
+    EXPECT(pano::app::query_native_render_dimensions(
+        native_preview, render_width, render_height, error));
+    EXPECT(render_width == 8U && render_height == 4U);
+    updated_plan.output_width.reset();
+    updated_plan.output_height.reset();
+    updated_plan.resolution = 0.5;
+    EXPECT(pano::app::update_native_preview_render_plan(native_preview,
+                                                        updated_plan, error));
+    EXPECT(pano::app::query_native_render_dimensions(
+        native_preview, render_width, render_height, error));
+    EXPECT(render_width == 4U && render_height == 2U);
+    updated_plan.output_width = 7U;
+    EXPECT(pano::app::update_native_preview_render_plan(native_preview,
+                                                        updated_plan, error));
+    EXPECT(pano::app::query_native_render_dimensions(
+        native_preview, render_width, render_height, error));
+    EXPECT(render_width == 6U && render_height == 3U);
+    updated_plan.output_width = 8U;
+    updated_plan.output_height = 4U;
+    updated_plan.resolution = 1.0;
     EXPECT(pano::app::update_native_preview_render_plan(native_preview,
                                                         updated_plan, error));
     auto incompatible_plan = updated_plan;
@@ -2454,6 +2569,17 @@ void test_sdr_d3d12_upload() {
                                              render_result, error));
     EXPECT(read_bytes(fs::u8path(preview_plan.outputs.panorama.final_path)) ==
            panorama_before_cancel);
+
+    auto uncovered_exr = preview_plan;
+    uncovered_exr.allow_incomplete = false;
+    uncovered_exr.outputs.panorama.final_path =
+        (rendered.path() / "native-uncovered.exr").u8string();
+    uncovered_exr.outputs.coverage.reset();
+    EXPECT(pano::app::update_native_preview_render_plan(
+        native_preview, uncovered_exr, error));
+    EXPECT(!pano::app::render_native_session(native_preview, render_options,
+                                             render_result, error));
+    EXPECT(error.find("cover every output pixel") != std::string::npos);
   }
   pano::app::destroy_native_preview(&native_preview);
   pano::app::destroy_native_preview(&native_preview);
@@ -2485,6 +2611,20 @@ void test_application_settings_history_and_deletion() {
   const auto settings_path = temporary.path() / fs::u8path(u8"настройки.json");
   pano::app::ApplicationSettings settings;
   std::string error;
+  unsigned gpu_memory_mib = 0;
+  EXPECT(pano::app::parse_application_gpu_memory_mib("1024", gpu_memory_mib,
+                                                     error));
+  EXPECT(gpu_memory_mib == 1024U);
+  EXPECT(pano::app::parse_application_gpu_memory_mib("8192", gpu_memory_mib,
+                                                     error));
+  EXPECT(gpu_memory_mib == 8192U);
+  for (const std::string_view invalid :
+       {"", "1023", "8193", "+1024", "1024 MiB", "42949672960"}) {
+    EXPECT(!pano::app::parse_application_gpu_memory_mib(invalid, gpu_memory_mib,
+                                                        error));
+    EXPECT(error.find("1024") != std::string::npos &&
+           error.find("8192") != std::string::npos);
+  }
   EXPECT(pano::app::load_application_settings(settings_path.u8string(),
                                               settings, error));
   EXPECT(settings.game_directory.empty() && settings.image_directory.empty() &&
@@ -2512,15 +2652,15 @@ void test_application_settings_history_and_deletion() {
          settings.stitched_sessions.empty());
   write_text(
       settings_path,
-      R"({"game_dir":"python-game","image_dir":"python-images","output_dir":"python-output","stitched_sessions":{"python-key":{"output_name":"python-panorama.jpg"}},"auto_contrast":true})");
+      R"({"game_dir":"legacy-game","image_dir":"legacy-images","output_dir":"legacy-output","stitched_sessions":{"legacy-key":{"output_name":"legacy-panorama.jpg"}},"auto_contrast":true})");
   EXPECT(pano::app::load_application_settings(settings_path.u8string(),
                                               settings, error));
-  EXPECT(settings.game_directory == "python-game" &&
-         settings.image_directory == "python-images" &&
-         settings.output_directory == "python-output" &&
+  EXPECT(settings.game_directory == "legacy-game" &&
+         settings.image_directory == "legacy-images" &&
+         settings.output_directory == "legacy-output" &&
          settings.auto_contrast && settings.stitched_sessions.size() == 1U &&
-         settings.stitched_sessions[0].key == "python-key" &&
-         settings.stitched_sessions[0].output_name == "python-panorama.jpg");
+         settings.stitched_sessions[0].key == "legacy-key" &&
+         settings.stitched_sessions[0].output_name == "legacy-panorama.jpg");
   settings.stitched_sessions.clear();
   settings.gpu_memory_mib = 3072U;
   settings.debug_coverage = true;
@@ -2544,6 +2684,30 @@ void test_application_settings_history_and_deletion() {
       settings, "game", "session", std::string("\xC0\xAF", 2), error));
   EXPECT(pano::app::set_application_session_tag(settings, "game", "session",
                                                 u8"любимый", error));
+  EXPECT(pano::app::set_and_save_application_session_tag(
+      settings, "game", "session", std::string(64U, 'x'), std::nullopt, error));
+  EXPECT(pano::app::application_session_tag(settings, "game", "session") ==
+         std::optional<std::string>(std::string(64U, 'x')));
+  EXPECT(pano::app::set_and_save_application_session_tag(
+      settings, "game", "session", "", std::nullopt, error));
+  EXPECT(!pano::app::application_session_tag(settings, "game", "session")
+              .has_value());
+  EXPECT(pano::app::set_and_save_application_session_tag(
+      settings, "game", "session", u8"любимый", std::nullopt, error));
+  EXPECT(!pano::app::set_and_save_application_session_tag(
+      settings, "game", "session", std::string(65U, 'x'), std::nullopt, error));
+  EXPECT(pano::app::application_session_tag(settings, "game", "session") ==
+         std::optional<std::string>(u8"любимый"));
+  const auto blocked_settings_parent = temporary.path() / "blocked-settings";
+  write_text(blocked_settings_parent, "not a directory");
+  EXPECT(!pano::app::set_and_save_application_session_tag(
+      settings, "game", "session", "replacement",
+      (blocked_settings_parent / "gui-settings.json").u8string(), error));
+  EXPECT(pano::app::application_session_tag(settings, "game", "session") ==
+         std::optional<std::string>(u8"любимый"));
+  EXPECT(pano::app::set_and_save_application_session_tag(
+      settings, "game", "session", u8"любимый", settings_path.u8string(),
+      error));
   const bool settings_saved = pano::app::save_application_settings(
       settings_path.u8string(), settings, error);
   if (!settings_saved)
@@ -2579,6 +2743,17 @@ void test_application_settings_history_and_deletion() {
          std::vector<std::string>({session.u8string()}));
   const auto targets = pano::app::application_deletion_targets(record, true);
   EXPECT(targets.size() == 3U && fs::exists(session) && fs::exists(image));
+  const auto partial_file = temporary.path() / "partial-delete.txt";
+  const auto blocked_directory = temporary.path() / "non-empty-directory";
+  write_text(partial_file, "delete first");
+  fs::create_directories(blocked_directory);
+  write_text(blocked_directory / "keep.txt", "keep");
+  pano::app::DeletionResult partial_deletion;
+  EXPECT(!pano::app::delete_application_files(
+      {partial_file.u8string(), blocked_directory.u8string()}, partial_deletion,
+      error));
+  EXPECT(!fs::exists(partial_file) && fs::exists(blocked_directory));
+  EXPECT(error.find(blocked_directory.u8string()) != std::string::npos);
   pano::app::DeletionResult deletion;
   EXPECT(pano::app::delete_application_files(targets, deletion, error));
   EXPECT(deletion.deleted == 2U && deletion.missing == 1U);
@@ -2635,6 +2810,28 @@ void test_cpu_native_session() {
   preview_options.viewport_width = 8U;
   pano::app::CpuNativePreview *preview = nullptr;
   std::string error;
+  auto uncovered = plan;
+  uncovered.allow_incomplete = false;
+  pano::app::CpuNativePreview *uncovered_preview = nullptr;
+  EXPECT(!pano::app::create_cpu_native_preview(
+      uncovered, preview_options, &uncovered_preview, error));
+  EXPECT(uncovered_preview == nullptr &&
+         error.find("cover every output pixel") != std::string::npos);
+
+  pano_gpu_cancellation_token *preview_token = nullptr;
+  std::array<char, 256> gpu_error{};
+  EXPECT(pano_gpu_cancellation_token_create(
+             &preview_token, gpu_error.data(),
+             static_cast<std::uint32_t>(gpu_error.size())) == PANO_GPU_SUCCESS);
+  pano::app::NativePreviewOptions token_cancelled_preview = preview_options;
+  token_cancelled_preview.gpu_cancellation = preview_token;
+  token_cancelled_preview.progress = cancel_gpu_on_progress;
+  token_cancelled_preview.progress_user_data = preview_token;
+  EXPECT(!pano::app::create_cpu_native_preview(
+      plan, token_cancelled_preview, &uncovered_preview, error));
+  EXPECT(uncovered_preview == nullptr && error.find("cancel") != std::string::npos);
+  pano_gpu_cancellation_token_destroy(&preview_token);
+
   const bool cpu_preview_created = pano::app::create_cpu_native_preview(
       plan, preview_options, &preview, error);
   if (!cpu_preview_created)
@@ -2645,6 +2842,28 @@ void test_cpu_native_session() {
   EXPECT(diagnostics.preview_width == 8U);
   EXPECT(diagnostics.preview_height == 4U);
   EXPECT(pano::app::cpu_native_preview_pixels(preview).size() == 128U);
+  pano::app::NativeExposureResult exposure;
+  EXPECT(pano::app::discard_cpu_native_exposure_edits(
+      preview, preview_options, exposure, error));
+  EXPECT(exposure.gains == std::vector<float>({1.0F, 1.0F}));
+  EXPECT(pano::app::apply_cpu_native_automatic_exposure(
+      preview, 0U, preview_options, exposure, error));
+  EXPECT(exposure.anchor_frame == 0U && exposure.gains.size() == 2U);
+  EXPECT(pano::app::apply_cpu_native_manual_exposure_match(
+      preview, 0U, {1U}, preview_options, exposure, error));
+  EXPECT(exposure.anchor_frame == 0U && exposure.gains.size() == 2U);
+  EXPECT(pano::app::discard_cpu_native_exposure_edits(
+      preview, preview_options, exposure, error));
+  EXPECT(exposure.gains == std::vector<float>({1.0F, 1.0F}));
+  unsigned render_width = 0U;
+  unsigned render_height = 0U;
+  EXPECT(pano::app::query_cpu_native_render_dimensions(preview, render_width,
+                                                       render_height, error));
+  EXPECT(render_width == 8U && render_height == 4U);
+  unsigned maximum_render_width = 0U;
+  EXPECT(pano::app::query_cpu_native_maximum_render_width(
+      preview, maximum_render_width, error));
+  EXPECT(maximum_render_width != 0U);
   NativeRenderProgress progress;
   pano::app::NativeRenderOptions render_options;
   render_options.progress = record_native_render_progress;
@@ -2688,11 +2907,34 @@ void test_cpu_native_session() {
          std::is_sorted(progress.values.begin(), progress.values.end()));
   EXPECT(result.published_paths ==
          std::vector<std::string>({feather.outputs.panorama.final_path}));
+#ifdef _WIN32
+  auto jpeg = feather;
+  jpeg.outputs.panorama.final_path =
+      (temporary.path() / "cpu-feather.jpg").u8string();
+  jpeg.jpeg_quality = 87U;
+  EXPECT(
+      pano::app::update_cpu_native_preview_render_plan(preview, jpeg, error));
+  EXPECT(pano::app::render_cpu_native_session(preview, render_options, result,
+                                              error));
+  pano::app::ImageInfo jpeg_info;
+  pano::app::CodecErrorCategory jpeg_category{};
+  EXPECT(pano::app::inspect_image(jpeg.outputs.panorama.final_path, jpeg_info,
+                                  jpeg_category, error));
+  EXPECT(jpeg_info.container == pano::app::ImageContainer::jpeg &&
+         jpeg_info.width == 8U && jpeg_info.height == 4U);
+#endif
   pano::app::NativeRenderOptions cancelled = render_options;
-  cancelled.cancellation = {always_cancelled, nullptr};
+  pano_gpu_cancellation_token *render_token = nullptr;
+  EXPECT(pano_gpu_cancellation_token_create(
+             &render_token, gpu_error.data(),
+             static_cast<std::uint32_t>(gpu_error.size())) == PANO_GPU_SUCCESS);
+  cancelled.gpu_cancellation = render_token;
+  cancelled.progress = cancel_gpu_on_progress;
+  cancelled.progress_user_data = render_token;
   EXPECT(
       !pano::app::render_cpu_native_session(preview, cancelled, result, error));
   EXPECT(error.find("cancel") != std::string::npos);
+  pano_gpu_cancellation_token_destroy(&render_token);
   pano::app::destroy_cpu_native_preview(&preview);
   pano::app::destroy_cpu_native_preview(&preview);
   EXPECT(preview == nullptr);

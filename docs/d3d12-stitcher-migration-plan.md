@@ -3016,12 +3016,605 @@ workers, cancellation, preview/exposure state, rendering, and publication.
    the Win32 interface as an automatic fallback. Remove the explicit switch only in a later
    reviewed change.
 
+### 24. Complete the WebView2 native-only cutover
+
+This packet is the final application-migration goal. It supersedes the transitional rollback
+requirements in Steps 22 and 23: the accepted repository and release contain the native D3D12
+backend, the native CPU fallback, and the WebView2 GUI only. There is no CUDA backend, Python
+product or tooling, Tk interface, comparison archive, hidden legacy Win32 interface, or
+`--native-ui` switch. Git history and previously published archives are the rollback mechanism.
+
+Native Windows services are not legacy UI and remain permitted: the top-level/Exposure window
+chrome, D3D12 or GDI preview child, taskbar progress, filesystem picker, completion notification,
+and the native missing-WebView2 bootstrap prompt. Application dialogs and controls belong in the
+WebView2 document.
+
+#### 24a. Freeze the final boundary
+
+##### 24a.1. Record the retained and removed components
+
+- Retain `stitcher/native`, the D3D12 DLL/API, native CPU fallback, embedded HTML/CSS/JavaScript,
+  native CLI/headless probes, contracts, codec fixtures, release audit, and native release build.
+- Mark all Python/Tk/CUDA product sources, adapters, entry points, tests, package metadata, lock
+  files, PyInstaller paths, comparison packaging, and Python-only helper scripts for deletion.
+- Classify each native dialog as either an application dialog to migrate or an operating-system
+  service that remains native.
+
+Gate: a checked-in inventory accounts for every shipped executable, runtime dependency, GUI
+surface, Python file, CUDA reference, release mode, and test that will be retained, replaced, or
+deleted. No deletion occurs in this substep.
+
+Completed 2026-08-31: [`native-only-cutover-inventory.md`](native-only-cutover-inventory.md)
+records the final archive shape, native/runtime dependencies, application-dialog versus OS-service
+classification, retained native sources/tests/fixtures, generated-tree cleanup, all Python deletion
+roots, CUDA disposition, current release modes, workflow replacements, and the final native test
+matrix. No product source was deleted for this boundary-freeze substep.
+
+##### 24a.2. Add native-only repository and archive assertions
+
+- Extend the release audit to reject Python executables/libraries, Python packages, PyInstaller
+  metadata, CUDA/CuPy/NVRTC/runtime files, comparison entry points, and the legacy native-UI switch.
+- Add focused source-tree checks for forbidden product/tooling extensions and dependency names,
+  while excluding `.git`, ignored local environments/build trees, historical docs, and explicit
+  third-party notices.
+
+Gate: the assertions pass on retained native inputs and have focused fixtures proving that each
+forbidden category is rejected.
+
+Completed 2026-08-31: `release/native-only-policy.ps1` now enforces the one-EXE/one-DLL archive
+shape and rejects Python runtime/package/PyInstaller payloads, CUDA-family files, comparison entry
+points, and the embedded `--native-ui` switch. Its source-tree assertion rejects Python/package
+files and obsolete dependency/frontend references while excluding historical docs, ignored or
+generated trees, third-party notices, and the policy fixtures themselves. The release audit invokes
+both policies, and `release/test-native-only-policy.ps1` proves clean native vocabulary is accepted
+and every forbidden category is rejected through focused Windows PowerShell fixtures.
+
+#### 24b. Move every application modal into WebView2
+
+##### 24b.1. Add a declarative modal host
+
+- Add one persistent modal layer to the existing render tree with derived open/kind/payload state.
+- Implement focus entry/return, Tab containment, Escape, backdrop behavior, accessible title and
+  description relationships, and native-preview occlusion while a modal overlaps it.
+- Keep all mutations native-authoritative through versioned allow-listed bridge messages.
+
+Gate: focused DOM/resource and bridge contracts cover open, close, focus restoration, stale-page
+rejection, keyboard handling, and preview z-order without changing application data.
+
+Completed 2026-08-31: the persistent WebView modal layer is derived from typed native
+kind/generation/dismissibility/payload state. It provides accessible title/description relations,
+inert background content, focus entry/return and containment, Escape/backdrop/Close handling, exact
+generation-tagged dismissal messages, and native-preview occlusion in both JavaScript geometry and
+native presentation guards. Shared predicates now make stale page and stale modal rejection
+directly contract-testable. No application mutation or existing modal command was migrated in this
+infrastructure substep. JavaScript syntax, clang-format, portable Release CTest 4/4, MSVC Release
+`/W4 /WX`, and Windows CTest 8/8 passed.
+
+##### 24b.2. Migrate Edit Tag
+
+- Port the current label, 64-character validation/counter, existing-value behavior, Save, and
+  Cancel flow into the modal host.
+- Preserve tags on invalid input, cancellation, persistence failure, and shutdown.
+
+Gate: existing, empty, maximum-length, overlength, save, cancel, and persistence-failure contracts
+pass without creating the Win32 tag modal.
+
+Completed 2026-08-31: the WebView `edit-tag` command now opens typed modal state with the existing
+tag, stable session identity, native 64-character validation/counter, read-only operation behavior,
+inline errors, Save, Cancel, and Enter-to-save. Draft changes never touch application settings;
+Cancel and shutdown discard them. Save validates and persists a candidate settings copy, commits
+only after the staged settings write succeeds, keeps the modal open on failure, and updates the
+session row only after success. Portable contracts cover existing, empty, 64-character,
+overlength, invalid UTF-8, successful round-trip, and injected persistence failure. JavaScript
+syntax, clang-format, Ruff lint/format, mypy, 172 transitional Python tests, portable Release CTest
+4/4, MSVC Release `/W4 /WX`, and Windows CTest 8/8 passed. The remaining Win32 tag-modal call is
+reachable only through the explicit legacy frontend and is deleted with that frontend in Step 24e.
+
+##### 24b.3. Migrate Input Options
+
+- Port incomplete-session admission and every remaining Input-only option with the shared input and
+  checkbox classes.
+- Preserve validation generation, preview invalidation, defaults, and persistence semantics.
+
+Gate: changing, accepting, cancelling, and reopening Input Options matches the current native state
+contract without creating native controls.
+
+Completed 2026-08-31: Input-stage `open-options` now opens the shared WebView modal with the current
+native “Allow incomplete session” value, shared checkbox styling, generation-tagged draft changes,
+read-only operation behavior, Save, and Cancel. Draft toggles do not touch the hidden authoritative
+checkbox; Save applies it and schedules the existing validation generation without discarding the
+preview, while Cancel and shutdown discard only the draft and reopening rereads native state.
+Preview-stage options remain on their old path until 24b.4. Exact boolean bridge contracts reject
+numeric, stale, and over-shaped messages. JavaScript syntax, clang-format, Ruff lint/format, mypy,
+172 transitional Python tests, portable Release CTest 4/4, MSVC Release `/W4 /WX`, and Windows
+CTest 8/8 passed.
+
+##### 24b.4. Migrate Preview Options
+
+- Port blend and SDR auto-contrast options with current enablement and invalidation behavior.
+- Preserve retained-source reuse, recomposition progress, exposure state, and cancellation.
+
+Gate: hard/feather and auto-contrast changes rebuild exactly the required preview stages and the
+modal never permits concurrent mutation.
+
+Completed 2026-08-31: Preview-stage `open-options` now opens the shared WebView modal with
+native-derived Hard/Feather and “Auto contrast (SDR only)” values, shared radio/checkbox styling,
+generation-tagged drafts, read-only operation behavior, Save, and Cancel. Native Save allow-lists
+the blend value, compares both options with current state, persists auto-contrast, and invokes the
+existing preview-option validation only when a value changed; that path preserves retained-source
+reuse, recomposition progress, exposure state, and cancellation. Cancel/shutdown performs no
+mutation and reopening rereads native state. JavaScript syntax, clang-format, Ruff lint/format,
+mypy, 172 transitional Python tests, portable Release CTest 4/4, MSVC Release `/W4 /WX`, and
+Windows CTest 8/8 passed. The remaining native Preview Options modal is reachable only through the
+explicit legacy frontend and is deleted with it in Step 24e.
+
+##### 24b.5. Migrate App Settings
+
+- Port GPU memory cap and debug coverage settings with shared inputs/checkboxes.
+- Preserve the corrected allocation-cap semantics, defaults, validation, settings persistence, and
+  the rule that coverage is absent from ordinary Output flow.
+
+Gate: valid/invalid caps, coverage persistence, Save, Cancel, restart, and malformed-settings
+recovery pass without creating the Win32 settings modal.
+
+Completed 2026-08-31: WebView `open-settings` now opens the shared modal host with the current
+native D3D12 allocation cap, shared text/checkbox styling, debug-coverage value, read-only operation
+behavior, inline validation, Save, Cancel, and Enter-to-save. The native validator accepts only
+exact unsigned 1024–8192 MiB values. Draft changes never mutate settings or compatibility controls;
+Save persists a complete candidate settings copy before committing the cap and coverage flag, keeps
+the modal open on publication failure, and preserves the existing reduced-cap preview rebuild and
+validation scheduling semantics. Debug coverage remains absent from ordinary Output UI. Portable
+contracts cover both boundaries, malformed/signed/suffixed/overflow values, settings round-trip,
+coverage persistence, and malformed-settings recovery; embedded-resource contracts cover the form,
+shared controls, Save/Cancel route, and Output exclusion. JavaScript syntax, clang-format, Ruff
+lint/format, mypy, 172 transitional Python tests, portable Release CTest 4/4, MSVC Release
+`/W4 /WX`, and Windows CTest 8/8 passed. The remaining native App Settings modal is reachable only
+through the explicit legacy frontend and is deleted with that frontend in Step 24e.
+
+##### 24b.6. Migrate destructive confirmations
+
+- Implement delete-session confirmation, optional image deletion, exact target summary, and
+  overwrite-output confirmation in WebView2.
+- Keep target resolution, filesystem mutation, staged publication, and refresh native; never send
+  arbitrary paths or filesystem commands from JavaScript.
+
+Gate: confirm/cancel, missing targets, partial deletion failure, overwrite refusal, and disposable
+successful deletion pass with no native application confirmation dialog.
+
+Completed 2026-08-31: WebView delete-session and overwrite-output actions now use the shared modal
+host with native-authored, multiline target summaries, generation-tagged confirm/cancel commands,
+destructive action labels, and an optional “Also delete captured screenshots” checkbox. JavaScript
+never supplies paths or filesystem commands. Delete confirmations retain stable native session
+identity, recompute the exact target list when the checkbox changes and immediately before mutation,
+and preserve missing-target accounting and failure reporting. Overwrite confirmations snapshot the
+native validation plan's existing outputs and re-resolve them before render; a changed target set is
+shown for a fresh confirmation instead of being overwritten under stale consent. Portable contracts
+cover metadata-only targets, duplicate/missing targets, disposable successful deletion, partial
+failure, and deterministic existing-output ordering; embedded-resource contracts cover both actions,
+Cancel, shared controls, multiline summaries, and the bridge trust boundary. JavaScript syntax,
+clang-format, Ruff lint/format, mypy, 172 transitional Python tests, portable Release CTest 4/4,
+MSVC Release `/W4 /WX`, and Windows CTest 8/8 passed. Native TaskDialog/MessageBox confirmations now
+remain only on the explicit legacy frontend and are deleted with it in Step 24e.
+
+##### 24b.7. Migrate ordinary application errors and notices
+
+- Present validation, render, exposure, bridge-command, and recoverable runtime errors through the
+  modal/toast layer with selectable text and deterministic dismissal.
+- Retain a native prompt only when WebView2 itself cannot be created or used, because HTML cannot
+  present that failure.
+
+Gate: every reachable post-WebView-start `MessageBox`/`TaskDialog` call is removed or documented as
+the unavailable-WebView bootstrap path.
+
+Completed 2026-08-31: actionable session-discovery, preview, retained-plan, render, exposure, and
+recoverable WebView/native-surface failures now preserve status text and open a native-authored,
+selectable, generation-tagged WebView notice with deterministic Close/Escape/backdrop dismissal.
+Cancellation and ordinary progress remain non-modal, while debounce-driven field validation stays
+inline so transient edits do not create blocking dialogs. Background failures never replace an open
+settings or destructive draft. Exposure satellite startup and host failures use the still-live main
+WebView notice host. The remaining application `MessageBox` calls are limited to main WebView startup
+or host failure, where HTML cannot present the error; overwrite and delete prompts are reachable only
+through the explicit legacy frontend and are deleted in Step 24e. Resource contracts cover selectable
+notice text and the established dismissal/focus behavior. JavaScript syntax, clang-format, Ruff
+lint/format, mypy, 172 transitional Python tests, portable Release CTest 4/4, MSVC Release `/W4 /WX`,
+and Windows CTest 8/8 passed.
+
+#### 24c. Replace hidden Win32 controls with typed native state
+
+##### 24c.1. Move directory and session fields into `GuiShellState`
+
+- Store game, screenshot, and output directories plus selected/manual session identity directly in
+  typed native fields.
+- Make folder-picker results and WebView edits mutate those fields before scheduling work.
+
+Gate: discovery, refresh, selection, settings restore, and snapshots no longer read or write hidden
+directory/session controls.
+
+Completed 2026-08-31: `GuiShellState` now owns game, screenshot, and output directories alongside
+its existing selected/manual session identity. Settings restore/save, request capture, discovery,
+refresh, selection, history/tag persistence, and WebView snapshot serialization consume typed state.
+WebView edits and folder-picker results mutate it before invoking the existing game reset or
+validation scheduling semantics, and WebView refresh/selection no longer populate or query the
+hidden session ListView. The explicit legacy frontend uses a one-way directory-control mirror and
+legacy-only ListView/accessibility branches until Step 24e. JavaScript syntax, clang-format, Ruff
+lint/format, mypy, 172 transitional Python tests, portable Release CTest 4/4, MSVC Release `/W4 /WX`,
+and Windows CTest 8/8 passed.
+
+##### 24c.2. Move Input and Preview options into typed state
+
+- Store blend, incomplete admission, auto contrast, GPU cap, coverage, and backend policy directly.
+- Construct validation/render requests from typed state without `SendMessage` or window text.
+
+Gate: focused request-snapshot tests cover defaults and every option; invalid input remains visible
+to WebView without corrupting the last valid plan.
+
+Completed 2026-08-31: `GuiShellState` now owns blend, incomplete-session admission, auto contrast,
+CPU memory/workers, D3D12 allocation cap, debug coverage, and GPU/fallback policy. Request capture,
+settings restore/save, App/Input/Preview modal drafts and commits, enablement, and legacy mirrors use
+that typed state; invalid modal or legacy numeric text cannot corrupt the last valid request. This
+substep also corrected an inherited semantic wiring bug: App Settings had persisted `gpu_memory_mib`
+but written it into the CPU-memory edit, while GUI request capture never populated the GPU cap.
+`GuiRenderRequestState` now carries an independent optional `gpu_memory_mib`, validates it against GPU
+policy, and copies it through `RenderOptions` and `RenderPlan` into the D3D12 admission planner. The
+Windows GUI self-test proves real capture of simultaneous 768 MiB CPU and 3072 MiB GPU budgets;
+portable contracts prove independent defaults, snapshot/plan propagation, invalid ranges, and
+CPU-only rejection, while existing GPU contracts prove the requested cap clamps planned available
+bytes. Clang-format, `git diff --check`, Ruff lint/format, mypy, 172 transitional Python tests,
+portable Release CTest 4/4, MSVC Release `/W4 /WX`, and Windows CTest 8/8 passed.
+
+##### 24c.3. Move Output fields into typed state
+
+- Store output name, format, JPEG quality, scale/width mode, current values, and the authoritative
+  100%-width ceiling directly.
+- Preserve smooth dimension display and native clamping/validation of explicit width.
+
+Gate: filename/format changes do not perturb dimensions; scale/width changes do; no Output request
+or snapshot accesses a hidden edit/combo/slider/radio control.
+
+Completed 2026-08-31: `GuiShellState` now owns the output filename, format, JPEG quality,
+percent/pixel mode and editable values, thumbnail request, current dimensions, and authoritative
+100%-scale width ceiling. WebView commands mutate those fields directly; request capture and WebView
+snapshots no longer read hidden Output edits, combo boxes, sliders, radio buttons, or checkboxes. The
+explicit legacy frontend remains a one-way compatibility mirror until Step 24e. Explicit-width input
+keeps native clamping, rejects stale/programmatic values above the retained preview's ceiling, and
+preserves the renderer's full-sphere even-width smoothing. Portable retained-preview contracts prove
+filename/format/quality changes preserve 8x4 dimensions, 50% scale produces 4x2, and an explicit odd
+width of 7 smooths to 6x3. The Windows GUI self-test exercises typed defaults, percent and pixel
+capture, thumbnail state, invalid numeric preservation, and ceiling rejection. Clang-format,
+`git diff --check`, Ruff lint/format, mypy, 172 transitional Python tests, portable Release CTest 4/4,
+MSVC Release `/W4 /WX`, and Windows CTest 8/8 passed.
+
+##### 24c.4. Derive enablement, status, and progress without controls
+
+- Replace `IsWindowEnabled`, `GetWindowText`, checkbox state, and hidden progress widgets with typed
+  derived state included in snapshots.
+- Keep taskbar progress and native completion notification driven from the same operation state.
+
+Gate: Input, Preview, Exposure, and Output enablement/progress/completion contracts pass with all
+legacy controls absent.
+
+Completed 2026-09-01: a pure `GuiPresentationState` derivation now maps typed workflow validation,
+retained-preview, operation, D3D12-exposure availability, selection/edit, progress, and publication
+state into Input, Preview, Exposure, and Output enablement plus routed progress/completion. It keeps
+CPU retained previews renderable without incorrectly enabling the D3D12-only exposure editor.
+`GuiShellState` owns status text and exposure visibility; validation updates workflow readiness, and
+WebView snapshots serialize only this typed state instead of reading hidden labels, button enablement,
+checkboxes, or progress widgets. The temporary legacy frontend mirrors the same derivation. Operation
+progress still drives tab painting and taskbar progress, while the hidden progress control is no longer
+touched by begin/end semantics and completion beeps remain on successful preview/exposure/render.
+Portable contracts cover idle, validated, CPU-preview, D3D12-exposure, preview-progress,
+render-progress, and completed-output states without HWNDs. The first Windows run exposed a recursive
+legacy status mirror introduced during the migration; the mirror was corrected, the focused GUI
+self-test passed, and the complete suite was rerun. Clang-format, `git diff --check`, focused source
+search, Ruff lint/format, mypy, 172 transitional Python tests, portable Release CTest 4/4, MSVC Release
+`/W4 /WX`, and Windows CTest 8/8 passed.
+
+##### 24c.5. Route every WebView command directly
+
+- Replace synthetic `WM_COMMAND`, control notifications, and hidden-control mutation with narrow
+  native command functions.
+- Preserve UI-thread ownership, generation checks, concurrency rejection, cancellation, and error
+  categories.
+
+Gate: an allow-listed command-to-mutation contract covers every WebView command and source search
+finds no WebView handler forwarding through legacy control IDs.
+
+Completed 2026-09-01: WebView Abort, Preview, Finalize, Render, and Render-with-thumbnail commands
+now call native cancellation, preview, navigation, and render functions directly instead of
+synthesizing `WM_COMMAND` against hidden buttons. The explicit legacy Abort button calls the same
+native cancellation function, preserving UI-thread ownership, the existing cancellation token,
+operation/generation checks, status categories, retained-preview admission, and overwrite flow.
+All 42 `WebViewCommandKind` values are covered in enum order by an allow-listed native mutation-domain
+contract spanning host, directory, session, navigation, Output, modal, Exposure, operation, and
+layout actions. Focused source search over both WebView handlers finds no `WM_COMMAND`, legacy control
+ID, `SendMessageW`, `PostMessageW`, or `SetWindowTextW` forwarding. Clang-format,
+`git diff --check`, Ruff lint/format, mypy, 172 transitional Python tests, portable Release CTest 4/4,
+MSVC Release `/W4 /WX`, and Windows CTest 8/8 passed.
+
+#### 24d. Finish and prove native CPU fallback in WebView2
+
+##### 24d.1. Audit CPU admission and selection
+
+- Force D3D12 unavailable/rejected and verify the existing native CPU coordinator is selected with
+  the fixed memory-bounded policy.
+- Surface the selected backend and actionable failure reason in the same WebView status model.
+
+Gate: deterministic contracts distinguish D3D12, CPU fallback, strict-D3D12 rejection, and total
+backend failure without Python participation.
+
+##### 24d.2. Verify CPU preview presentation and interaction
+
+- Present the retained CPU preview through the measured native preview slot without periodic browser
+  copies or idle repaint work.
+- Preserve default CPU preview resolution, navigation, reset, resize, and cancellation behavior.
+
+Gate: forced-CPU hidden-GUI tests reach Preview ready, remain idle, resize correctly, and tear down
+all workers/resources.
+
+##### 24d.3. Verify CPU final render and publication
+
+- Route ordinary and thumbnail renders, format/quality, coverage debug output, progress, cancellation,
+  failure cleanup, history, and Output completion through the native CPU coordinator.
+
+Gate: forced-CPU JPEG/PNG/EXR fixtures publish expected outputs within memory bounds; cancellation
+and injected failures publish nothing and return the GUI to an operable state.
+
+##### 24d.4. Run forced-no-D3D12 WebView acceptance
+
+- Exercise Input through Output, settings restart, preview, final render, cancellation, and errors
+  with D3D12 deliberately unavailable.
+
+Gate: the WebView2 workflow remains usable and memory-bounded with no Python/CUDA process, module,
+or fallback path.
+
+Completed 2026-09-01: the GUI accepts `--no-gpu` as an explicit memory-bounded CPU-backend request
+even when D3D12 is available. A pure admission contract distinguishes D3D12, forced CPU, automatic
+CPU fallback, strict-D3D12 rejection, and total unavailability; the selected backend and reason are
+published in the typed WebView snapshot. CPU preview creation, retained-plan updates, dimensions,
+native BGRA/GDI presentation, pointer magnification/reset, validation, ordinary/thumbnail rendering,
+progress, Output completion, history, and teardown now share the native GUI operation/generation and
+cancellation paths without a browser pixel-copy loop. The hidden Windows acceptance creates a real
+WebView2 controller, receives DOM `ready`, sends native snapshots, drives Preview/Abort/retry/Finalize/
+thumbnail Render through WebView handlers with `--no-gpu`, verifies no D3D12 device/surface was
+created, publishes and inspects 8x4 panorama/coverage/thumbnail outputs, and closes without live
+workers or native allocations. The tiny cancellation fixture accepts the legitimate race where work
+finishes before Abort observes the token, then explicitly discards before retry; deterministic native
+CPU contracts separately prove pre-cancelled work publishes nothing and failure cleanup is operable.
+Full-session CPU contracts cover PNG and JPEG on Windows and EXR portably under the fixed 2048 MiB
+policy. JavaScript syntax, clang-format, `git diff --check`, Ruff lint/format, mypy, 172 transitional
+Python tests, portable Release CTest 4/4, MSVC Release `/W4 /WX`, focused Windows GUI CTest 1/1, and
+Windows CTest 8/8 passed on the D3D12-capable Windows 11/NVIDIA host.
+
+#### 24e. Delete the legacy Win32 frontend
+
+##### 24e.1. Remove the explicit rollback switch
+
+- Remove `--native-ui`, its argument parsing/help/documentation, and all tests that select it.
+- Ordinary launch either creates WebView2 or shows the native unavailable-WebView bootstrap prompt
+  and exits; it never exposes another application UI.
+
+Gate: CLI/resource/source searches find no legacy switch and startup contracts cover WebView success
+and controlled prerequisite failure.
+
+Completed 2026-09-01: `--native-ui`, its parser state, startup branch, and README rollback instruction
+are removed. Ordinary launch now enables WebView2 unconditionally; missing runtime still follows the
+native prerequisite prompt-and-exit path, while internal self-test mode remains headless and the
+public `--no-gpu` backend selector remains available. Negative release-policy fixtures deliberately
+retain the removed spelling so archive/source audits reject regressions. Focused active-source search
+and rebuilt-PE string search found no switch, portable Release CTest passed 4/4, MSVC Release `/W4
+/WX` built cleanly, and Windows CTest passed 8/8.
+
+##### 24e.2. Remove legacy control construction and layout
+
+- Delete hidden main controls, legacy Exposure controls, owner-draw routines, layout branches,
+  accessibility annotations tied to those controls, and their IDs/fonts/handles.
+- Retain only the host window, WebView controllers, preview child, Exposure host window, and native
+  OS integrations listed at the start of Step 24.
+
+Gate: the GUI builds with no legacy control tree, and Input/Preview/Exposure/Output snapshots and
+interaction tests still pass.
+
+Completed 2026-09-01: the main `Controls` tree now contains only the retained preview child. Hidden
+main/Exposure controls, their IDs and fonts, native accessibility annotations, owner-draw and
+subclass procedures, control layout/enablement mirrors, and non-WebView resize/paint branches are
+deleted. The host window now creates WebView2 unconditionally for both ordinary and self-test
+startup; the separate Exposure host remains WebView2-only. The GUI target also dropped its redundant
+direct Common Controls dependency, while the WebView runtime helper retains that library solely for
+the approved missing-runtime bootstrap prompt. MSVC Release `/W4 /WX` and Windows CTest 8/8 pass;
+the GUI contract exercises Input/Preview/Output interaction, retained-preview geometry, abort/retry,
+finalize, and rendering in both D3D12 and forced-CPU modes.
+
+##### 24e.3. Remove legacy modal and command code
+
+- Delete `ModalKind`, modal window procedures, native application confirmation fallbacks, and unused
+  `WM_COMMAND` routes after their WebView replacements pass.
+
+Gate: source search finds no legacy application modal creation; only approved OS-service dialogs
+remain.
+
+Completed 2026-09-01: `ModalKind`, `ModalState`, the modal window class/procedure, `run_modal`, native
+delete/overwrite confirmations, and all legacy `WM_COMMAND`, notification, scroll, measurement,
+owner-draw, and control-color routes are deleted. Application notices and destructive confirmations
+remain declarative WebView modals. Active native-source search is clean for the removed classes,
+procedures, messages, subclasses, ListView API, and legacy switch; rebuilt-PE string search is clean
+for legacy UI labels and retains only the public `--no-gpu` backend status plus the approved WebView2
+runtime bootstrap text. The reconfigured MSVC Release build and Windows CTest pass 8/8.
+
+##### 24e.4. Rebaseline GUI tests and resource measurements
+
+- Replace native-control accessibility/self-tests with WebView bridge, DOM accessibility, host
+  lifetime, preview geometry, and process-tree tests.
+- Repeat idle/preview/render CPU, host-RAM, private-commit, VRAM, process-tree, and teardown probes.
+
+Gate: no detached WebView/worker process remains; stable idle and memory-bounded rendering stay
+within the recorded acceptance limits.
+
+Completed 2026-09-01: the process-tree probe now moves the GUI to the secondary monitor, activates
+renderer accessibility only for the probe child, drives Input Options and Preview through WebView UI
+Automation, verifies the native Allow incomplete state round trip, and rejects surviving host,
+WebView, or worker processes. Idle measured 7 processes at 369.234 MiB combined working set and
+417.255 MiB private bytes. The real incomplete-session D3D12 retained preview measured 514.252 MiB
+working set and 2064.259 MiB private bytes; explicit `--no-gpu` on the same D3D12-capable host/session
+measured 392.840 MiB and 414.649 MiB. Every tree exited within five seconds. Hardware probing exposed
+and fixed a GUI request-capture bug: CPU mode retained an optional GPU memory budget, so validation
+rejected the otherwise valid CPU request. CPU requests now omit GPU-only budget/strict fields, while
+D3D12 requests retain them; the hidden WebView test asserts both forms and still renders real
+temporary CPU/D3D12 outputs. MSVC Release `/W4 /WX`, Windows CTest 8/8, portable Release CTest 4/4,
+Ruff lint/format, mypy, 172 pytest tests, clang-format, and `git diff --check` pass.
+
+#### 24f. Make release tooling native-only
+
+##### 24f.1. Give the native build an independent version source
+
+- Move the product version out of `stitcher/pyproject.toml` into a native/release-owned source used
+  by CMake, executable metadata, archive naming, and the mod-release consistency check.
+
+Gate: one version change updates every native artifact without Python or parsing Python package
+metadata.
+
+Completed 2026-09-01: `stitcher/native/VERSION` drives CMake project/version generation, CLI
+`--version`, GUI PE File/ProductVersion, archive naming, CET consistency, and the PowerShell bump
+workflow. Portable CTest passed 4/4; MSVC Release and Windows CTest passed 8/8; CLI and PE metadata
+all reported `1.0.4`; the version-policy regression passed valid-update and invalid-no-write cases.
+
+##### 24f.2. Collapse the release builder to one frontend
+
+- Remove Python command, frontend selector, virtual environment, pip, PyInstaller, comparison mode,
+  Python archive naming, and Python probe paths.
+- Always build/package `pano-stitch-native-gui.exe` as `PanoramaCaptureStitcher.exe` beside exactly
+  one `pano_gpu.dll`, licenses, and README.
+
+Gate: a clean release build never invokes Python/pip/PyInstaller and produces only the native
+archive shape.
+
+Completed 2026-09-01: the builder has no interpreter/frontend selector, virtual environment,
+package installer, freezer, or comparison branch. Two clean Windows builds each passed 8/8 CTests
+and produced the flat native archive with one application EXE, one backend DLL, notices, and README.
+
+##### 24f.3. Simplify release audit and documentation
+
+- Remove comparison/Python audit branches and make native-only checks unconditional.
+- Update README setup, launch, troubleshooting, dependency, source-map, and development commands;
+  remove Python/CUDA instructions and transitional rollback language.
+
+Gate: documentation and scripts describe exactly one WebView2 native product and no obsolete entry
+point or dependency.
+
+Completed 2026-09-01: release CI, audit, README, repository guidance, and local Windows runbook use
+only the native WebView2 product. Native-only archive and real-source PowerShell policy suites pass.
+
+#### 24g. Permanently delete Python and CUDA source
+
+##### 24g.1. Preserve the last authoritative native fixtures
+
+- Before deleting generators/reference tests, ensure every still-required schema, codec, projection,
+  exposure, publication, and failure case has a committed native fixture or native contract.
+- Replace Python-generated-at-test-time data with checked-in bounded fixtures or native generators.
+
+Gate: native tests cover each retained contract without importing or executing Python.
+
+##### 24g.2. Delete the Python application and adapters
+
+- Delete `stitcher/src/pano_stitch`, including Tk GUI, CLI, compositor, D3D12 ctypes adapter, CUDA
+  backend, planners, metadata/session helpers, and Python application code.
+- Delete Python entry scripts and benchmarks under `stitcher/scripts` after any retained fixture
+  generation is replaced.
+
+Gate: tracked source search finds no Python application entry point, ctypes binding, Tk import,
+CUDA/CuPy implementation, or Python compositor.
+
+##### 24g.3. Delete Python tests and package metadata
+
+- Delete `stitcher/tests`, `stitcher/pyproject.toml`, `stitcher/uv.lock`, Python build outputs, and
+  Python-only test configuration.
+- Replace any still-relevant release/version/schema checks with native CTest or PowerShell checks
+  before removing their Python originals.
+
+Gate: a clean checkout has no tracked Python package/test environment and all retained checks run
+without `uv`, pytest, Ruff, mypy, pip, or a Python interpreter.
+
+##### 24g.4. Delete remaining repository Python tooling
+
+- Replace or remove Python-only release/version, fixture-generation, CET-manifest, and maintenance
+  scripts elsewhere in the repository.
+- Do not treat ignored local virtual environments or historical Git objects as product source; they
+  are outside the committed-tree gate and may be removed locally only with explicit approval.
+
+Gate: excluding `.git`, ignored local/build directories, vendored third-party inputs, and historical
+documentation, the tracked repository contains no `.py`, Python packaging metadata, or executable
+Python invocation.
+
+##### 24g.5. Remove every CUDA reference from active product/build/test paths
+
+- Delete CUDA backend selection, dependencies, environment probes, archive checks specific to the
+  removed comparison frontend, and stale user-facing documentation.
+- Retain historical migration/acceptance records that describe CUDA only as history; they must not
+  provide an active command or imply a supported backend.
+
+Gate: active source/build/release/README searches contain no CUDA, CuPy, NVRTC, or vendor-compute
+runtime path; the archive dependency audit independently confirms the same.
+
+Completed 2026-09-01: authoritative JSON/codec fixtures moved under native tests and passed a fresh
+offline portable build/CTest. The application, adapters, entry scripts, tests, package metadata,
+old version utility, and redundant add-on source-inspection test were deleted after their native or
+PowerShell replacements passed. The 2,530 tracked generated files under native `build-debug` and
+`build-release` were also removed; `build-*/` is now ignored. The active-source policy passes while
+excluding only historical docs, ignored local output/caches, and vendored dependencies.
+
+#### 24h. Accept the final product
+
+##### 24h.1. Run clean native automation
+
+- Configure and build from a clean tree with Windows x64 MSVC Release `/W4 /WX`.
+- Run portable native contracts where supported, Windows CTest/WARP, hidden-GUI teardown, WebView
+  DOM/bridge/accessibility contracts, corrupt/missing DLL handling, missing-WebView handling, and
+  deterministic double-build comparison.
+
+Gate: every locally available check passes without Python/CUDA tooling or payload.
+
+##### 24h.2. Run Windows 11/NVIDIA workflow and resource acceptance
+
+- On the available device, verify Input, Preview/magnification/exposure, Output, ordinary/thumbnail
+  render, coverage debug setting, cancellation, errors, settings restart, and disposable deletion.
+- Repeat headless and complete WebView process-tree RAM/VRAM/CPU/GPU monitoring at retained idle and
+  natural-resolution hard/feather render.
+
+Gate: outputs remain visually/contractually accepted, rendering stays within the recorded memory
+limits, stable idle remains quiescent, and shutdown leaves no worker/WebView process or live native
+allocation.
+
+##### 24h.3. Audit the final archive and repository
+
+- Extract under clean ASCII and spaces/Unicode paths; verify runtime, hashes, dependencies, settings,
+  controlled failure, and archive contents.
+- Confirm the archive contains one application executable, one D3D12 DLL, required notices, and no
+  Python/CUDA/legacy-native-UI payload. Confirm the active repository satisfies the same source gate.
+
+Gate: Step 24 is complete. Windows 10, AMD, Intel, and physical CPU-only checks remain in the
+separate deferred hardware checklist and do not block this locally achievable goal.
+
+Completed 2026-09-01: the final archive is
+`PanoramaCapture-Stitcher-1.0.4-win-x64.zip`, 1,206,012 bytes, SHA-256
+`9759a5615575f08b103fd20938f71178910e147589d85d1d4716853f59065f58`; a second clean build produced
+the identical hash. The unconditional audit passed from an extracted path with spaces, and a
+separate spaces/Unicode extraction reported ABI 10 on the NVIDIA GeForce RTX 5090. PE imports,
+static runtime, controlled corrupt/missing-DLL exit 3, and the forced missing-WebView2 prerequisite
+prompt passed. Packaged monitor-2 process-tree runs reached idle and retained-preview `Finalize` for
+both D3D12 and explicit `--no-gpu` CPU on the newest incomplete session, and all seven processes
+exited within five seconds after each run. Working-set/private totals were 377.094/423.821 MiB idle,
+536.652/2067.587 MiB D3D12 preview, and 392.702/414.887 MiB forced-CPU preview. Previously recorded
+natural hard/feather resource runs and WebView workflow/accessibility contracts remain accepted.
+Windows 10, AMD, Intel, and a physical CPU-only host remain the non-blocking deferred matrix.
+
 ## Verification matrix
 
 Every implementation increment runs the checks relevant to files it touches and reports only
 checks actually run.
 
-### Platform-independent
+### Retired transitional checks (through Step 24g)
+
+These checks were used while the transitional product/test sources existed. They are no longer
+part of the repository or final verification matrix after Step 24g.
 
 From `stitcher/`:
 
@@ -3054,8 +3647,10 @@ no checks is a failure.
 cmake -S stitcher/native -B build/stitcher-native -A x64
 cmake --build build/stitcher-native --config Release
 ctest --test-dir build/stitcher-native -C Release --output-on-failure
-uv run pytest -m windows_warp
 ```
+
+After Step 24g this native matrix, focused PowerShell release/audit tests, JavaScript syntax/resource
+contracts, and physical-hardware acceptance replace every former Python test invocation.
 
 ### Physical hardware acceptance
 
@@ -3082,13 +3677,17 @@ cleanup.
 
 ## Completion criteria
 
-The D3D12 migration is complete at increment 16 when one transitional archive passes the automated
-gates, accelerates the full existing GPU contract on the available Windows 11/NVIDIA system,
-safely falls back to CPU under the tested admission contracts, and contains no CUDA implementation
-or dependencies. The explicitly deferred cross-device checklist expands confidence when hardware
-becomes available but is not part of this completion gate. The application migration is separately
-complete at increment 22 when the native executable replaces Python without losing any tested
-behavior.
+Steps 16 and 22 record completed backend and transitional native-application milestones; they are
+not the final product gate. The full migration is complete only at Step 24h.3, when the active
+repository and reproducible release contain the native D3D12 backend, memory-bounded native CPU
+fallback, and WebView2 GUI only; all application modals use WebView2; hidden legacy controls and
+`--native-ui` are gone; and Python, Tk, ctypes, CUDA/CuPy, PyInstaller, their package metadata, and
+their active tests/tooling have been permanently deleted after native replacements pass.
+
+The explicitly deferred Windows 10, AMD, Intel, and physical CPU-only checklist expands hardware
+confidence when those systems become available but is not part of this locally achievable
+completion gate. Windows 11/NVIDIA, WARP, forced-CPU, clean archive, resource, teardown, and
+repository-source audits are blocking Step 24 acceptance.
 
 WARP and Linux tests alone are not physical-hardware acceptance; the recorded Windows 11/NVIDIA
 run supplies the physical validation for the current milestone.

@@ -1,6 +1,11 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(PanoramaStitchNative LANGUAGES C CXX)
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" PANO_APP_VERSION LIMIT_COUNT 1)
+if(NOT PANO_APP_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+    message(FATAL_ERROR "native VERSION must use MAJOR.MINOR.PATCH")
+endif()
+
+project(PanoramaStitchNative VERSION "${PANO_APP_VERSION}" LANGUAGES C CXX)
 
 if(MSVC)
     set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
@@ -8,6 +13,12 @@ endif()
 
 include(CTest)
 include(cmake/PanoCodecDependencies.cmake)
+
+set(PANO_APP_GENERATED_INCLUDE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/generated/include")
+configure_file(
+    include/pano_app_version.h.in
+    "${PANO_APP_GENERATED_INCLUDE_DIRECTORY}/pano_app_version.h"
+    @ONLY)
 
 add_library(yyjson STATIC third_party/yyjson/yyjson.c)
 target_include_directories(yyjson PUBLIC third_party/yyjson)
@@ -27,7 +38,8 @@ add_library(pano_app_core STATIC
     src/pano_app_settings.cpp
     src/pano_app_writer.cpp)
 target_compile_features(pano_app_core PUBLIC cxx_std_17)
-target_include_directories(pano_app_core PUBLIC include)
+target_include_directories(
+    pano_app_core PUBLIC include "${PANO_APP_GENERATED_INCLUDE_DIRECTORY}")
 target_link_libraries(pano_app_core PRIVATE yyjson pano_app_codecs)
 
 add_executable(pano-stitch-native src/pano_app_main.cpp)
@@ -79,6 +91,10 @@ if(WIN32)
             -DINPUT_EXPOSURE_JS=${PANO_APP_EXPOSURE_SOURCE_JS}
             -DINPUT_RC=${PANO_APP_UI_RESOURCE_TEMPLATE}
             -DINPUT_ICON=${PANO_APP_ICON_SOURCE}
+            -DPANO_APP_VERSION=${PROJECT_VERSION}
+            -DPANO_APP_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+            -DPANO_APP_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+            -DPANO_APP_VERSION_PATCH=${PROJECT_VERSION_PATCH}
             -DOUTPUT_HTML=${PANO_APP_UI_EMBEDDED_HTML}
             -DOUTPUT_EXPOSURE_HTML=${PANO_APP_EXPOSURE_EMBEDDED_HTML}
             -DOUTPUT_RC=${PANO_APP_UI_RESOURCE}
@@ -135,17 +151,11 @@ if(WIN32)
         pano-stitch-native-gui PRIVATE
         pano_app_core
         pano_app_webview
-        comctl32
         ole32
         shell32)
     target_compile_options(pano-stitch-native-gui PRIVATE /W4 /WX /permissive-)
     target_link_options(pano-stitch-native-gui PRIVATE /Brepro /DELAYLOAD:pano_gpu.dll)
     target_link_libraries(pano-stitch-native-gui PRIVATE delayimp)
-    add_test(NAME pano_app_gui_self_test
-             COMMAND ${CMAKE_COMMAND}
-                     -DGUI_EXECUTABLE=$<TARGET_FILE:pano-stitch-native-gui>
-                     -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/RunGuiSelfTest.cmake)
-
     find_program(FXC_EXECUTABLE NAMES fxc.exe fxc REQUIRED)
     set(PANO_GPU_SHADER_HEADER "${CMAKE_CURRENT_BINARY_DIR}/pano_gpu_fill_shader.h")
     set(PANO_GPU_RAY_SHADER_HEADER "${CMAKE_CURRENT_BINARY_DIR}/pano_gpu_ray_shader.h")
@@ -580,10 +590,17 @@ else()
 endif()
 
 if(BUILD_TESTING)
-    set(PANO_APP_FIXTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../tests/fixtures/application_contracts"
+    set(PANO_APP_FIXTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/application_contracts"
         CACHE PATH "Application contract fixture directory")
-    set(PANO_CODEC_FIXTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../tests/fixtures/codecs"
+    set(PANO_CODEC_FIXTURE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/codecs"
         CACHE PATH "Codec contract fixture directory")
+    if(WIN32)
+        add_test(NAME pano_app_gui_self_test
+                 COMMAND ${CMAKE_COMMAND}
+                         -DGUI_EXECUTABLE=$<TARGET_FILE:pano-stitch-native-gui>
+                         -DCODEC_FIXTURE_DIR=${PANO_CODEC_FIXTURE_DIR}
+                         -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/RunGuiSelfTest.cmake)
+    endif()
     add_executable(pano_app_contract_test tests/pano_app_contract_test.cpp)
     target_link_libraries(pano_app_contract_test PRIVATE pano_app_core)
     target_compile_features(pano_app_contract_test PRIVATE cxx_std_17)

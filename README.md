@@ -40,9 +40,10 @@ For a D3D12 smoke test, leave **Use GPU acceleration** enabled, select a
 completed session, and render a preview. The status must identify the D3D12 adapter rather than a
 CPU fallback.
 
-The native stitcher requires and uses its embedded WebView2 interface by default; it does not
-silently fall back to the previous Win32 interface. Launch it from a console with `--native-ui`
-to opt into that interface during the transition period.
+The native stitcher requires the Microsoft Edge WebView2 Runtime. If it is unavailable, startup
+shows the native prerequisite prompt and exits instead of exposing another application interface.
+To verify the memory-bounded CPU backend on a D3D12-capable system, launch it from a console with
+`PanoramaCaptureStitcher.exe --no-gpu`.
 
 The editable WebView sources are `stitcher/native/resources/pano_app_ui.html`,
 `pano_app_ui.css`, and `pano_app_ui.js`. The native build inlines all three into one generated

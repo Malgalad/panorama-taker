@@ -14,6 +14,10 @@ if(PANO_WEBVIEW2_SDK_ROOT)
     set(_pano_webview2_source "${PANO_WEBVIEW2_SDK_ROOT}")
 else()
     include(FetchContent)
+    cmake_policy(PUSH)
+    if(POLICY CMP0169)
+        cmake_policy(SET CMP0169 OLD)
+    endif()
     FetchContent_Declare(
         pano_webview2_sdk
         URL "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/${PANO_WEBVIEW2_VERSION}"
@@ -23,6 +27,7 @@ else()
     if(NOT pano_webview2_sdk_POPULATED)
         FetchContent_Populate(pano_webview2_sdk)
     endif()
+    cmake_policy(POP)
     set(_pano_webview2_source "${pano_webview2_sdk_SOURCE_DIR}")
 endif()
 

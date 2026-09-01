@@ -3,12 +3,14 @@
 #include "yyjson.h"
 
 #include <algorithm>
+#include <charconv>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <new>
 #include <unordered_set>
+#include <utility>
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -274,6 +276,22 @@ bool save_application_settings(const std::string &path,
   }
 }
 
+bool parse_application_gpu_memory_mib(const std::string_view text,
+                                      unsigned &value, std::string &error) {
+  unsigned parsed = 0;
+  const auto result =
+      std::from_chars(text.data(), text.data() + text.size(), parsed);
+  if (text.empty() || result.ec != std::errc{} ||
+      result.ptr != text.data() + text.size() || parsed < 1024U ||
+      parsed > 8192U) {
+    error = "Enter a value from 1024 to 8192 MiB";
+    return false;
+  }
+  value = parsed;
+  error.clear();
+  return true;
+}
+
 std::string application_history_key(const std::string &game_directory,
                                     const std::string &session_id) {
   return normalized_path(game_directory) + "::" + session_id;
@@ -331,6 +349,21 @@ bool set_application_session_tag(ApplicationSettings &settings,
   } else {
     found->tag = tag;
   }
+  error.clear();
+  return true;
+}
+
+bool set_and_save_application_session_tag(
+    ApplicationSettings &settings, const std::string &game_directory,
+    const std::string &session_id, const std::string &tag,
+    const std::optional<std::string> &settings_path, std::string &error) {
+  ApplicationSettings updated = settings;
+  if (!set_application_session_tag(updated, game_directory, session_id, tag,
+                                   error) ||
+      (settings_path.has_value() &&
+       !save_application_settings(*settings_path, updated, error)))
+    return false;
+  settings = std::move(updated);
   error.clear();
   return true;
 }

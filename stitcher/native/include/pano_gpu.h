@@ -66,6 +66,9 @@ typedef enum pano_gpu_exposure_invalidation_reason
     PANO_GPU_EXPOSURE_INVALIDATE_GEOMETRY = 2,
 } pano_gpu_exposure_invalidation_reason;
 
+typedef int (*pano_gpu_progress_callback)(
+    void *user_data, uint32_t completed, uint32_t total);
+
 typedef struct pano_gpu_probe_options
 {
     uint32_t size;
@@ -836,6 +839,13 @@ PANO_GPU_API pano_gpu_result pano_gpu_session_reduce_exposure_graph(
 PANO_GPU_API pano_gpu_result pano_gpu_session_reduce_reference_exposure_graph(
     pano_gpu_session *session,
     const pano_gpu_exposure_pair_request *request_template,
+    char *error_buffer,
+    uint32_t error_buffer_size) PANO_GPU_NOEXCEPT;
+PANO_GPU_API pano_gpu_result pano_gpu_session_reduce_reference_exposure_graph_progress(
+    pano_gpu_session *session,
+    const pano_gpu_exposure_pair_request *request_template,
+    pano_gpu_progress_callback progress,
+    void *progress_user_data,
     char *error_buffer,
     uint32_t error_buffer_size) PANO_GPU_NOEXCEPT;
 PANO_GPU_API pano_gpu_result pano_gpu_session_query_exposure_graph(

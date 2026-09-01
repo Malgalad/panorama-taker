@@ -1,2 +1,0 @@
-/usr/bin/ar qc libIex-3_4.a CMakeFiles/Iex.dir/IexBaseExc.cpp.o CMakeFiles/Iex.dir/IexMathFloatExc.cpp.o CMakeFiles/Iex.dir/IexMathFpu.cpp.o CMakeFiles/Iex.dir/IexThrowErrnoExc.cpp.o
-/usr/bin/ranlib libIex-3_4.a

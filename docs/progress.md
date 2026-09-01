@@ -2810,3 +2810,302 @@ D3D12 migration Step 10f.1.2 (2026-08-28): added checked `uint32` pair-count pla
   accurate across preview recomposition, and clears with exposure discard or retained-preview reset.
   The embedded WebView contract, JavaScript syntax check, MSVC Release build, all eight Windows CTests,
   and all 172 Python tests passed.
+
+## 2026-08-31 — WebView Output-screen integration
+
+- Ported `native-gui-prototype/output.html` into the persistent declarative main-page tree as a hidden
+  Output section. Finalize and the Output tab now expose the same native output directory, filename,
+  percentage/pixel resolution mode, mutually exclusive JPEG/PNG/EXR format, JPEG quality, ordinary
+  render, thumbnail render, validation, overwrite confirmation, cancellation, taskbar progress, and
+  publication paths already used by `--native-ui`. PNG and EXR omit the quality row entirely.
+- Added strict versioned WebView commands for Output navigation and edits. Native hidden controls remain
+  authoritative, so edits reuse their validation notifications and settings persistence rather than
+  maintaining a second render state. Percentage mode reports dimensions from the renderer's existing
+  projection formula; entering pixel mode seeds an empty width from that validated result.
+- Adopted the prototype's `input-text`, `input-range`, `input-radio`, and `input-checkbox` component
+  classes across the main and Exposure pages. Shared button hover/active styling now excludes disabled
+  buttons. JavaScript syntax, clang-format, portable Release CTest 4/4, Ruff lint/format, mypy, all 172
+  Python tests, MSVC Release `/W4 /WX`, and Windows CTest 8/8 pass. A disposable live `DISPLAY2` capture
+  after a real retained D3D12 preview showed Preview complete, Output enabled, the renderer-derived
+  `15760x7880 (124MP)` summary, and both render actions enabled; no output render was started and the
+  audit captures were removed.
+- Made automatic-exposure overlap measurement report actual completed-pair progress from the D3D12
+  reduction loop, including cancellation checks between pairs, instead of holding at one phase marker.
+  Preview completion now remains visible while a final render runs; Output progress and completion are
+  scoped to the current retained preview and no longer inferred from persisted stitched-session history.
+  Resetting the preview clears both completion badges.
+- Replaced the Output page's duplicate preview-width resolution estimate with the same retained-plan
+  dimension calculation used by the D3D12 and CPU renderers. The last valid dimensions remain visible
+  while asynchronous option validation runs, including filename and format changes; the initial value is
+  `0x0 (0MP)`. Focused native contracts cover both dimension queries and monotonic overlap callbacks.
+  Portable Release CTest 4/4, JavaScript syntax, Ruff lint/format, mypy, all 172 Python tests, MSVC Release
+  `/W4 /WX`, and Windows CTest 8/8 passed, including WARP.
+- Capped Output pixel mode at the retained renderer's source-derived 100%-scale width. Both the range and
+  numeric controls receive that dynamic maximum, WebView edits are clamped before reaching the hidden
+  control, and native request capture rejects bypass attempts. D3D12 and CPU use their own authoritative
+  projection inputs rather than a UI estimate. Portable Release CTest 4/4 and Windows CTest 8/8 passed.
+
+## 2026-08-31 — Native-only cutover boundary (Step 24a.1)
+
+- Added the checked-in native-only cutover inventory before any Step 24 deletion. It accounts for the
+  final one-EXE/one-DLL stitcher archive, retained runtime dependencies and native validation, every
+  application dialog to migrate, permitted native OS services, all Python/Tk/ctypes/CUDA deletion roots,
+  three transitional release modes, workflow replacements, and the tracked generated native build trees.
+- A tracked-file audit found no non-generated Python file outside the inventory's deletion roots. The
+  documentation-only change passed `git diff --check`; no product tests were run.
+
+## 2026-08-31 — Native-only repository/archive policy (Step 24a.2)
+
+- Added a shared PowerShell policy used by the Windows release audit. Native-only archives must have
+  exactly `PanoramaCaptureStitcher.exe` and `pano_gpu.dll` and reject Python runtime/package/PyInstaller
+  payloads, CUDA/CuPy/NVRTC/runtime files, comparison entry points, and an embedded `--native-ui`
+  switch. The optional source-tree gate rejects Python/package files and active obsolete dependency or
+  frontend references while excluding historical docs, ignored/generated trees, and third-party notices.
+- Added category-specific temporary fixtures for clean native inputs and every forbidden archive/source
+  class. The Windows PowerShell fixture suite passed, including source checking through the release-audit
+  entry point. Ruff lint/format, mypy, all 172 transitional Python tests, and `git diff --check` passed.
+
+## 2026-08-31 — Declarative WebView modal host (Step 24b.1)
+
+- Added one persistent modal layer driven by typed native kind, generation, dismissibility, title, and
+  description state. It makes background content inert, exposes dialog title/description relationships,
+  enters and restores focus, traps focus and Tab, handles Escape/backdrop/Close consistently, and leaves
+  existing application modal commands unchanged until their individual migrations.
+- Modal snapshots occlude the native preview immediately, JavaScript reports the preview slot hidden while
+  a modal is open, and native geometry application independently rejects stale visible geometry. Exact
+  generation-tagged dismissal parsing plus shared current-page/current-modal predicates reject stale or
+  over-shaped bridge messages without mutating application data.
+- JavaScript syntax, clang-format, `git diff --check`, portable Release CTest 4/4, MSVC Release `/W4 /WX`,
+  and Windows CTest 8/8 passed. The first portable configure required approved network access to download
+  the pinned Imath/OpenEXR sources after the sandboxed attempt failed DNS resolution.
+
+## 2026-08-31 — WebView Edit Tag migration (Step 24b.2)
+
+- Routed WebView Edit Tag into the shared modal host with the existing value, Tag label, native-derived
+  64-character counter/validation, inline errors, read-only operation behavior, Save/Cancel, and
+  Enter-to-save. Generation-tagged draft and submit commands have exact bridge shapes and stable native
+  session identity; cancel or shutdown discards only the modal draft.
+- Added transactional tag persistence: native code validates and saves a candidate settings copy, commits
+  it only after staged publication succeeds, and updates the visible row only after success. Existing tags
+  survive invalid input and injected settings-write failure. Native contracts cover existing, empty,
+  maximum-length, overlength, invalid UTF-8, save/round-trip, and persistence failure.
+- JavaScript syntax, clang-format, `git diff --check`, Ruff lint/format, mypy, all 172 transitional Python
+  tests, portable Release CTest 4/4, MSVC Release `/W4 /WX`, and Windows CTest 8/8 passed.
+
+## 2026-08-31 — Typed Input and Preview option state (Step 24c.2)
+
+- Moved blend, incomplete admission, auto contrast, CPU memory/workers, D3D12 cap, debug coverage,
+  and GPU/fallback policy into `GuiShellState`. Request capture, settings, option modals, enablement,
+  and the temporary legacy mirror now consume that state.
+- Corrected the inherited CPU/GPU budget coupling: App Settings' persisted `gpu_memory_mib` now flows
+  through `GuiRenderRequestState`, `RenderOptions`, and `RenderPlan` into D3D12 admission, while
+  `memory_mib` remains the independent memory-bounded CPU budget.
+- Portable contracts prove simultaneous 768 MiB CPU/3072 MiB GPU propagation, range/policy rejection,
+  defaults, and every option. The Windows GUI self-test exercises the real capture path with those two
+  distinct values; existing GPU contracts prove the requested cap clamps planned available bytes.
+  Clang-format, `git diff --check`, Ruff lint/format, mypy, all 172 transitional Python tests,
+  portable Release CTest 4/4, MSVC Release `/W4 /WX`, and Windows CTest 8/8 passed.
+
+## 2026-08-31 — Typed Output state (Step 24c.3)
+
+- Moved output filename, format, JPEG quality, percent/pixel mode and values, thumbnail request,
+  current dimensions, and the authoritative 100%-scale width ceiling into `GuiShellState`.
+  WebView commands, request capture, and snapshots now use that state without reading hidden Output
+  controls; the explicit legacy frontend only mirrors it until Step 24e.
+- Preserved explicit-width clamping and full-sphere even-width smoothing. Request capture rejects
+  stale or programmatic widths above the retained preview ceiling without replacing invalid typed
+  text or the last valid plan.
+- Portable retained-preview contracts prove non-dimensional output edits preserve 8x4, 50% scale
+  produces 4x2, and explicit width 7 smooths to 6x3. The Windows GUI self-test covers typed defaults,
+  percent/pixel capture, thumbnail state, invalid numeric preservation, and ceiling rejection.
+  Clang-format, `git diff --check`, Ruff lint/format, mypy, all 172 transitional Python tests,
+  portable Release CTest 4/4, MSVC Release `/W4 /WX`, and Windows CTest 8/8 passed.
+
+## 2026-09-01 — Typed presentation state (Step 24c.4)
+
+- Added a pure `GuiPresentationState` derivation for Input, Preview, Exposure, and Output
+  enablement, operation progress, rendering, and completion. It distinguishes a renderable retained
+  CPU preview from a D3D12 preview that can open the exposure editor.
+- Moved status text and exposure visibility into `GuiShellState`, wired validation readiness into
+  `GuiWorkflowState`, and made WebView snapshots consume only typed state. The temporary legacy
+  frontend mirrors the same derivation; hidden progress widgets no longer participate in operation
+  begin/end, while tab/taskbar progress and native completion notification remain intact.
+- Portable contracts cover idle, validated, CPU/D3D12 preview, exposure, progress, render, and
+  completion states without HWNDs. The initial Windows run caught a recursive legacy status mirror;
+  after the one-line correction, the focused GUI self-test and complete suite were rerun successfully.
+  Clang-format, `git diff --check`, focused source search, Ruff lint/format, mypy, all 172 transitional
+  Python tests, portable Release CTest 4/4, MSVC Release `/W4 /WX`, and Windows CTest 8/8 passed.
+
+## 2026-09-01 — Direct WebView command routing (Step 24c.5)
+
+- Replaced WebView's synthetic `WM_COMMAND` forwarding for Abort, Preview, Finalize, Render, and
+  Render-with-thumbnail with direct native cancellation, preview, navigation, and render calls.
+  The legacy Abort button shares the same cancellation function.
+- Added an exhaustive enum-order allow list that classifies all 42 bridge commands into native
+  mutation domains. Focused source search finds no WebView-handler forwarding through legacy
+  controls, messages, or control IDs.
+- Clang-format, `git diff --check`, Ruff lint/format, mypy, all 172 transitional Python tests,
+  portable Release CTest 4/4, MSVC Release `/W4 /WX`, and Windows CTest 8/8 passed.
+
+## 2026-09-01 — Native CPU fallback in WebView2 (Step 24d)
+
+- Added the public GUI `--no-gpu` flag and deterministic backend admission for D3D12, forced CPU,
+  automatic CPU fallback, strict-D3D12 rejection, and total unavailability. WebView snapshots expose
+  the selected backend and actionable reason.
+- Routed retained CPU preview, native GDI presentation and magnification, plan updates, ordinary and
+  thumbnail rendering, progress, publication/history, Output completion, cancellation, and teardown
+  through the same typed GUI workflow used by D3D12. CPU rendering retains its fixed 2048 MiB bounded
+  policy and creates no D3D12 preview device or surface when forced.
+- Extended the hidden Windows acceptance to create a real WebView2 controller and drive
+  Preview/Abort/retry/Finalize/thumbnail Render with `--no-gpu` on the D3D12-capable host. It verifies
+  8x4 panorama, coverage, and thumbnail publication plus clean shutdown. Full-session contracts cover
+  Windows PNG/JPEG and portable EXR; deterministic cancellation/failure contracts publish nothing.
+  JavaScript syntax, clang-format, `git diff --check`, Ruff lint/format, mypy, all 172 transitional
+  Python tests, portable Release CTest 4/4, MSVC Release `/W4 /WX`, focused Windows GUI CTest 1/1,
+  and Windows CTest 8/8 passed.
+
+## 2026-09-01 — Legacy rollback switch removal (Step 24e.1)
+
+- Removed `--native-ui` parsing and startup selection. Ordinary launch now creates WebView2 or uses
+  the existing native prerequisite prompt-and-exit path; internal self-test remains headless and the
+  public `--no-gpu` backend selector remains supported.
+- Replaced the README rollback instruction with the WebView2 prerequisite and forced-CPU verification
+  command. Negative release-policy fixtures retain the spelling only to reject regressions.
+- Active-source and rebuilt-PE searches found no rollback switch. Clang-format, `git diff --check`,
+  portable Release CTest 4/4, MSVC Release `/W4 /WX`, and Windows CTest 8/8 passed.
+
+## 2026-09-01 — Legacy Win32 UI deletion (Steps 24e.2–24e.3)
+
+- Reduced the native GUI control tree to the retained preview child and removed hidden main and
+  Exposure controls, native-control accessibility/font state, owner-draw/subclass code, legacy
+  layout and enablement mirrors, and non-WebView paint/resize paths.
+- Made WebView2 the sole application frontend in ordinary and self-test startup. Removed the legacy
+  modal class/state/procedure, `run_modal`, native application confirmations, and all legacy command,
+  notification, scroll, measurement, drawing, and control-color handlers.
+- Kept only the approved native integrations: host/Exposure windows, D3D12 or GDI CPU preview child,
+  taskbar progress, folder picker, dark caption, and controlled WebView bootstrap/host-failure
+  reporting. The GUI target no longer links Common Controls directly; the WebView prerequisite
+  helper retains it for its bootstrap TaskDialog.
+- Active-source and rebuilt-PE searches are clean for legacy UI/switch residue. Reconfigured MSVC
+  Release `/W4 /WX` builds cleanly and Windows CTest passes 8/8, including the hidden GUI contract in
+  both D3D12 and explicit `--no-gpu` CPU modes.
+
+## 2026-09-01 — WebView resource rebaseline and CPU hardware verification (Step 24e.4)
+
+- Replaced hidden-control process probing with WebView UI Automation. The probe runs on the second
+  monitor, activates renderer accessibility only for its child process, drives the incomplete-session
+  modal and Preview action, verifies native state round trips, and fails on surviving process-tree
+  members.
+- Idle measured 7 processes at 369.234 MiB combined working set/417.255 MiB private. Real-session
+  D3D12 preview measured 514.252/2064.259 MiB; explicit `--no-gpu` CPU preview on the same
+  D3D12-capable machine measured 392.840/414.649 MiB. Every host/WebView tree exited within five
+  seconds.
+- The forced-CPU hardware run exposed a GUI snapshot defect: a disabled GPU request still carried
+  the optional GPU memory budget and was rejected by shared validation. CPU request capture now
+  omits GPU-only budget/strict fields, while D3D12 retains them; the hidden GUI regression asserts
+  both forms.
+- MSVC Release `/W4 /WX`, Windows CTest 8/8, portable Release CTest 4/4, Ruff lint/format, mypy, 172
+  pytest tests, clang-format, and `git diff --check` pass.
+
+## 2026-08-31 — Typed directory and session state (Step 24c.1)
+
+- Added native-owned game, screenshot, and output directory fields to `GuiShellState`; selected and
+  manual session identity remain typed there. Settings, request capture, discovery, refresh,
+  selection, history/tag persistence, and WebView snapshots now use those fields.
+- WebView edits and folder pickers mutate typed state before reset/validation scheduling. WebView
+  refresh and selection no longer populate/query the hidden session ListView. Legacy controls are a
+  one-way compatibility mirror guarded behind the explicit legacy frontend until Step 24e.
+- Clang-format, `git diff --check`, Ruff lint/format, mypy, all 172 transitional Python tests,
+  portable Release CTest 4/4, MSVC Release `/W4 /WX`, and Windows CTest 8/8 passed.
+
+## 2026-08-31 — WebView application notices (Step 24b.7)
+
+- Added a native notice dispatcher that preserves status text and presents actionable discovery,
+  preview, retained-plan, render, exposure, and recoverable surface/host errors through the shared
+  WebView modal host with selectable text and deterministic dismissal. Cancellation, progress, and
+  transient debounce validation remain non-modal/inline.
+- Background errors do not replace open settings or destructive drafts. Exposure satellite failures
+  use the main WebView host. Remaining native application prompts are restricted to the explicit
+  legacy frontend or main WebView startup/host failure where HTML is unavailable.
+- JavaScript syntax, clang-format, `git diff --check`, Ruff lint/format, mypy, all 172 transitional
+  Python tests, portable Release CTest 4/4, MSVC Release `/W4 /WX`, and Windows CTest 8/8 passed.
+
+## 2026-09-01 — Native-only release and final acceptance (Steps 24f–24h)
+
+- Added `stitcher/native/VERSION` as the native product source for CMake, CLI output, generated GUI
+  PE metadata, archive naming, CET consistency, workflow defaults, and the replacement PowerShell
+  bump/version regression. CLI, FileVersion, and ProductVersion all report `1.0.4`.
+- Collapsed the Windows builder, audit, CI, release workflow, README, and repository guidance to one
+  WebView2 native frontend. Two clean builders each passed Windows CTest 8/8 and produced the same
+  1,206,012-byte archive with SHA-256
+  `9759a5615575f08b103fd20938f71178910e147589d85d1d4716853f59065f58`.
+- Moved frozen session/codec fixtures under native ownership after a fresh offline portable build
+  passed CTest 4/4. Removed the retired application/adapters/scripts/tests/package metadata and
+  replacement-complete repository tooling. Removed 2,530 tracked generated build-tree files and
+  added `build-*/` to ignore rules. Native-only archive fixtures, version policy, and the real active
+  source audit pass.
+- The final archive audit verified exactly one EXE and `pano_gpu.dll`, native/system PE dependencies,
+  static runtime, hashes, RTX 5090 ABI 10 hardware dispatch, corrupt-DLL recovery, and missing-DLL
+  exit 3. A separate extraction under a path containing spaces and Unicode passed the hardware
+  runtime probe. A child-only invalid WebView2 folder exposed and cleanly dismissed the native
+  prerequisite prompt on monitor 2.
+- Packaged monitor-2 runs on the newest incomplete session passed Input idle, D3D12 retained
+  preview, and explicit `--no-gpu` CPU retained preview. Each run used seven host/WebView processes,
+  reached the expected UI state, and left no recorded process after five seconds. Total
+  working-set/private memory was 377.094/423.821 MiB idle, 536.652/2067.587 MiB D3D12, and
+  392.702/414.887 MiB forced CPU; the CPU host command line contained `--no-gpu`.
+- Windows 10, AMD, Intel, and a physical CPU-only host remain the explicitly non-blocking deferred
+  hardware matrix. The available Windows 11/NVIDIA, WARP, forced-CPU, release, controlled-failure,
+  resource, teardown, and active-source gates are complete.
+
+## 2026-08-31 — WebView destructive confirmations (Step 24b.6)
+
+- Replaced WebView delete-session and overwrite-output native dialogs with shared WebView modal
+  confirmations. Native code supplies the exact multiline target summary and accepts only modal
+  generation, optional screenshot-deletion boolean, confirm, or cancel from JavaScript.
+- Delete retains stable session identity and recomputes targets before mutation; overwrite snapshots
+  and re-resolves existing outputs so changed targets require fresh consent. Cancel/refusal performs no
+  mutation. The explicit legacy frontend retains its dialogs only until Step 24e.
+- Added disposable successful deletion, duplicate/missing target, partial-failure, deterministic
+  overwrite-target, modal action, multiline summary, and bridge-boundary contracts. JavaScript syntax,
+  clang-format, `git diff --check`, Ruff lint/format, mypy, all 172 transitional Python tests, portable
+  Release CTest 4/4, MSVC Release `/W4 /WX`, and Windows CTest 8/8 passed.
+
+## 2026-08-31 — WebView App Settings migration (Step 24b.5)
+
+- Routed WebView App Settings into the shared modal host with the current D3D12 allocation cap,
+  debug-coverage value, shared text/checkbox styling, native 1024–8192 MiB validation, read-only
+  operation behavior, inline errors, Save/Cancel, and Enter-to-save. Debug coverage remains absent
+  from ordinary Output UI.
+- Save stages a complete application-settings copy and commits the cap, coverage flag, and hidden
+  compatibility controls only after persistence succeeds. Cancel, invalid input, publication failure,
+  and shutdown leave authoritative state unchanged; successful reduced-cap changes preserve the
+  existing preview rebuild and validation scheduling semantics.
+- Added portable cap boundary and malformed-input contracts plus embedded-resource coverage for the
+  form, shared controls, Save route, and Output exclusion. Existing contracts continue to cover
+  settings/coverage round-trip and malformed-settings recovery. JavaScript syntax, clang-format,
+  `git diff --check`, Ruff lint/format, mypy, all 172 transitional Python tests, portable Release
+  CTest 4/4, MSVC Release `/W4 /WX`, and Windows CTest 8/8 passed.
+
+## 2026-08-31 — WebView Preview Options migration (Step 24b.4)
+
+- Routed Preview-stage Options into the shared modal host with native-derived Hard/Feather and SDR
+  auto-contrast values, shared radio/checkbox styling, generation-tagged drafts, read-only operation
+  behavior, Save, and Cancel. Both Input and Preview WebView routes now avoid native modal construction.
+- Save allow-lists blend values, compares both options with authoritative state, persists auto-contrast,
+  and calls the existing preview-option validation only on change. That path retains source reuse,
+  recomposition progress, exposure state, and cancellation; Cancel/shutdown performs no mutation and
+  reopening derives current values.
+- JavaScript syntax, clang-format, `git diff --check`, Ruff lint/format, mypy, all 172 transitional Python
+  tests, portable Release CTest 4/4, MSVC Release `/W4 /WX`, and Windows CTest 8/8 passed.
+
+## 2026-08-31 — WebView Input Options migration (Step 24b.3)
+
+- Routed Input-stage Options into the shared modal host with the native “Allow incomplete session” value,
+  shared checkbox styling, generation-tagged boolean drafts, read-only operation behavior, Save, and
+  Cancel. Preview-stage Options deliberately remains on its legacy route until Step 24b.4.
+- Draft changes do not mutate native option state. Save applies the checkbox and reuses the existing
+  validation scheduling semantics; Cancel/shutdown discards the draft, and reopening derives the latest
+  native value. Focused bridge contracts reject non-boolean, stale, missing, and extra-field messages.
+- JavaScript syntax, clang-format, `git diff --check`, Ruff lint/format, mypy, all 172 transitional Python
+  tests, portable Release CTest 4/4, MSVC Release `/W4 /WX`, and Windows CTest 8/8 passed.
