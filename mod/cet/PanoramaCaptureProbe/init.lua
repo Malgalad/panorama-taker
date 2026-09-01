@@ -1,4 +1,4 @@
-local MOD_VERSION = "1.1.1"
+local MOD_VERSION = "1.1.2"
 local DEVELOPMENT_MODE = false
 
 local function log(message)
