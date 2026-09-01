@@ -3,12 +3,15 @@
 #include <atomic>
 #include <algorithm>
 #include <array>
+#include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <cmath>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <new>
 #include <stdexcept>
 #include <vector>
@@ -19,6 +22,7 @@
 #endif
 #include <windows.h>
 #include <d3d12.h>
+#include <d3d12sdklayers.h>
 #include <dxgi1_6.h>
 #include <wrl/client.h>
 #include "pano_gpu_fill_shader.h"
@@ -73,6 +77,8 @@
 #include "pano_gpu_exposure_pair_reduce_result_shader.h"
 #endif
 
+void debug_log(const char *format, ...) noexcept;
+
 namespace
 {
 std::atomic<uint32_t> live_device_count {0};
@@ -103,11 +109,16 @@ struct pano_gpu_device_core
     Microsoft::WRL::ComPtr<ID3D12Device> d3d_device;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
     Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+    Microsoft::WRL::ComPtr<ID3D12InfoQueue1> info_queue;
+    DWORD info_queue_callback_cookie {0};
+    bool info_queue_callback_registered {false};
     std::atomic<uint64_t> next_fence_value {0};
     bool counts_registered {false};
 
     ~pano_gpu_device_core()
     {
+        if (info_queue && info_queue_callback_registered)
+            info_queue->UnregisterMessageCallback(info_queue_callback_cookie);
         if (!counts_registered)
             return;
         if (fence)
@@ -374,6 +385,7 @@ namespace
 {
 void write_error(char *error_buffer, const uint32_t error_buffer_size, const char *message)
 {
+    debug_log("error: %s", message == nullptr ? "" : message);
     if (error_buffer == nullptr || error_buffer_size == 0)
         return;
     const size_t message_size = std::strlen(message);
@@ -383,6 +395,234 @@ void write_error(char *error_buffer, const uint32_t error_buffer_size, const cha
 }
 
 #if defined(_WIN32)
+struct debug_log_state
+{
+    std::once_flag initialize_once;
+    std::mutex write_mutex;
+    HANDLE file {INVALID_HANDLE_VALUE};
+    bool enabled {false};
+
+    ~debug_log_state()
+    {
+        if (file != INVALID_HANDLE_VALUE)
+            CloseHandle(file);
+    }
+};
+
+debug_log_state &diagnostic_log() noexcept
+{
+    static debug_log_state state;
+    return state;
+}
+
+void write_debug_line_unlocked(debug_log_state &state, const char *const message) noexcept
+{
+    SYSTEMTIME time {};
+    GetLocalTime(&time);
+    char line[2304] {};
+    const int prefix_size = std::snprintf(
+        line, sizeof(line), "%04u-%02u-%02u %02u:%02u:%02u.%03u [pid=%lu tid=%lu] ",
+        time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
+        time.wMilliseconds, static_cast<unsigned long>(GetCurrentProcessId()),
+        static_cast<unsigned long>(GetCurrentThreadId()));
+    if (prefix_size < 0 || static_cast<size_t>(prefix_size) >= sizeof(line))
+        return;
+    const size_t remaining = sizeof(line) - static_cast<size_t>(prefix_size);
+    const int message_size = std::snprintf(
+        line + prefix_size, remaining, "%s\r\n", message == nullptr ? "" : message);
+    if (message_size < 0)
+        return;
+    const size_t line_size = std::min(
+        sizeof(line) - 1, static_cast<size_t>(prefix_size) + static_cast<size_t>(message_size));
+    OutputDebugStringA(line);
+    if (state.file != INVALID_HANDLE_VALUE)
+    {
+        DWORD written = 0;
+        WriteFile(state.file, line, static_cast<DWORD>(line_size), &written, nullptr);
+        FlushFileBuffers(state.file);
+    }
+}
+
+void CALLBACK d3d12_message_callback(
+    const D3D12_MESSAGE_CATEGORY category, const D3D12_MESSAGE_SEVERITY severity,
+    const D3D12_MESSAGE_ID id, const LPCSTR description, void *) noexcept
+{
+    debug_log(
+        "d3d12-message category=%u severity=%u id=%u description=%s",
+        static_cast<unsigned>(category), static_cast<unsigned>(severity),
+        static_cast<unsigned>(id), description == nullptr ? "" : description);
+}
+
+void initialize_debug_diagnostics() noexcept
+{
+    auto &state = diagnostic_log();
+    std::call_once(state.initialize_once, [&state] {
+        wchar_t enabled[8] {};
+        if (GetEnvironmentVariableW(L"PANO_D3D12_DEBUG", enabled,
+                                    static_cast<DWORD>(std::size(enabled))) == 0 ||
+            std::wcscmp(enabled, L"1") != 0)
+            return;
+        state.enabled = true;
+        std::array<wchar_t, 32768> path {};
+        const DWORD path_size = GetEnvironmentVariableW(
+            L"PANO_D3D12_DEBUG_LOG_PATH", path.data(), static_cast<DWORD>(path.size()));
+        if (path_size > 0 && path_size < path.size())
+        {
+            state.file = CreateFileW(
+                path.data(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        }
+        write_debug_line_unlocked(state, "D3D12 debug diagnostics requested");
+
+        Microsoft::WRL::ComPtr<ID3D12Debug> debug;
+        const HRESULT debug_result = D3D12GetDebugInterface(IID_PPV_ARGS(&debug));
+        if (SUCCEEDED(debug_result))
+        {
+            debug->EnableDebugLayer();
+            Microsoft::WRL::ComPtr<ID3D12Debug1> debug1;
+            if (SUCCEEDED(debug.As(&debug1)))
+            {
+                debug1->SetEnableGPUBasedValidation(TRUE);
+                debug1->SetEnableSynchronizedCommandQueueValidation(TRUE);
+            }
+        }
+        char detail[160] {};
+        std::snprintf(
+            detail, sizeof(detail), "debug-layer initialization HRESULT=0x%08lx gpu-validation=%s",
+            static_cast<unsigned long>(debug_result), SUCCEEDED(debug_result) ? "enabled" : "unavailable");
+        write_debug_line_unlocked(state, detail);
+
+        Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedDataSettings1> dred;
+        const HRESULT dred_result = D3D12GetDebugInterface(IID_PPV_ARGS(&dred));
+        if (SUCCEEDED(dred_result))
+        {
+            dred->SetAutoBreadcrumbsEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred->SetPageFaultEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+            dred->SetBreadcrumbContextEnablement(D3D12_DRED_ENABLEMENT_FORCED_ON);
+        }
+        std::snprintf(
+            detail, sizeof(detail), "DRED initialization HRESULT=0x%08lx breadcrumbs=%s",
+            static_cast<unsigned long>(dred_result), SUCCEEDED(dred_result) ? "enabled" : "unavailable");
+        write_debug_line_unlocked(state, detail);
+    });
+}
+
+bool debug_diagnostics_enabled() noexcept
+{
+    initialize_debug_diagnostics();
+    return diagnostic_log().enabled;
+}
+
+const char *debug_object_name(
+    const char *const name_a, const wchar_t *const name_w, char *const converted,
+    const int converted_size) noexcept
+{
+    if (name_a != nullptr && name_a[0] != '\0')
+        return name_a;
+    if (name_w == nullptr || name_w[0] == L'\0' || converted == nullptr || converted_size <= 0)
+        return "<unnamed>";
+    if (WideCharToMultiByte(
+            CP_UTF8, 0, name_w, -1, converted, converted_size, nullptr, nullptr) == 0)
+        return "<unrepresentable>";
+    return converted;
+}
+
+void log_dred_allocations(
+    const char *const label, const D3D12_DRED_ALLOCATION_NODE1 *node) noexcept
+{
+    unsigned count = 0;
+    for (; node != nullptr && count < 64; node = node->pNext, ++count)
+    {
+        char converted[256] {};
+        debug_log(
+            "DRED %s allocation[%u] type=%u name=%s object=%p", label, count,
+            static_cast<unsigned>(node->AllocationType),
+            debug_object_name(node->ObjectNameA, node->ObjectNameW, converted,
+                              static_cast<int>(sizeof(converted))),
+            node->pObject);
+    }
+    if (node != nullptr)
+        debug_log("DRED %s allocations truncated after %u nodes", label, count);
+}
+
+std::atomic<ID3D12Device *> dred_dumped_device {nullptr};
+
+void dump_dred(ID3D12Device *const device, const char *const operation) noexcept
+{
+    if (device == nullptr || !debug_diagnostics_enabled())
+        return;
+    ID3D12Device *const previous = dred_dumped_device.exchange(device, std::memory_order_acq_rel);
+    if (previous == device)
+        return;
+    Microsoft::WRL::ComPtr<ID3D12DeviceRemovedExtendedData1> dred;
+    const HRESULT query_result = device->QueryInterface(IID_PPV_ARGS(&dred));
+    debug_log(
+        "DRED dump operation=%s query-HRESULT=0x%08lx", operation == nullptr ? "" : operation,
+        static_cast<unsigned long>(query_result));
+    if (FAILED(query_result))
+        return;
+
+    D3D12_DRED_AUTO_BREADCRUMBS_OUTPUT1 breadcrumbs {};
+    const HRESULT breadcrumb_result = dred->GetAutoBreadcrumbsOutput1(&breadcrumbs);
+    debug_log("DRED breadcrumbs HRESULT=0x%08lx", static_cast<unsigned long>(breadcrumb_result));
+    if (SUCCEEDED(breadcrumb_result))
+    {
+        unsigned node_index = 0;
+        for (const D3D12_AUTO_BREADCRUMB_NODE1 *node = breadcrumbs.pHeadAutoBreadcrumbNode;
+             node != nullptr && node_index < 64; node = node->pNext, ++node_index)
+        {
+            char list_name[256] {};
+            char queue_name[256] {};
+            const UINT completed = node->pLastBreadcrumbValue == nullptr
+                ? 0
+                : std::min(*node->pLastBreadcrumbValue, node->BreadcrumbCount);
+            debug_log(
+                "DRED breadcrumb-node[%u] list=%s queue=%s completed=%u count=%u", node_index,
+                debug_object_name(
+                    node->pCommandListDebugNameA, node->pCommandListDebugNameW, list_name,
+                    static_cast<int>(sizeof(list_name))),
+                debug_object_name(
+                    node->pCommandQueueDebugNameA, node->pCommandQueueDebugNameW, queue_name,
+                    static_cast<int>(sizeof(queue_name))),
+                completed, node->BreadcrumbCount);
+            if (node->pCommandHistory != nullptr)
+            {
+                const UINT begin = completed > 16 ? completed - 16 : 0;
+                const UINT end = std::min(node->BreadcrumbCount, completed + 4);
+                for (UINT index = begin; index < end; ++index)
+                {
+                    debug_log(
+                        "DRED breadcrumb-node[%u] op[%u]=%u%s", node_index, index,
+                        static_cast<unsigned>(node->pCommandHistory[index]),
+                        index == completed ? " <-- next" : "");
+                }
+            }
+            for (UINT index = 0; index < std::min(node->BreadcrumbContextsCount, 32U); ++index)
+            {
+                char context[512] {};
+                debug_log(
+                    "DRED breadcrumb-node[%u] context[%u] breadcrumb=%u text=%s", node_index,
+                    index, node->pBreadcrumbContexts[index].BreadcrumbIndex,
+                    debug_object_name(
+                        nullptr, node->pBreadcrumbContexts[index].pContextString, context,
+                        static_cast<int>(sizeof(context))));
+            }
+        }
+    }
+
+    D3D12_DRED_PAGE_FAULT_OUTPUT1 page_fault {};
+    const HRESULT page_fault_result = dred->GetPageFaultAllocationOutput1(&page_fault);
+    debug_log(
+        "DRED page-fault HRESULT=0x%08lx virtual-address=0x%016llx",
+        static_cast<unsigned long>(page_fault_result),
+        static_cast<unsigned long long>(page_fault.PageFaultVA));
+    if (SUCCEEDED(page_fault_result))
+    {
+        log_dred_allocations("existing", page_fault.pHeadExistingAllocationNode);
+        log_dred_allocations("recently-freed", page_fault.pHeadRecentFreedAllocationNode);
+    }
+}
+
 struct upload_slot_selection
 {
     ID3D12Resource *resource {nullptr};
@@ -410,26 +650,77 @@ void write_device_error(
         message, sizeof(message), "%s (HRESULT 0x%08lx; device reason 0x%08lx)", operation,
         static_cast<unsigned long>(result), static_cast<unsigned long>(removal_reason));
     write_error(error_buffer, error_buffer_size, message);
+    if (FAILED(removal_reason))
+        dump_dred(device, operation);
 }
 
 pano_gpu_result wait_for_fence(
     pano_gpu_device_core *const device_core, const uint64_t fence_value, char *const error_buffer,
     const uint32_t error_buffer_size, const char *const operation)
 {
-    if (device_core->fence->GetCompletedValue() < fence_value)
+    const ULONGLONG wait_started = GetTickCount64();
+    uint64_t completed_value = device_core->fence->GetCompletedValue();
+    debug_log(
+        "fence wait begin operation=%s target=%llu completed=%llu", operation,
+        static_cast<unsigned long long>(fence_value),
+        static_cast<unsigned long long>(completed_value));
+    if (completed_value == std::numeric_limits<uint64_t>::max())
+    {
+        write_device_error(
+            error_buffer, error_buffer_size, operation, DXGI_ERROR_DEVICE_REMOVED,
+            device_core->d3d_device.Get());
+        return PANO_GPU_UNAVAILABLE;
+    }
+    if (completed_value < fence_value)
     {
         HANDLE event_handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-        if (event_handle == nullptr ||
-            FAILED(device_core->fence->SetEventOnCompletion(fence_value, event_handle)) ||
-            WaitForSingleObject(event_handle, 10000) != WAIT_OBJECT_0)
+        if (event_handle == nullptr)
         {
-            if (event_handle != nullptr)
-                CloseHandle(event_handle);
+            debug_log("fence wait cannot create event win32-error=%lu", GetLastError());
             write_error(error_buffer, error_buffer_size, operation);
             return PANO_GPU_UNAVAILABLE;
         }
+        const HRESULT event_result =
+            device_core->fence->SetEventOnCompletion(fence_value, event_handle);
+        const DWORD wait_status = SUCCEEDED(event_result)
+            ? WaitForSingleObject(event_handle, 10000)
+            : WAIT_FAILED;
         CloseHandle(event_handle);
+        if (FAILED(event_result) || wait_status != WAIT_OBJECT_0)
+        {
+            const HRESULT removal_reason = device_core->d3d_device->GetDeviceRemovedReason();
+            const uint64_t failed_completed_value = device_core->fence->GetCompletedValue();
+            debug_log(
+                "fence wait failed operation=%s event-HRESULT=0x%08lx wait-status=0x%08lx "
+                "device-reason=0x%08lx target=%llu completed=%llu elapsed-ms=%llu",
+                operation, static_cast<unsigned long>(event_result),
+                static_cast<unsigned long>(wait_status), static_cast<unsigned long>(removal_reason),
+                static_cast<unsigned long long>(fence_value),
+                static_cast<unsigned long long>(failed_completed_value),
+                static_cast<unsigned long long>(GetTickCount64() - wait_started));
+            if (FAILED(removal_reason))
+                write_device_error(
+                    error_buffer, error_buffer_size, operation,
+                    FAILED(event_result) ? event_result : DXGI_ERROR_DEVICE_REMOVED,
+                    device_core->d3d_device.Get());
+            else
+                write_error(error_buffer, error_buffer_size, operation);
+            return PANO_GPU_UNAVAILABLE;
+        }
     }
+    completed_value = device_core->fence->GetCompletedValue();
+    if (completed_value == std::numeric_limits<uint64_t>::max())
+    {
+        write_device_error(
+            error_buffer, error_buffer_size, operation, DXGI_ERROR_DEVICE_REMOVED,
+            device_core->d3d_device.Get());
+        return PANO_GPU_UNAVAILABLE;
+    }
+    debug_log(
+        "fence wait complete operation=%s target=%llu completed=%llu elapsed-ms=%llu", operation,
+        static_cast<unsigned long long>(fence_value),
+        static_cast<unsigned long long>(completed_value),
+        static_cast<unsigned long long>(GetTickCount64() - wait_started));
 #if defined(PANO_GPU_TEST_HOOKS)
     if (fail_next_fence_wait.exchange(false, std::memory_order_relaxed))
     {
@@ -498,6 +789,7 @@ bool valid_session_diagnostics_arguments(
 bool admit_adapter(IDXGIAdapter1 *const selected, pano_gpu_adapter_info *const adapter)
 {
     using Microsoft::WRL::ComPtr;
+    const bool diagnostics_enabled = debug_diagnostics_enabled();
     ComPtr<ID3D12Device> device;
     if (FAILED(D3D12CreateDevice(selected, D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device))))
         return false;
@@ -534,6 +826,22 @@ bool admit_adapter(IDXGIAdapter1 *const selected, pano_gpu_adapter_info *const a
             CP_UTF8, 0, description.Description, -1, admitted.name, sizeof(admitted.name), nullptr,
             nullptr) == 0)
         admitted.name[0] = '\0';
+    if (diagnostics_enabled)
+    {
+        LARGE_INTEGER driver_version {};
+        const HRESULT driver_result =
+            selected->CheckInterfaceSupport(__uuidof(IDXGIDevice), &driver_version);
+        debug_log(
+            "adapter admitted name=%s vendor=0x%04x device=0x%04x luid=0x%016llx "
+            "dedicated=%llu budget=%llu usage=%llu driver-HRESULT=0x%08lx driver=0x%016llx",
+            admitted.name, admitted.vendor_id, admitted.device_id,
+            static_cast<unsigned long long>(admitted.luid),
+            static_cast<unsigned long long>(admitted.dedicated_bytes),
+            static_cast<unsigned long long>(admitted.local_budget_bytes),
+            static_cast<unsigned long long>(admitted.local_usage_bytes),
+            static_cast<unsigned long>(driver_result),
+            static_cast<unsigned long long>(driver_version.QuadPart));
+    }
     *adapter = admitted;
     return true;
 }
@@ -667,6 +975,27 @@ bool align_resource(const uint64_t value, uint64_t *const result)
     return true;
 }
 } // namespace
+
+void debug_log(const char *const format, ...) noexcept
+{
+#if !defined(_WIN32)
+    (void)format;
+#else
+    initialize_debug_diagnostics();
+    auto &state = diagnostic_log();
+    if (!state.enabled)
+        return;
+    char message[2048] {};
+    va_list arguments;
+    va_start(arguments, format);
+    const int written = std::vsnprintf(message, sizeof(message), format, arguments);
+    va_end(arguments);
+    if (written < 0)
+        return;
+    std::lock_guard<std::mutex> lock(state.write_mutex);
+    write_debug_line_unlocked(state, message);
+#endif
+}
 
 uint32_t pano_gpu_abi_version(void) noexcept
 {
@@ -932,6 +1261,18 @@ pano_gpu_result pano_gpu_plan_memory(
     const pano_gpu_memory_request *const request, pano_gpu_memory_plan *const plan,
     char *const error_buffer, const uint32_t error_buffer_size) noexcept
 {
+    if (request != nullptr)
+    {
+        debug_log(
+            "memory plan request frames=%u source=%ux%u sample-bytes=%u output=%ux%u "
+            "free=%llu total=%llu requested=%llu preview-cache=%llu",
+            request->frame_count, request->source_width, request->source_height,
+            request->source_sample_bytes, request->output_width, request->output_height,
+            static_cast<unsigned long long>(request->free_bytes),
+            static_cast<unsigned long long>(request->total_bytes),
+            static_cast<unsigned long long>(request->requested_budget_bytes),
+            static_cast<unsigned long long>(request->preview_cache_bytes));
+    }
     if (request == nullptr || plan == nullptr || request->size != sizeof(*request) ||
         request->abi_version != PANO_GPU_ABI_VERSION || plan->size != sizeof(*plan) ||
         plan->abi_version != PANO_GPU_ABI_VERSION || request->frame_count == 0 ||
@@ -1062,6 +1403,17 @@ pano_gpu_result pano_gpu_plan_memory(
     plan->reserve_bytes = reserve;
     plan->required_bytes = required;
     plan->available_bytes = available;
+    debug_log(
+        "memory plan selected band-rows=%u source=%llu session=%llu workspace=%llu upload=%llu "
+        "readback=%llu reserve=%llu required=%llu available=%llu",
+        plan->output_band_rows, static_cast<unsigned long long>(plan->source_bytes),
+        static_cast<unsigned long long>(plan->session_workspace_bytes),
+        static_cast<unsigned long long>(plan->output_workspace_bytes),
+        static_cast<unsigned long long>(plan->upload_bytes),
+        static_cast<unsigned long long>(plan->readback_bytes),
+        static_cast<unsigned long long>(plan->reserve_bytes),
+        static_cast<unsigned long long>(plan->required_bytes),
+        static_cast<unsigned long long>(plan->available_bytes));
     return PANO_GPU_SUCCESS;
 }
 
@@ -1083,6 +1435,7 @@ pano_gpu_result pano_gpu_device_create(
     const pano_gpu_probe_options *const options, pano_gpu_device **const device,
     char *const error_buffer, const uint32_t error_buffer_size) noexcept
 {
+    debug_log("device creation requested allow-warp=%u", options == nullptr ? 0 : options->allow_warp);
     if (options == nullptr || device == nullptr || options->size != sizeof(*options) ||
         options->abi_version != PANO_GPU_ABI_VERSION)
     {
@@ -1127,6 +1480,24 @@ pano_gpu_result pano_gpu_device_create(
         core->d3d_device = d3d_device;
         core->queue = queue;
         core->fence = fence;
+        const bool diagnostics_enabled = debug_diagnostics_enabled();
+        if (diagnostics_enabled && SUCCEEDED(d3d_device.As(&core->info_queue)))
+        {
+            const HRESULT callback_result = core->info_queue->RegisterMessageCallback(
+                d3d12_message_callback, D3D12_MESSAGE_CALLBACK_FLAG_NONE, nullptr,
+                &core->info_queue_callback_cookie);
+            core->info_queue_callback_registered = SUCCEEDED(callback_result);
+            debug_log(
+                "debug message callback HRESULT=0x%08lx registered=%u",
+                static_cast<unsigned long>(callback_result),
+                core->info_queue_callback_registered ? 1U : 0U);
+        }
+        if (diagnostics_enabled)
+        {
+            d3d_device->SetName(L"PanoramaCapture D3D12 device");
+            queue->SetName(L"PanoramaCapture direct queue");
+            fence->SetName(L"PanoramaCapture shared fence");
+        }
         pano_gpu_device *const created = new pano_gpu_device;
         created->core = std::move(core);
         live_device_count.fetch_add(1, std::memory_order_relaxed);
@@ -1134,6 +1505,10 @@ pano_gpu_result pano_gpu_device_create(
         live_fence_count.fetch_add(1, std::memory_order_relaxed);
         created->core->counts_registered = true;
         *device = created;
+        debug_log(
+            "device created adapter=%s vendor=0x%04x device=0x%04x luid=0x%016llx",
+            ignored_adapter.name, ignored_adapter.vendor_id, ignored_adapter.device_id,
+            static_cast<unsigned long long>(ignored_adapter.luid));
         return PANO_GPU_SUCCESS;
     }
     catch (const std::bad_alloc &)
@@ -1164,6 +1539,27 @@ pano_gpu_result pano_gpu_device_query_diagnostics(
         return PANO_GPU_INVALID_ARGUMENT;
     }
     diagnostics->adapter = device->core->adapter_info;
+#if defined(_WIN32)
+    if (debug_diagnostics_enabled())
+    {
+        Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter3;
+        DXGI_QUERY_VIDEO_MEMORY_INFO live_memory {};
+        const HRESULT live_result = device->core->adapter.As(&adapter3);
+        const HRESULT memory_result = SUCCEEDED(live_result)
+            ? adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &live_memory)
+            : live_result;
+        debug_log(
+            "device memory snapshot cached-budget=%llu cached-usage=%llu live-HRESULT=0x%08lx "
+            "live-budget=%llu live-usage=%llu available-for-reservation=%llu reservation=%llu",
+            static_cast<unsigned long long>(diagnostics->adapter.local_budget_bytes),
+            static_cast<unsigned long long>(diagnostics->adapter.local_usage_bytes),
+            static_cast<unsigned long>(memory_result),
+            static_cast<unsigned long long>(live_memory.Budget),
+            static_cast<unsigned long long>(live_memory.CurrentUsage),
+            static_cast<unsigned long long>(live_memory.AvailableForReservation),
+            static_cast<unsigned long long>(live_memory.CurrentReservation));
+    }
+#endif
     if (diagnostics->adapter.local_usage_bytes > diagnostics->adapter.local_budget_bytes)
     {
         write_error(error_buffer, error_buffer_size, "D3D12 device memory budget is invalid");
@@ -2832,6 +3228,9 @@ pano_gpu_result upload_frame_impl(
     write_error(error_buffer, error_buffer_size, "D3D12 is available only on Windows");
     return PANO_GPU_UNAVAILABLE;
 #else
+    debug_log(
+        "source upload begin frame=%u bytes=%llu upload-count=%u", upload->frame_index,
+        static_cast<unsigned long long>(upload->data_bytes), session->upload_count);
     const bool use_second_slot = session->second_upload_slot && (session->upload_count % 2U) != 0;
     const upload_slot_selection selected_slot = use_second_slot
         ? upload_slot_selection {
@@ -2869,13 +3268,30 @@ pano_gpu_result upload_frame_impl(
         return PANO_GPU_CANCELLED;
     Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator;
     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
-    if (FAILED(session->device_core->d3d_device->CreateCommandAllocator(
-            D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
-        FAILED(session->device_core->d3d_device->CreateCommandList(
-            0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list))))
+    const HRESULT allocator_result = session->device_core->d3d_device->CreateCommandAllocator(
+        D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator));
+    if (FAILED(allocator_result))
     {
-        write_error(error_buffer, error_buffer_size, "cannot create D3D12 source upload commands");
+        write_device_error(
+            error_buffer, error_buffer_size, "cannot create D3D12 source upload allocator",
+            allocator_result, session->device_core->d3d_device.Get());
         return PANO_GPU_UNAVAILABLE;
+    }
+    const HRESULT list_result = session->device_core->d3d_device->CreateCommandList(
+        0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr, IID_PPV_ARGS(&list));
+    if (FAILED(list_result))
+    {
+        write_device_error(
+            error_buffer, error_buffer_size, "cannot create D3D12 source upload command list",
+            list_result, session->device_core->d3d_device.Get());
+        return PANO_GPU_UNAVAILABLE;
+    }
+    if (debug_diagnostics_enabled())
+    {
+        wchar_t list_name[96] {};
+        std::swprintf(list_name, std::size(list_name), L"PanoramaCapture source upload frame %u",
+                      upload->frame_index);
+        list->SetName(list_name);
     }
     const uint64_t destination_offset = static_cast<uint64_t>(upload->frame_index) * session->source_frame_bytes;
     if (session->source_is_shader_readable)
@@ -2906,16 +3322,25 @@ pano_gpu_result upload_frame_impl(
 #else
     const bool injected_signal_failure = false;
 #endif
-    if (injected_signal_failure ||
-        FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)))
+    const HRESULT signal_result = injected_signal_failure
+        ? E_FAIL
+        : session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value);
+    if (FAILED(signal_result))
     {
-        write_error(error_buffer, error_buffer_size, "cannot signal D3D12 source upload fence");
+        write_device_error(
+            error_buffer, error_buffer_size, "cannot signal D3D12 source upload fence",
+            signal_result, session->device_core->d3d_device.Get());
         return PANO_GPU_UNAVAILABLE;
     }
     *selected_slot.last_fence = fence_value;
     session->frame_upload_fences[upload->frame_index] = fence_value;
     session->upload_count += 1;
     session->uploaded_bytes = uploaded_bytes;
+    debug_log(
+        "source upload submitted frame=%u slot=%u fence=%llu total-uploaded=%llu",
+        upload->frame_index, use_second_slot ? 1U : 0U,
+        static_cast<unsigned long long>(fence_value),
+        static_cast<unsigned long long>(session->uploaded_bytes));
     return PANO_GPU_SUCCESS;
 #endif
 }
@@ -4626,6 +5051,11 @@ pano_gpu_result pano_gpu_session_allocate_source(
     write_error(error_buffer, error_buffer_size, "D3D12 is available only on Windows");
     return PANO_GPU_UNAVAILABLE;
 #else
+    debug_log(
+        "source allocation begin frames=%u frame-bytes=%llu total-bytes=%llu dimensions=%ux%u",
+        session->frame_count, static_cast<unsigned long long>(session->source_frame_bytes),
+        static_cast<unsigned long long>(source_bytes), session->source_width,
+        session->source_height);
     if (session->source)
     {
         write_error(error_buffer, error_buffer_size, "D3D12 source storage is already allocated");
@@ -4657,6 +5087,9 @@ pano_gpu_result pano_gpu_session_allocate_source(
         return PANO_GPU_UNAVAILABLE;
     }
     session->source_bytes = source_bytes;
+    if (debug_diagnostics_enabled())
+        session->source->SetName(L"PanoramaCapture resident source frames");
+    debug_log("source allocation complete bytes=%llu", static_cast<unsigned long long>(source_bytes));
     return PANO_GPU_SUCCESS;
 #endif
 }
@@ -5764,6 +6197,14 @@ pano_gpu_result pano_gpu_preview_create(
     write_error(error_buffer, error_buffer_size, "D3D12 is available only on Windows");
     return PANO_GPU_UNAVAILABLE;
 #else
+    debug_log(
+        "retained preview create frames=%u preview=%ux%u overview=%ux%u masks=%ux%u "
+        "preview-bytes=%llu overview-bytes=%llu mask-bytes=%llu",
+        options->frame_count, options->preview_width, options->preview_height,
+        options->overview_width, options->overview_height, options->mask_width,
+        options->mask_height, static_cast<unsigned long long>(preview_bytes),
+        static_cast<unsigned long long>(overview_bytes),
+        static_cast<unsigned long long>(mask_bytes));
     pano_gpu_preview *created = nullptr;
     try
     {
@@ -8185,6 +8626,17 @@ static pano_gpu_result dispatch_typed_hard_composite(
     write_error(error_buffer, error_buffer_size, "D3D12 is available only on Windows");
     return PANO_GPU_UNAVAILABLE;
 #else
+    const pano_gpu_one_frame_composite_request &debug_frame = request->frame_requests[0];
+    const uint32_t debug_dispatches = expected_frame_count * (feather_mode ? 3U : 2U) +
+        (local_fields == nullptr ? 0U : expected_frame_count) + (feather_mode ? 1U : 0U);
+    debug_log(
+        "composite begin mode=%s frames=%u sample-type=%u output=%ux%u rows=%u..%u "
+        "pixels=%llu dispatches=%u local-fields=%u",
+        feather_mode ? "feather" : "hard", expected_frame_count, expected_sample_type,
+        debug_frame.output_width, debug_frame.output_height, debug_frame.row_start,
+        debug_frame.row_start + debug_frame.row_count,
+        static_cast<unsigned long long>(layout.pixel_count), debug_dispatches,
+        local_fields == nullptr ? 0U : 1U);
     ID3D12Device *const device = session->device_core->d3d_device.Get();
     const uint32_t source_element_bytes = expected_sample_type == PANO_GPU_SAMPLE_FLOAT32
         ? sizeof(float)
@@ -8327,6 +8779,17 @@ static pano_gpu_result dispatch_typed_hard_composite(
     if (FAILED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap))) || FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
         FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), candidate_pso.Get(), IID_PPV_ARGS(&list))))
     { write_error(error_buffer, error_buffer_size, "cannot create D3D12 two-frame uint8 command resources"); return PANO_GPU_UNAVAILABLE; }
+    if (debug_diagnostics_enabled())
+    {
+        wchar_t composite_name[128] {};
+        std::swprintf(
+            composite_name, std::size(composite_name),
+            L"PanoramaCapture %ls composite %ux%u rows %u-%u frames %u",
+            feather_mode ? L"feather" : L"hard", debug_frame.output_width,
+            debug_frame.output_height, debug_frame.row_start,
+            debug_frame.row_start + debug_frame.row_count, expected_frame_count);
+        list->SetName(composite_name);
+    }
     const UINT increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
     const auto cpu = [&](const UINT slot) { D3D12_CPU_DESCRIPTOR_HANDLE h = heap->GetCPUDescriptorHandleForHeapStart(); h.ptr += static_cast<SIZE_T>(slot) * increment; return h; };
     const auto gpu = [&](const UINT slot) { D3D12_GPU_DESCRIPTOR_HANDLE h = heap->GetGPUDescriptorHandleForHeapStart(); h.ptr += static_cast<UINT64>(slot) * increment; return h; };

@@ -45,6 +45,14 @@ shows the native prerequisite prompt and exits instead of exposing another appli
 To verify the memory-bounded CPU backend on a D3D12-capable system, launch it from a console with
 `PanoramaCaptureStitcher.exe --no-gpu`.
 
+For D3D12 failure diagnostics, launch `PanoramaCaptureStitcher.exe --d3d12-debug`. This enables the
+D3D12 debug layer, GPU-based validation, synchronized queue validation, and DRED breadcrumbs/page
+fault reporting. A timestamped log is written under
+`%LOCALAPPDATA%\PanoramaCapture\logs`. The log records adapter and memory-plan details, preview
+stages, source uploads, command submissions, fence waits, HRESULT/device-removal details, and CPU
+fallback. This mode intentionally adds validation overhead and should not be used for performance
+measurement.
+
 The editable WebView sources are `stitcher/native/resources/pano_app_ui.html`,
 `pano_app_ui.css`, and `pano_app_ui.js`. The native build inlines all three into one generated
 HTML resource; those source files are not shipped beside the executable.

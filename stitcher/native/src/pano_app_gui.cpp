@@ -24,6 +24,8 @@
 #include <charconv>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <cwchar>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
@@ -111,6 +113,8 @@ struct GuiShellState {
   bool settings_loaded = false;
   bool headless = false;
   bool self_test_allows_warp = false;
+  bool d3d12_debug = false;
+  std::filesystem::path d3d12_debug_log_path;
   std::unique_ptr<GuiRuntimeState> runtime;
   std::unique_ptr<pano::app::WebViewHost> webview;
   std::unique_ptr<pano::app::WebViewHost> exposure_webview;
@@ -318,6 +322,86 @@ void handle_exposure_webview_command(HWND window,
 std::optional<int> webview_outer_height(HWND window, double css_height);
 void report_application_error(const std::wstring &title,
                               const std::wstring &message);
+
+std::mutex gui_debug_log_mutex;
+
+void append_gui_debug_log(const std::filesystem::path &path,
+                          const std::string_view message) {
+  if (path.empty())
+    return;
+  SYSTEMTIME time{};
+  GetLocalTime(&time);
+  std::array<char, 2304> line{};
+  const int prefix_size = std::snprintf(
+      line.data(), line.size(),
+      "%04u-%02u-%02u %02u:%02u:%02u.%03u [pid=%lu tid=%lu] gui: ",
+      time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute,
+      time.wSecond, time.wMilliseconds,
+      static_cast<unsigned long>(GetCurrentProcessId()),
+      static_cast<unsigned long>(GetCurrentThreadId()));
+  if (prefix_size < 0 || static_cast<std::size_t>(prefix_size) >= line.size())
+    return;
+  const auto available = line.size() - static_cast<std::size_t>(prefix_size);
+  const int message_size = std::snprintf(
+      line.data() + prefix_size, available, "%.*s\r\n",
+      static_cast<int>(std::min(message.size(), available - 3U)),
+      message.data());
+  if (message_size < 0)
+    return;
+  const auto line_size = std::min(
+      line.size() - 1U, static_cast<std::size_t>(prefix_size) +
+                            static_cast<std::size_t>(message_size));
+  std::lock_guard<std::mutex> lock(gui_debug_log_mutex);
+  const HANDLE file = CreateFileW(
+      path.c_str(), FILE_APPEND_DATA,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+      OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file == INVALID_HANDLE_VALUE)
+    return;
+  DWORD written = 0;
+  WriteFile(file, line.data(), static_cast<DWORD>(line_size), &written,
+            nullptr);
+  FlushFileBuffers(file);
+  CloseHandle(file);
+}
+
+bool configure_d3d12_debug(std::filesystem::path &path,
+                           std::wstring &error) {
+  std::array<wchar_t, 32768> local_app_data{};
+  const DWORD length = GetEnvironmentVariableW(
+      L"LOCALAPPDATA", local_app_data.data(),
+      static_cast<DWORD>(local_app_data.size()));
+  if (length == 0U || length >= local_app_data.size()) {
+    error = L"LOCALAPPDATA is unavailable";
+    return false;
+  }
+  const auto directory = std::filesystem::path(local_app_data.data()) /
+                         L"PanoramaCapture" / L"logs";
+  std::error_code directory_error;
+  std::filesystem::create_directories(directory, directory_error);
+  if (directory_error) {
+    error = L"Cannot create the D3D12 log directory";
+    return false;
+  }
+  SYSTEMTIME time{};
+  GetLocalTime(&time);
+  wchar_t filename[128]{};
+  std::swprintf(filename, std::size(filename),
+                L"d3d12-%04u%02u%02u-%02u%02u%02u-%lu.log", time.wYear,
+                time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
+                static_cast<unsigned long>(GetCurrentProcessId()));
+  path = directory / filename;
+  if (SetEnvironmentVariableW(L"PANO_D3D12_DEBUG", L"1") == FALSE ||
+      SetEnvironmentVariableW(L"PANO_D3D12_DEBUG_LOG_PATH",
+                              path.c_str()) == FALSE) {
+    error = L"Cannot configure the D3D12 diagnostic environment";
+    path.clear();
+    return false;
+  }
+  append_gui_debug_log(path, "diagnostic mode configured");
+  error.clear();
+  return true;
+}
 
 bool write_runtime_probe_result(const std::filesystem::path &path,
                                 const std::string &result) {
@@ -1070,6 +1154,14 @@ void report_preview_progress(void *, const unsigned completed,
     runtime_state().preview_progress_phase =
         phase == nullptr ? "Preparing preview" : phase;
   }
+  if (application_state().d3d12_debug) {
+    std::ostringstream message;
+    message << "preview progress phase="
+            << (phase == nullptr ? "Preparing preview" : phase)
+            << " completed=" << completed << " total=" << total;
+    append_gui_debug_log(application_state().d3d12_debug_log_path,
+                         message.str());
+  }
   const HWND target =
       runtime_state().refresh_window.load(std::memory_order_acquire);
   if (target != nullptr)
@@ -1198,6 +1290,19 @@ void start_preview() {
     report_application_error(L"Preview", L"Preview surface has no usable size");
     return;
   }
+  if (application_state().d3d12_debug) {
+    std::ostringstream message;
+    message << "preview requested viewport-width=" << bounds.right
+            << " frames=" << plan.session.frames.size()
+            << " blend=" << plan.blend
+            << " auto-contrast=" << (plan.auto_contrast ? 1 : 0)
+            << " gpu-memory-mib="
+            << (plan.gpu_memory_mib.has_value()
+                    ? std::to_string(*plan.gpu_memory_mib)
+                    : std::string("automatic"));
+    append_gui_debug_log(application_state().d3d12_debug_log_path,
+                         message.str());
+  }
   const bool retaining_cpu =
       runtime_state().active_cpu_preview_owner != nullptr;
   const bool d3d12_available =
@@ -1300,6 +1405,12 @@ void start_preview() {
               pano_gpu_cancellation_token_is_cancelled(
                   runtime_state().preview_cancellation) == 0) {
             result->fallback_error = result->error;
+            if (application_state().d3d12_debug) {
+              append_gui_debug_log(
+                  application_state().d3d12_debug_log_path,
+                  "D3D12 preview failed; starting CPU fallback: " +
+                      result->fallback_error);
+            }
             result->error.clear();
             pano::app::destroy_native_preview(&result->preview);
             result->backend = pano::app::GuiBackendDecision::cpu_fallback;
@@ -1453,6 +1564,11 @@ void apply_preview_results() {
       update_operation_progress(window, 100U, 100U);
     complete_owned_operation(result->operation_generation);
     set_status_text(ready_status);
+    if (application_state().d3d12_debug) {
+      append_gui_debug_log(
+          application_state().d3d12_debug_log_path,
+          cpu ? "CPU fallback preview ready" : "D3D12 preview ready");
+    }
     notify_operation_complete();
   }
   pano_gpu_cancellation_token_destroy(&runtime_state().preview_cancellation);
@@ -4168,18 +4284,31 @@ int WINAPI wWinMain(const HINSTANCE instance, HINSTANCE, PWSTR,
   }
   bool self_test_requested = false;
   bool no_gpu_requested = false;
+  bool d3d12_debug_requested = false;
   std::filesystem::path self_test_codec_directory;
   for (int index = 1; arguments != nullptr && index < argument_count; ++index) {
     self_test_requested =
         self_test_requested || std::wstring(arguments[index]) == L"--self-test";
     no_gpu_requested =
         no_gpu_requested || std::wstring(arguments[index]) == L"--no-gpu";
+    d3d12_debug_requested =
+        d3d12_debug_requested ||
+        std::wstring(arguments[index]) == L"--d3d12-debug";
     if (std::wstring(arguments[index]) == L"--self-test-codec-dir" &&
         index + 1 < argument_count)
       self_test_codec_directory = arguments[++index];
   }
   if (arguments != nullptr)
     LocalFree(arguments);
+  std::filesystem::path d3d12_debug_log_path;
+  if (d3d12_debug_requested) {
+    std::wstring debug_error;
+    if (!configure_d3d12_debug(d3d12_debug_log_path, debug_error)) {
+      MessageBoxW(nullptr, debug_error.c_str(), L"D3D12 diagnostics",
+                  MB_OK | MB_ICONERROR);
+      return 25;
+    }
+  }
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
   const HRESULT com_result = CoInitializeEx(
       nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
@@ -4194,6 +4323,8 @@ int WINAPI wWinMain(const HINSTANCE instance, HINSTANCE, PWSTR,
   shell.runtime = std::make_unique<GuiRuntimeState>();
   shell.headless = self_test_requested;
   shell.use_gpu = !no_gpu_requested;
+  shell.d3d12_debug = d3d12_debug_requested;
+  shell.d3d12_debug_log_path = std::move(d3d12_debug_log_path);
   active_application_state = &shell;
   if (self_test_requested) {
     const int result = webview_self_test(instance, shell, no_gpu_requested,
