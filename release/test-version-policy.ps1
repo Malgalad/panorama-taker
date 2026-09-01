@@ -26,6 +26,12 @@ $releaseWorkflow = Get-Content -LiteralPath `
 if (-not $releaseWorkflow.Contains('          ref: ${{ github.ref }}')) {
     throw "Release workflow must check out the triggering ref"
 }
+if ($releaseWorkflow.Contains('"msbuild=$(& msbuild -version -nologo')) {
+    throw "Release workflow must not require MSBuild on PATH"
+}
+if (-not $releaseWorkflow.Contains('-requires Microsoft.Component.MSBuild')) {
+    throw "Release workflow must locate MSBuild through Visual Studio Installer"
+}
 
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("pano-version-policy-" + [guid]::NewGuid())
 try {
