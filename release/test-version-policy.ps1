@@ -35,6 +35,14 @@ try {
         New-Item -ItemType Directory -Force -Path (Split-Path -Parent $destination) | Out-Null
         Copy-Item -LiteralPath $source -Destination $destination
     }
+    foreach ($relativePath in @(
+        "mod\cet\PanoramaCaptureProbe\init.lua",
+        ".github\workflows\release.yml"
+    )) {
+        $path = Join-Path $testRoot $relativePath
+        $contents = [IO.File]::ReadAllText($path) -replace "`r?`n", "`r`n"
+        [IO.File]::WriteAllText($path, $contents, [Text.UTF8Encoding]::new($false))
+    }
 
     & $bumpScript -Version "9.8.7" -ProjectRoot $testRoot | Out-Null
     if ((Get-Content -LiteralPath (Join-Path $testRoot "stitcher\native\VERSION") -Raw).Trim() -ne "9.8.7") {

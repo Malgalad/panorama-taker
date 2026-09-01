@@ -23,7 +23,7 @@ $targets = @(
     }
     [PSCustomObject]@{
         Path = "mod\cet\PanoramaCaptureProbe\init.lua"
-        Pattern = '(?m)^local MOD_VERSION = "[^"]+"$'
+        Pattern = '(?m)^local MOD_VERSION = "[^"]+"(?=\r?$)'
         Replacement = "local MOD_VERSION = `"$Version`""
     }
     [PSCustomObject]@{
@@ -38,7 +38,7 @@ $targets = @(
     }
     [PSCustomObject]@{
         Path = ".github\workflows\release.yml"
-        Pattern = '(?m)^(        default: )"[^"]+"$'
+        Pattern = '(?m)^(        default: )"[^"]+"(?=\r?$)'
         Replacement = "`${1}`"$Version`""
     }
 )
