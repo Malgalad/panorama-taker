@@ -40,6 +40,7 @@ enum class WebViewCommandKind {
   browse_output_directory,
   refresh,
   select_session,
+  copy_session_coordinates,
   edit_tag,
   delete_session,
   navigate_input,
@@ -59,6 +60,7 @@ enum class WebViewCommandKind {
   clear_exposure_hover,
   set_exposure_reference,
   toggle_exposure_selection,
+  set_final_exposure,
   reset_exposure,
   equalize_exposure,
   abort_operation,
@@ -105,6 +107,7 @@ webview_command_domain(const WebViewCommandKind kind) noexcept {
     return WebViewCommandDomain::directories;
   case WebViewCommandKind::refresh:
   case WebViewCommandKind::select_session:
+  case WebViewCommandKind::copy_session_coordinates:
   case WebViewCommandKind::edit_tag:
   case WebViewCommandKind::delete_session:
     return WebViewCommandDomain::sessions;
@@ -132,6 +135,7 @@ webview_command_domain(const WebViewCommandKind kind) noexcept {
   case WebViewCommandKind::clear_exposure_hover:
   case WebViewCommandKind::set_exposure_reference:
   case WebViewCommandKind::toggle_exposure_selection:
+  case WebViewCommandKind::set_final_exposure:
   case WebViewCommandKind::reset_exposure:
   case WebViewCommandKind::equalize_exposure:
     return WebViewCommandDomain::exposure;
@@ -169,6 +173,7 @@ struct WebViewCommand {
   std::uint64_t page_generation = 0;
   std::optional<std::size_t> session_index;
   std::optional<unsigned> pose_index;
+  std::optional<double> exposure_ev;
   std::optional<bool> enabled;
   std::optional<std::uint64_t> modal_generation;
   std::optional<std::uint64_t> layout_generation;

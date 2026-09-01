@@ -343,6 +343,7 @@ struct pano_gpu_preview_surface
     bool count_registered {false};
     std::atomic<bool> presenting {false};
 #if defined(_WIN32)
+    uint64_t sdr_color_space_set_count {0};
     Microsoft::WRL::ComPtr<IDXGISwapChain3> swap_chain;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> rtv_heap;
     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2> buffers;
@@ -5092,6 +5093,16 @@ static void update_surface_device_lost(
     surface->device_lost =
         FAILED(surface->device_core->d3d_device->GetDeviceRemovedReason());
 }
+
+static bool set_surface_sdr_color_space(
+    pano_gpu_preview_surface *const surface) noexcept
+{
+    if (FAILED(surface->swap_chain->SetColorSpace1(
+            DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709)))
+        return false;
+    ++surface->sdr_color_space_set_count;
+    return true;
+}
 #endif
 
 pano_gpu_result pano_gpu_preview_surface_create(
@@ -5142,7 +5153,8 @@ pano_gpu_result pano_gpu_preview_surface_create(
         if (FAILED(factory->CreateSwapChainForHwnd(
                 device->core->queue.Get(), window, &description, nullptr,
                 nullptr, &swap_chain)) ||
-            FAILED(swap_chain.As(&created->swap_chain)))
+            FAILED(swap_chain.As(&created->swap_chain)) ||
+            !set_surface_sdr_color_space(created))
             throw std::runtime_error("cannot create preview swap chain");
         factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER);
         D3D12_DESCRIPTOR_HEAP_DESC heap {};
@@ -5206,6 +5218,7 @@ pano_gpu_result pano_gpu_preview_surface_resize(
     surface->present_texture.Reset();
     if (FAILED(surface->swap_chain->ResizeBuffers(
             2, width, height, DXGI_FORMAT_R8G8B8A8_UNORM, 0)) ||
+        !set_surface_sdr_color_space(surface) ||
         !create_surface_back_buffers(surface))
     {
         update_surface_device_lost(surface);
@@ -6339,13 +6352,24 @@ void pano_gpu_preview_surface_destroy(
 }
 
 #if defined(PANO_GPU_TEST_HOOKS)
+uint64_t pano_gpu_test_preview_surface_sdr_color_space_set_count(
+    const pano_gpu_preview_surface *const surface) noexcept
+{
+#if defined(_WIN32)
+    return surface == nullptr ? 0 : surface->sdr_color_space_set_count;
+#else
+    (void)surface;
+    return 0;
+#endif
+}
+
 void pano_gpu_test_fail_next_preview_surface_device_removed(void) noexcept
 {
     fail_next_preview_surface_device_removed.store(true,
                                                     std::memory_order_relaxed);
 }
 
- pano_gpu_result pano_gpu_test_read_preview_surface(
+pano_gpu_result pano_gpu_test_read_preview_surface(
     pano_gpu_preview_surface *const surface, uint8_t *const rgba8,
     const uint64_t rgba8_bytes, char *const error_buffer,
     const uint32_t error_buffer_size) noexcept
@@ -8180,33 +8204,17 @@ static pano_gpu_result dispatch_typed_hard_composite(
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(out->ReleaseAndGetAddressOf())));
     };
     using resource_array = std::unique_ptr<Microsoft::WRL::ComPtr<ID3D12Resource>[]>;
-    resource_array candidate_rgb {new (std::nothrow)
-                                      Microsoft::WRL::ComPtr<ID3D12Resource>[expected_frame_count]};
-    resource_array adjusted_rgb {new (std::nothrow)
-                                     Microsoft::WRL::ComPtr<ID3D12Resource>[expected_frame_count]};
-    resource_array validity {new (std::nothrow)
-                                 Microsoft::WRL::ComPtr<ID3D12Resource>[expected_frame_count]};
-    resource_array edge {new (std::nothrow)
-                             Microsoft::WRL::ComPtr<ID3D12Resource>[expected_frame_count]};
-    resource_array feather_weight {new (std::nothrow)
-                                       Microsoft::WRL::ComPtr<ID3D12Resource>[expected_frame_count]};
-    if (!candidate_rgb || !adjusted_rgb || !validity || !edge || !feather_weight)
-    {
-        write_error(error_buffer, error_buffer_size, "cannot allocate hard-composite resource owners");
-        return PANO_GPU_OUT_OF_MEMORY;
-    }
+    Microsoft::WRL::ComPtr<ID3D12Resource> candidate_rgb, adjusted_rgb, validity, edge, feather_weight;
     Microsoft::WRL::ComPtr<ID3D12Resource> accumulator_rgb[2], accumulator_weight[2], coverage_resource;
-    for (uint32_t index = 0; index < expected_frame_count; ++index)
-        if (!make_default(layout.selected_rgb_bytes, &candidate_rgb[index]) ||
-            !make_default(valid_bytes, &validity[index]) ||
-            !make_default(layout.selected_weight_bytes, &edge[index]) ||
-            (feather_mode && !make_default(layout.selected_weight_bytes, &feather_weight[index])) ||
-            (local_fields != nullptr &&
-             !make_default(layout.selected_rgb_bytes, &adjusted_rgb[index])))
-        {
-            write_error(error_buffer, error_buffer_size, "cannot create D3D12 hard-composite frame buffers");
-            return PANO_GPU_UNAVAILABLE;
-        }
+    if (!make_default(layout.selected_rgb_bytes, &candidate_rgb) ||
+        !make_default(valid_bytes, &validity) ||
+        !make_default(layout.selected_weight_bytes, &edge) ||
+        (feather_mode && !make_default(layout.selected_weight_bytes, &feather_weight)) ||
+        (local_fields != nullptr && !make_default(layout.selected_rgb_bytes, &adjusted_rgb)))
+    {
+        write_error(error_buffer, error_buffer_size, "cannot create D3D12 hard-composite frame buffers");
+        return PANO_GPU_UNAVAILABLE;
+    }
     if (!make_default(layout.selected_rgb_bytes, &accumulator_rgb[0]) ||
         !make_default(layout.selected_rgb_bytes, &accumulator_rgb[1]) ||
         !make_default(layout.selected_weight_bytes, &accumulator_weight[0]) ||
@@ -8335,20 +8343,20 @@ static pano_gpu_result dispatch_typed_hard_composite(
     D3D12_SHADER_RESOURCE_VIEW_DESC valid_srv {}; valid_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER; valid_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; valid_srv.Format = DXGI_FORMAT_R32_TYPELESS; valid_srv.Buffer.NumElements = static_cast<UINT>(valid_bytes / 4); valid_srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
     for (UINT pass = 0; pass < expected_frame_count; ++pass) {
         const UINT candidate_slot = pass * 4; device->CreateShaderResourceView(session->source.Get(), &source_srv, cpu(candidate_slot));
-        device->CreateUnorderedAccessView(candidate_rgb[pass].Get(), nullptr, &rgb_uav, cpu(candidate_slot + 1)); device->CreateUnorderedAccessView(validity[pass].Get(), nullptr, &valid_uav, cpu(candidate_slot + 2)); device->CreateUnorderedAccessView(edge[pass].Get(), nullptr, &weight_uav, cpu(candidate_slot + 3));
+        device->CreateUnorderedAccessView(candidate_rgb.Get(), nullptr, &rgb_uav, cpu(candidate_slot + 1)); device->CreateUnorderedAccessView(validity.Get(), nullptr, &valid_uav, cpu(candidate_slot + 2)); device->CreateUnorderedAccessView(edge.Get(), nullptr, &weight_uav, cpu(candidate_slot + 3));
         if (local_fields != nullptr) {
             const UINT local_slot = local_base + pass * 3;
-            structured_srv(candidate_rgb[pass].Get(), 3 * sizeof(float), local_slot);
+            structured_srv(candidate_rgb.Get(), 3 * sizeof(float), local_slot);
             D3D12_SHADER_RESOURCE_VIEW_DESC field_srv {}; field_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER; field_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; field_srv.Format = DXGI_FORMAT_UNKNOWN; field_srv.Buffer.NumElements = local_field_width * local_field_height; field_srv.Buffer.StructureByteStride = sizeof(float); device->CreateShaderResourceView(local_field_resources[pass].Get(), &field_srv, cpu(local_slot + 1));
-            device->CreateUnorderedAccessView(adjusted_rgb[pass].Get(), nullptr, &rgb_uav, cpu(local_slot + 2));
+            device->CreateUnorderedAccessView(adjusted_rgb.Get(), nullptr, &rgb_uav, cpu(local_slot + 2));
         }
         if (!feather_mode) {
-            const UINT select_slot = select_base + pass * 8; structured_srv((local_fields == nullptr ? candidate_rgb[pass] : adjusted_rgb[pass]).Get(), 3 * sizeof(float), select_slot); device->CreateShaderResourceView(validity[pass].Get(), &valid_srv, cpu(select_slot + 1)); structured_srv(edge[pass].Get(), sizeof(float), select_slot + 2);
+            const UINT select_slot = select_base + pass * 8; structured_srv((local_fields == nullptr ? candidate_rgb : adjusted_rgb).Get(), 3 * sizeof(float), select_slot); device->CreateShaderResourceView(validity.Get(), &valid_srv, cpu(select_slot + 1)); structured_srv(edge.Get(), sizeof(float), select_slot + 2);
             structured_srv(pass == 0 ? zero_rgb.Get() : accumulator_rgb[(pass + 1) % 2].Get(), 3 * sizeof(float), select_slot + 3); structured_srv(pass == 0 ? zero_weight.Get() : accumulator_weight[(pass + 1) % 2].Get(), sizeof(float), select_slot + 4);
             device->CreateUnorderedAccessView(accumulator_rgb[pass % 2].Get(), nullptr, &rgb_uav, cpu(select_slot + 5)); device->CreateUnorderedAccessView(accumulator_weight[pass % 2].Get(), nullptr, &weight_uav, cpu(select_slot + 6)); device->CreateUnorderedAccessView(coverage_resource.Get(), nullptr, &coverage_uav, cpu(select_slot + 7));
         } else {
-            const UINT weight_slot = select_base + pass * 3; device->CreateShaderResourceView(validity[pass].Get(), &valid_srv, cpu(weight_slot)); structured_srv(edge[pass].Get(), sizeof(float), weight_slot + 1); device->CreateUnorderedAccessView(feather_weight[pass].Get(), nullptr, &weight_uav, cpu(weight_slot + 2));
-            const UINT accumulate_slot = feather_accumulate_base + pass * 6; structured_srv((local_fields == nullptr ? candidate_rgb[pass] : adjusted_rgb[pass]).Get(), 3 * sizeof(float), accumulate_slot); structured_srv(feather_weight[pass].Get(), sizeof(float), accumulate_slot + 1); structured_srv(pass == 0 ? zero_rgb.Get() : accumulator_rgb[(pass + 1) % 2].Get(), 3 * sizeof(float), accumulate_slot + 2); structured_srv(pass == 0 ? zero_weight.Get() : accumulator_weight[(pass + 1) % 2].Get(), sizeof(float), accumulate_slot + 3); device->CreateUnorderedAccessView(accumulator_rgb[pass % 2].Get(), nullptr, &rgb_uav, cpu(accumulate_slot + 4)); device->CreateUnorderedAccessView(accumulator_weight[pass % 2].Get(), nullptr, &weight_uav, cpu(accumulate_slot + 5));
+            const UINT weight_slot = select_base + pass * 3; device->CreateShaderResourceView(validity.Get(), &valid_srv, cpu(weight_slot)); structured_srv(edge.Get(), sizeof(float), weight_slot + 1); device->CreateUnorderedAccessView(feather_weight.Get(), nullptr, &weight_uav, cpu(weight_slot + 2));
+            const UINT accumulate_slot = feather_accumulate_base + pass * 6; structured_srv((local_fields == nullptr ? candidate_rgb : adjusted_rgb).Get(), 3 * sizeof(float), accumulate_slot); structured_srv(feather_weight.Get(), sizeof(float), accumulate_slot + 1); structured_srv(pass == 0 ? zero_rgb.Get() : accumulator_rgb[(pass + 1) % 2].Get(), 3 * sizeof(float), accumulate_slot + 2); structured_srv(pass == 0 ? zero_weight.Get() : accumulator_weight[(pass + 1) % 2].Get(), sizeof(float), accumulate_slot + 3); device->CreateUnorderedAccessView(accumulator_rgb[pass % 2].Get(), nullptr, &rgb_uav, cpu(accumulate_slot + 4)); device->CreateUnorderedAccessView(accumulator_weight[pass % 2].Get(), nullptr, &weight_uav, cpu(accumulate_slot + 5));
         }
     }
     if (feather_mode) {
@@ -8370,7 +8378,7 @@ static pano_gpu_result dispatch_typed_hard_composite(
                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
             list->ResourceBarrier(2, writable_accumulators);
         }
-        const pano_gpu_one_frame_composite_request &frame = request->frame_requests[pass]; list->ClearUnorderedAccessViewUint(gpu(pass * 4 + 2), cpu(pass * 4 + 2), validity[pass].Get(), clear, 0, nullptr); D3D12_RESOURCE_BARRIER cleared_validity {}; cleared_validity.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; cleared_validity.UAV.pResource = validity[pass].Get(); list->ResourceBarrier(1, &cleared_validity);
+        const pano_gpu_one_frame_composite_request &frame = request->frame_requests[pass]; list->ClearUnorderedAccessViewUint(gpu(pass * 4 + 2), cpu(pass * 4 + 2), validity.Get(), clear, 0, nullptr); D3D12_RESOURCE_BARRIER cleared_validity {}; cleared_validity.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; cleared_validity.UAV.pResource = validity.Get(); list->ResourceBarrier(1, &cleared_validity);
         uint32_t constants[36] {frame.output_width, frame.output_height, frame.row_start, frame.row_count, session->source_width, session->source_height, session->source_row_stride_bytes / source_element_bytes, static_cast<uint32_t>(static_cast<uint64_t>(frame.frame_index) * session->source_frame_bytes / source_element_bytes)};
         std::memcpy(&constants[8], &frame.latitude_span_degrees, sizeof(float)); std::memcpy(&constants[12], frame.world_to_camera, 3 * sizeof(float)); std::memcpy(&constants[16], frame.world_to_camera + 3, 3 * sizeof(float)); std::memcpy(&constants[20], frame.world_to_camera + 6, 3 * sizeof(float));
         const float camera[4] {static_cast<float>(session->source_width), static_cast<float>(session->source_height), session->source_width / (2.0F * std::tan(frame.horizontal_fov_degrees * 0.00872664625997165F)), session->source_height / (2.0F * std::tan(frame.vertical_fov_degrees * 0.00872664625997165F))}; std::memcpy(&constants[24], camera, sizeof(camera));
@@ -8379,20 +8387,64 @@ static pano_gpu_result dispatch_typed_hard_composite(
         std::memcpy(&constants[32], &rectilinear_output, sizeof(rectilinear_output)); std::memcpy(&constants[33], &frame.output_vertical_fov_degrees, sizeof(frame.output_vertical_fov_degrees));
         constants[34] = session->transfer_function;
         list->SetPipelineState(candidate_pso.Get()); list->SetComputeRootSignature(candidate_root.Get()); list->SetComputeRoot32BitConstants(0, 36, constants, 0); list->SetComputeRootDescriptorTable(1, gpu(pass * 4)); list->Dispatch((frame.output_width + 7) / 8, (frame.row_count + 7) / 8, 1);
-        D3D12_RESOURCE_BARRIER bars[3] {}; ID3D12Resource *candidate_resources[] = {candidate_rgb[pass].Get(), validity[pass].Get(), edge[pass].Get()}; for (UINT i = 0; i < 3; ++i) { bars[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; bars[i].Transition.pResource = candidate_resources[i]; bars[i].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; bars[i].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE; bars[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; } list->ResourceBarrier(3, bars);
+        D3D12_RESOURCE_BARRIER bars[3] {}; ID3D12Resource *candidate_resources[] = {candidate_rgb.Get(), validity.Get(), edge.Get()}; for (UINT i = 0; i < 3; ++i) { bars[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; bars[i].Transition.pResource = candidate_resources[i]; bars[i].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; bars[i].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE; bars[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; } list->ResourceBarrier(3, bars);
         if (local_fields != nullptr) {
             const uint32_t local_constants[8] {frame.output_width, frame.output_height, frame.row_start, frame.row_count, local_field_width, local_field_height};
             list->SetPipelineState(local_pso.Get()); list->SetComputeRootSignature(local_root.Get()); list->SetComputeRoot32BitConstants(0, 8, local_constants, 0); list->SetComputeRootDescriptorTable(1, gpu(local_base + pass * 3)); list->Dispatch((pixels + 63) / 64, 1, 1);
-            D3D12_RESOURCE_BARRIER adjusted_barrier {}; adjusted_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; adjusted_barrier.Transition.pResource = adjusted_rgb[pass].Get(); adjusted_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; adjusted_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE; adjusted_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; list->ResourceBarrier(1, &adjusted_barrier);
+            D3D12_RESOURCE_BARRIER adjusted_barrier {}; adjusted_barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; adjusted_barrier.Transition.pResource = adjusted_rgb.Get(); adjusted_barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; adjusted_barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE; adjusted_barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; list->ResourceBarrier(1, &adjusted_barrier);
         }
         if (!feather_mode) {
             list->SetPipelineState(select_pso.Get()); list->SetComputeRootSignature(select_root.Get()); list->SetComputeRoot32BitConstants(0, 1, &pixels, 0); list->SetComputeRootDescriptorTable(1, gpu(select_base + pass * 8)); list->Dispatch((pixels + 63) / 64, 1, 1);
         } else {
             const uint32_t weight_constants[3] {pixels, session->source_width, session->source_height}; list->SetPipelineState(feather_weight_pso.Get()); list->SetComputeRootSignature(feather_weight_root.Get()); list->SetComputeRoot32BitConstants(0, 3, weight_constants, 0); list->SetComputeRootDescriptorTable(1, gpu(select_base + pass * 3)); list->Dispatch((pixels + 63) / 64, 1, 1);
-            D3D12_RESOURCE_BARRIER weight_ready {}; weight_ready.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; weight_ready.Transition = {feather_weight[pass].Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE}; list->ResourceBarrier(1, &weight_ready);
+            D3D12_RESOURCE_BARRIER weight_ready {}; weight_ready.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; weight_ready.Transition = {feather_weight.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE}; list->ResourceBarrier(1, &weight_ready);
             list->SetPipelineState(feather_accumulate_pso.Get()); list->SetComputeRootSignature(feather_accumulate_root.Get()); list->SetComputeRoot32BitConstants(0, 1, &pixels, 0); list->SetComputeRootDescriptorTable(1, gpu(feather_accumulate_base + pass * 6)); list->Dispatch((pixels + 63) / 64, 1, 1);
         }
-        if (pass + 1 < expected_frame_count) { D3D12_RESOURCE_BARRIER prior[5] {}; for (UINT i = 0; i < 2; ++i) { prior[i].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; prior[i].UAV.pResource = i == 0 ? accumulator_rgb[pass % 2].Get() : accumulator_weight[pass % 2].Get(); prior[i + 2].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; prior[i + 2].Transition.pResource = prior[i].UAV.pResource; prior[i + 2].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; prior[i + 2].Transition.StateAfter = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE; prior[i + 2].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; } prior[4].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; prior[4].UAV.pResource = coverage_resource.Get(); list->ResourceBarrier(feather_mode ? 4 : 5, prior); if (FAILED(list->Close())) { write_error(error_buffer, error_buffer_size, "cannot close D3D12 composite command list"); return PANO_GPU_UNAVAILABLE; } ID3D12CommandList *pass_lists[] = {list.Get()}; session->device_core->queue->ExecuteCommandLists(1, pass_lists); const uint64_t pass_fence = session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1; if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), pass_fence)) || wait_for_fence(session->device_core.get(), pass_fence, error_buffer, error_buffer_size, "D3D12 composite fence timed out") != PANO_GPU_SUCCESS || FAILED(allocator->Reset()) || FAILED(list->Reset(allocator.Get(), candidate_pso.Get()))) { write_error(error_buffer, error_buffer_size, "cannot restart D3D12 composite command list"); return PANO_GPU_UNAVAILABLE; } list->SetDescriptorHeaps(1, heaps); }
+        if (pass + 1 < expected_frame_count) {
+            std::array<D3D12_RESOURCE_BARRIER, 9> prior{};
+            UINT barrier_count = 0;
+            for (UINT i = 0; i < 2; ++i) {
+                ID3D12Resource *const accumulator =
+                    i == 0 ? accumulator_rgb[pass % 2].Get() : accumulator_weight[pass % 2].Get();
+                prior[barrier_count].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                prior[barrier_count++].UAV.pResource = accumulator;
+                prior[barrier_count].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                prior[barrier_count].Transition = {
+                    accumulator, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE};
+                ++barrier_count;
+            }
+            if (!feather_mode) {
+                prior[barrier_count].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV;
+                prior[barrier_count++].UAV.pResource = coverage_resource.Get();
+            }
+            for (ID3D12Resource *const resource : candidate_resources) {
+                prior[barrier_count].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                prior[barrier_count].Transition = {
+                    resource, D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+                ++barrier_count;
+            }
+            if (local_fields != nullptr) {
+                prior[barrier_count].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                prior[barrier_count].Transition = {
+                    adjusted_rgb.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+                ++barrier_count;
+            }
+            if (feather_mode) {
+                prior[barrier_count].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+                prior[barrier_count].Transition = {
+                    feather_weight.Get(), D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
+                    D3D12_RESOURCE_STATE_UNORDERED_ACCESS};
+                ++barrier_count;
+            }
+            list->ResourceBarrier(barrier_count, prior.data());
+        }
     }
     const UINT final_accumulator = (expected_frame_count - 1) % 2;
     if (feather_mode) {

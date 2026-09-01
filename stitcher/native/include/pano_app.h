@@ -63,6 +63,7 @@ struct RenderOptions {
   bool gpu_strict = false;
   bool allow_incomplete = false;
   bool auto_contrast = true;
+  double final_exposure_ev = 0.0;
   bool automatic_exposure = false;
   std::optional<unsigned> exposure_target;
   std::vector<unsigned> exposure_sources;
@@ -286,6 +287,7 @@ struct CpuSdrConversionRequest {
   CpuTransferFunction source_transfer = CpuTransferFunction::srgb;
   CpuColorPrimaries source_primaries = CpuColorPrimaries::srgb;
   float reference_white_nits = 100.0F;
+  float exposure_multiplier = 1.0F;
   bool apply_auto_contrast = false;
   CpuAutoContrastLevels levels;
 };
@@ -319,6 +321,11 @@ struct FrameSummary {
   std::optional<std::array<double, 9>> camera_basis_row_major;
 };
 
+struct SessionLocation {
+  std::array<double, 3> position{};
+  double yaw_deg = 0.0;
+};
+
 struct SessionSummary {
   unsigned schema_version = 0;
   std::string session_id;
@@ -327,6 +334,7 @@ struct SessionSummary {
   double horizontal_fov_deg = 0.0;
   double vertical_fov_deg = 0.0;
   double overlap_fraction = 0.0;
+  std::optional<SessionLocation> location;
   std::vector<FrameSummary> frames;
   bool completed = false;
   ImageEncoding image_encoding;
@@ -366,6 +374,7 @@ struct GuiRenderRequestState {
   bool gpu_strict = false;
   bool allow_incomplete = false;
   bool auto_contrast = true;
+  double final_exposure_ev = 0.0;
 };
 
 struct GuiOptionEnablement {
@@ -429,6 +438,7 @@ struct RenderPlan {
   bool gpu_strict = false;
   bool allow_incomplete = false;
   bool auto_contrast = true;
+  double final_exposure_ev = 0.0;
   bool automatic_exposure = false;
   std::optional<unsigned> exposure_target;
   std::vector<unsigned> exposure_sources;
@@ -731,6 +741,7 @@ bool solve_cpu_exposure_graph(unsigned frame_count,
 bool solve_reference_exposure_gains(
     unsigned frame_count, unsigned target,
     const std::vector<CpuExposureEquation> &equations,
+    unsigned measured_equation_count,
     const std::vector<float> &current_gains, std::vector<float> &gains,
     std::string &error);
 bool make_cpu_exposure_report(const CpuExposureSolveResult &solved,
@@ -786,12 +797,16 @@ bool discover_gui_sessions(const std::string &game_directory,
 GuiSessionStatus gui_session_status(const GuiSessionRecord &record,
                                     bool stitched) noexcept;
 std::string gui_session_local_label(const std::string &session_id);
+std::optional<std::string>
+gui_session_coordinates(const SessionSummary &session);
 std::uint64_t begin_gui_session_refresh(GuiRefreshState &state) noexcept;
 bool complete_gui_session_refresh(
     GuiRefreshState &state, std::uint64_t generation,
     std::vector<GuiSessionRecord> records) noexcept;
 GuiOptionEnablement
 gui_option_enablement(const GuiRenderRequestState &state) noexcept;
+std::optional<std::string>
+gui_output_format_from_filename(const std::string &filename);
 bool snapshot_gui_render_request(const GuiRenderRequestState &state,
                                  RenderOptions &options, std::string &error);
 std::uint64_t begin_gui_validation(GuiValidationState &state) noexcept;
@@ -886,6 +901,10 @@ bool render_native_session(NativePreview *preview,
 bool create_cpu_native_preview(const RenderPlan &plan,
                                const NativePreviewOptions &options,
                                CpuNativePreview **preview, std::string &error);
+bool rebuild_cpu_native_preview(CpuNativePreview *preview,
+                                const RenderPlan &plan,
+                                const NativePreviewOptions &options,
+                                std::string &error);
 bool query_cpu_native_preview(const CpuNativePreview *preview,
                               NativePreviewDiagnostics &diagnostics,
                               std::string &error);

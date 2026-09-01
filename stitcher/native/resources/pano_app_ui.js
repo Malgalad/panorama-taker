@@ -13,6 +13,7 @@
  * @property {string} tag User-assigned tag, or an empty string.
  * @property {SessionStatus} status
  * @property {string} detail Validation details, or an empty string.
+ * @property {boolean} hasCoordinates Whether the session has a saved location.
  */
 
 /**
@@ -599,6 +600,12 @@
             role: 'menu'
           }, () => {
             h(ActionsMenuItem, {
+              label: 'Copy coordinates',
+              focusTarget: 'copy-coordinates',
+              disabled: disabled || !session.hasCoordinates,
+              onClick: () => post('copy-session-coordinates', { index })
+            });
+            h(ActionsMenuItem, {
               label: 'Edit tag...',
               focusTarget: 'edit-tag',
               disabled,
@@ -882,7 +889,7 @@
           snapshot?.status ?? 'Loading application state...');
         h('button', {
           id: 'abort',
-          className: 'button sm',
+          className: 'button sm shrink-0',
           type: 'button',
           hidden: !busy,
           onClick: () => post('abort')
@@ -892,14 +899,14 @@
         if (output) {
           h('button', {
             id: 'render-thumbnail',
-            className: 'button primary',
+            className: 'button primary shrink-0',
             type: 'button',
             disabled: busy || !(snapshot?.renderEnabled ?? false),
             onClick: () => post('render-with-thumbnail')
           }, 'Render with thumbnail');
           h('button', {
             id: 'render',
-            className: 'button primary',
+            className: 'button primary shrink-0',
             type: 'button',
             disabled: busy || !(snapshot?.renderEnabled ?? false),
             onClick: () => post('render')
@@ -907,14 +914,14 @@
         } else {
           h('button', {
             id: 'options',
-            className: 'button',
+            className: 'button shrink-0',
             type: 'button',
             disabled: busy,
             onClick: () => post('open-options')
           }, () => h(Icon, { glyph: '\uE70F' }), ' Options');
           h('button', {
             id: 'primary',
-            className: 'button primary',
+            className: 'button primary shrink-0',
             type: 'button',
             disabled: preview ? !ready : !(snapshot?.previewEnabled ?? false),
             onClick: () => post(preview ? 'finalize' : 'start-preview')
@@ -1154,7 +1161,7 @@
       : [];
     const describedBy = modal?.kind === 'delete-session'
       ? 'modal-description modal-file-list'
-      : modal?.kind === 'overwrite-output' && description
+      : (modal?.kind === 'overwrite-output' || modal?.kind === 'notice') && description
         ? 'modal-description'
         : null;
     h('div', {
@@ -1182,7 +1189,7 @@
             h('ul', { id: 'modal-file-list' }, () => {
               deleteDescription.slice(1).forEach(path => h('li', {}, path));
             });
-          } else if (modal?.kind === 'overwrite-output') {
+          } else if (modal?.kind === 'overwrite-output' || modal?.kind === 'notice') {
             h('p', { id: 'modal-description' }, description);
           }
           if (modal?.kind === 'edit-tag') h(EditTagModal, { modal });

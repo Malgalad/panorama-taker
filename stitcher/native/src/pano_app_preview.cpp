@@ -514,9 +514,9 @@ bool plan_preview_memory(pano_gpu_device *device, const ImageInfo &source,
   request.preview_cache_bytes = preview_cache_bytes;
   request.session_workspace_bytes = rotation_bytes;
   request.output_workspace_bytes_per_pixel = std::max<std::uint64_t>(
-      62U + 21U * frame_count, needs_sdr_conversion ? 52U : 25U);
+      62U + 21U, needs_sdr_conversion ? 52U : 25U);
   request.output_workspace_fixed_bytes =
-      4096U * sizeof(std::uint32_t) + (4U * frame_count + 16U) * alignment;
+      4096U * sizeof(std::uint32_t) + 20U * alignment;
   request.upload_bytes = aligned_source_frame * 2U;
   request.readback_bytes_per_pixel = 12U;
   request.descriptor_count = frame_count + 4U;
@@ -601,12 +601,17 @@ bool compose_preview(pano_gpu_session *session, const RenderPlan &plan,
   ordered.abi_version = PANO_GPU_ABI_VERSION;
   ordered.frame_request_count = static_cast<std::uint32_t>(frames.size());
   ordered.frame_requests = frames.data();
+  std::vector<float> exposed_gains = gains;
+  const float exposure_multiplier =
+      static_cast<float>(std::exp2(plan.final_exposure_ev));
+  for (float &gain : exposed_gains)
+    gain *= exposure_multiplier;
   pano_gpu_composite_inputs inputs{};
   inputs.size = sizeof(inputs);
   inputs.abi_version = PANO_GPU_ABI_VERSION;
   inputs.mark_incomplete = plan.allow_incomplete ? 1U : 0U;
-  inputs.global_gains = gains.data();
-  inputs.global_gain_bytes = gains.size() * sizeof(float);
+  inputs.global_gains = exposed_gains.data();
+  inputs.global_gain_bytes = exposed_gains.size() * sizeof(float);
   const auto compose = [&]() {
     gpu_error.fill('\0');
     const auto result = plan.blend == "hard"
@@ -1028,22 +1033,46 @@ bool solve_automatic_exposure(NativePreview &preview, const unsigned target,
   if (!measure_exposure_graph(preview, options, error))
     return false;
   report_progress(options, 45U, "Propagating exposure");
+  std::array<char, 512> gpu_error{};
+  pano_gpu_exposure_graph_diagnostics diagnostics{};
+  diagnostics.size = sizeof(diagnostics);
+  diagnostics.abi_version = PANO_GPU_ABI_VERSION;
+  if (!gpu_ok(pano_gpu_session_build_exposure_solve_graph(
+                  preview.session, gpu_error.data(),
+                  static_cast<std::uint32_t>(gpu_error.size())),
+              gpu_error, "cannot build reference exposure graph", error) ||
+      !gpu_ok(pano_gpu_session_query_exposure_graph(
+                  preview.session, &diagnostics, gpu_error.data(),
+                  static_cast<std::uint32_t>(gpu_error.size())),
+              gpu_error, "cannot query reference exposure graph", error))
+    return false;
   try {
+    std::vector<pano_gpu_exposure_equation> solve_equations(
+        diagnostics.solve_equation_count);
+    if (!gpu_ok(pano_gpu_session_copy_exposure_solve_equations(
+                    preview.session, solve_equations.data(),
+                    solve_equations.size() * sizeof(pano_gpu_exposure_equation),
+                    gpu_error.data(),
+                    static_cast<std::uint32_t>(gpu_error.size())),
+                gpu_error, "cannot copy reference exposure graph", error))
+      return false;
     std::vector<CpuExposureEquation> equations;
-    equations.reserve(preview.exposure_equations.size());
-    for (const auto &equation : preview.exposure_equations)
+    equations.reserve(solve_equations.size());
+    for (const auto &equation : solve_equations)
       equations.push_back(CpuExposureEquation{
           equation.left_frame_index, equation.right_frame_index,
           equation.difference, equation.weight});
     if (!solve_reference_exposure_gains(preview.diagnostics.frame_count, target,
-                                        equations, preview.gains, gains, error))
+                                        equations,
+                                        static_cast<unsigned>(
+                                            preview.exposure_equations.size()),
+                                        preview.gains, gains, error))
       return false;
+    preview.exposure_edge_count = static_cast<unsigned>(equations.size());
   } catch (const std::bad_alloc &) {
     error = "cannot allocate native exposure solution";
     return false;
   }
-  preview.exposure_edge_count =
-      static_cast<unsigned>(preview.exposure_equations.size());
   return true;
 }
 
@@ -1257,12 +1286,22 @@ bool stream_gpu_output(NativePreview &preview, ImageWriter *writer,
   ordered.abi_version = PANO_GPU_ABI_VERSION;
   ordered.frame_request_count = static_cast<std::uint32_t>(frames.size());
   ordered.frame_requests = frames.data();
+  std::vector<float> exposed_gains;
+  const std::vector<float> *output_gains = &preview.gains;
+  if (sdr) {
+    exposed_gains = preview.gains;
+    const float exposure_multiplier =
+        static_cast<float>(std::exp2(preview.plan.final_exposure_ev));
+    for (float &gain : exposed_gains)
+      gain *= exposure_multiplier;
+    output_gains = &exposed_gains;
+  }
   pano_gpu_composite_inputs inputs{};
   inputs.size = sizeof(inputs);
   inputs.abi_version = PANO_GPU_ABI_VERSION;
   inputs.mark_incomplete = preview.plan.allow_incomplete ? 1U : 0U;
-  inputs.global_gains = preview.gains.data();
-  inputs.global_gain_bytes = preview.gains.size() * sizeof(float);
+  inputs.global_gains = output_gains->data();
+  inputs.global_gain_bytes = output_gains->size() * sizeof(float);
   const auto compose = [&]() {
     const auto result = preview.plan.blend == "hard"
                             ? pano_gpu_output_compose_hard_with_inputs(
@@ -1655,7 +1694,7 @@ bool render_native_session(NativePreview *const preview,
         container == ImageContainer::exr ? "float32" : "uint8";
     panorama_options.encoding =
         container == ImageContainer::exr
-            ? ImageEncoding{"float32", "rec2020", "linear",
+            ? ImageEncoding{"float16", "rec2020", "linear",
                             preview->source.encoding.reference_white_nits}
             : ImageEncoding{};
     panorama_options.jpeg_quality = preview->plan.jpeg_quality;

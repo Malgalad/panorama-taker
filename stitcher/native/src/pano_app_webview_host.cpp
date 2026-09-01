@@ -191,6 +191,24 @@ bool parse_webview_command_json(const std::string_view json,
     error.clear();
     return true;
   }
+  if (name == "set-final-exposure") {
+    yyjson_val *const value = yyjson_obj_get(root, "value");
+    const double exposure_ev = yyjson_is_num(value) ? yyjson_get_real(value)
+                                                     : 0.0;
+    if (!exact_object_shape(root,
+                            {"version", "kind", "pageGeneration", "value"}) ||
+        !yyjson_is_num(value) || !std::isfinite(exposure_ev) ||
+        exposure_ev < -2.0 || exposure_ev > 2.0 ||
+        std::fabs(exposure_ev * 10.0 - std::round(exposure_ev * 10.0)) >
+            1.0e-9) {
+      error = "invalid WebView final exposure command";
+      return false;
+    }
+    command.kind = WebViewCommandKind::set_final_exposure;
+    command.exposure_ev = exposure_ev;
+    error.clear();
+    return true;
+  }
   if (name == "hover-exposure-pose" || name == "set-exposure-reference" ||
       name == "toggle-exposure-selection") {
     if (!exact_object_shape(root,
@@ -311,8 +329,8 @@ bool parse_webview_command_json(const std::string_view json,
     error.clear();
     return true;
   }
-  if (name == "select-session" || name == "edit-tag" ||
-      name == "delete-session") {
+  if (name == "select-session" || name == "copy-session-coordinates" ||
+      name == "edit-tag" || name == "delete-session") {
     if (!exact_object_shape(root,
                             {"version", "kind", "pageGeneration", "index"})) {
       error = "unexpected WebView session command fields";
@@ -325,9 +343,13 @@ bool parse_webview_command_json(const std::string_view json,
       return false;
     }
     command.session_index = static_cast<std::size_t>(yyjson_get_uint(index));
-    command.kind = name == "select-session" ? WebViewCommandKind::select_session
-                   : name == "edit-tag"     ? WebViewCommandKind::edit_tag
-                                        : WebViewCommandKind::delete_session;
+    command.kind =
+        name == "select-session"
+            ? WebViewCommandKind::select_session
+        : name == "copy-session-coordinates"
+            ? WebViewCommandKind::copy_session_coordinates
+        : name == "edit-tag" ? WebViewCommandKind::edit_tag
+                              : WebViewCommandKind::delete_session;
     error.clear();
     return true;
   }

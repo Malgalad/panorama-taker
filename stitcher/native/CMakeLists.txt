@@ -602,7 +602,8 @@ if(BUILD_TESTING)
                          -P ${CMAKE_CURRENT_SOURCE_DIR}/cmake/RunGuiSelfTest.cmake)
     endif()
     add_executable(pano_app_contract_test tests/pano_app_contract_test.cpp)
-    target_link_libraries(pano_app_contract_test PRIVATE pano_app_core)
+    target_link_libraries(
+        pano_app_contract_test PRIVATE pano_app_core pano_app_codecs)
     target_compile_features(pano_app_contract_test PRIVATE cxx_std_17)
     target_compile_definitions(pano_app_contract_test
         PRIVATE PANO_APP_FIXTURE_DIR="${PANO_APP_FIXTURE_DIR}"

@@ -34,6 +34,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -106,6 +107,7 @@ struct GuiShellState {
   std::string application_settings_path;
   bool persistence_enabled = false;
   bool settings_loaded = false;
+  bool headless = false;
   bool self_test_allows_warp = false;
   std::unique_ptr<GuiRuntimeState> runtime;
   std::unique_ptr<pano::app::WebViewHost> webview;
@@ -154,6 +156,7 @@ struct GuiShellState {
   HWND exposure_window = nullptr;
   bool exposure_overlay_boundaries = false;
   bool exposure_edits_applied = false;
+  double final_exposure_ev = 0.0;
   unsigned operation_progress_percent = 0U;
   unsigned output_width = 0U;
   unsigned output_height = 0U;
@@ -219,6 +222,8 @@ struct ExposureResult {
 struct RenderResult {
   std::uint64_t generation = 0;
   std::uint64_t operation_generation = 0;
+  std::string session_id;
+  std::string panorama_path;
   pano::app::NativeRenderResult render;
   bool cpu = false;
   bool succeeded = false;
@@ -581,6 +586,7 @@ bool capture_gui_request(pano::app::GuiRenderRequestState &request,
   captured.coverage = shell->debug_coverage;
   captured.allow_incomplete = shell->allow_incomplete;
   captured.auto_contrast = shell->auto_contrast;
+  captured.final_exposure_ev = shell->final_exposure_ev;
   captured.gpu = shell->use_gpu;
   if (shell->use_gpu)
     captured.gpu_memory_mib = shell->gpu_memory_mib;
@@ -609,6 +615,50 @@ void select_output_format(const HWND window, const int selection) {
   shell->output_name = name.wstring();
   update_option_enablement();
   schedule_validation(window, false);
+}
+
+bool copy_text_to_clipboard(const HWND owner, const std::wstring_view text,
+                            std::wstring &error) {
+  if (text.empty() ||
+      text.size() > std::numeric_limits<SIZE_T>::max() / sizeof(wchar_t) - 1U) {
+    error = L"Coordinates are too large for the clipboard";
+    return false;
+  }
+  const SIZE_T bytes = (text.size() + 1U) * sizeof(wchar_t);
+  HGLOBAL memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+  if (memory == nullptr) {
+    error = L"Cannot allocate clipboard text";
+    return false;
+  }
+  auto *const destination = static_cast<wchar_t *>(GlobalLock(memory));
+  if (destination == nullptr) {
+    GlobalFree(memory);
+    error = L"Cannot prepare clipboard text";
+    return false;
+  }
+  std::copy(text.begin(), text.end(), destination);
+  destination[text.size()] = L'\0';
+  GlobalUnlock(memory);
+  if (!OpenClipboard(owner)) {
+    GlobalFree(memory);
+    error = L"Cannot open the clipboard";
+    return false;
+  }
+  if (!EmptyClipboard()) {
+    CloseClipboard();
+    GlobalFree(memory);
+    error = L"Cannot clear the clipboard";
+    return false;
+  }
+  if (SetClipboardData(CF_UNICODETEXT, memory) == nullptr) {
+    CloseClipboard();
+    GlobalFree(memory);
+    error = L"Cannot copy coordinates to the clipboard";
+    return false;
+  }
+  CloseClipboard();
+  error.clear();
+  return true;
 }
 
 std::optional<std::wstring> choose_path(const HWND owner, const bool folder) {
@@ -723,6 +773,10 @@ bool update_preview_surface() {
     runtime_state().d3d12_error = error.data();
     return false;
   }
+  if (runtime_state().active_preview_owner != nullptr) {
+    runtime_state().d3d12_error.clear();
+    return true;
+  }
   constexpr float background[4]{0.035F, 0.035F, 0.045F, 1.0F};
   const bool presented =
       pano_gpu_preview_surface_clear_present(
@@ -809,6 +863,30 @@ bool present_preview_view() {
   if (runtime_state().preview_surface == nullptr ||
       runtime_state().active_preview == nullptr)
     return true;
+  const auto *const shell = shell_state(
+      runtime_state().refresh_window.load(std::memory_order_acquire));
+  const bool exposure_open = shell != nullptr &&
+                             shell->exposure_window != nullptr &&
+                             IsWindowVisible(shell->exposure_window);
+  if (!exposure_open) {
+    std::fill(runtime_state().preview_hovered.begin(),
+              runtime_state().preview_hovered.end(), std::uint8_t{0});
+    pano_gpu_preview_surface_present_request request{};
+    request.size = sizeof(request);
+    request.abi_version = PANO_GPU_ABI_VERSION;
+    request.use_overview = runtime_state().preview_view.overview ? 1U : 0U;
+    if (!runtime_state().preview_view.overview) {
+      request.crop_left = runtime_state().preview_view.crop.left;
+      request.crop_top = runtime_state().preview_view.crop.top;
+      request.crop_width = runtime_state().preview_view.crop.width;
+      request.crop_height = runtime_state().preview_view.crop.height;
+    }
+    std::array<char, 512> error{};
+    return pano_gpu_preview_surface_present_base(
+               runtime_state().preview_surface, runtime_state().active_preview,
+               &request, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS;
+  }
   pano_gpu_preview_surface_overlay_request request{};
   request.size = sizeof(request);
   request.abi_version = PANO_GPU_ABI_VERSION;
@@ -819,14 +897,6 @@ bool present_preview_view() {
     request.crop_width = runtime_state().preview_view.crop.width;
     request.crop_height = runtime_state().preview_view.crop.height;
   }
-  const auto *const shell = shell_state(
-      runtime_state().refresh_window.load(std::memory_order_acquire));
-  const bool exposure_open = shell != nullptr &&
-                             shell->exposure_window != nullptr &&
-                             IsWindowVisible(shell->exposure_window);
-  if (!exposure_open)
-    std::fill(runtime_state().preview_hovered.begin(),
-              runtime_state().preview_hovered.end(), std::uint8_t{0});
   request.target_pose =
       runtime_state().exposure_target.has_value()
           ? static_cast<std::int32_t>(*runtime_state().exposure_target)
@@ -880,9 +950,12 @@ void navigate_stage(const HWND window, const pano::app::GuiStage stage) {
 pano::app::GuiPresentationState
 gui_presentation(const GuiShellState &shell) noexcept {
   return pano::app::derive_gui_presentation(
-      shell.workflow, runtime_state().active_preview_owner != nullptr,
+      shell.workflow,
+      runtime_state().active_preview_owner != nullptr ||
+          runtime_state().active_cpu_preview_owner != nullptr,
       runtime_state().exposure_target.has_value(),
-      !runtime_state().exposure_selected.empty(), shell.exposure_edits_applied,
+      !runtime_state().exposure_selected.empty(),
+      shell.exposure_edits_applied || shell.final_exposure_ev != 0.0,
       shell.operation_progress_percent, shell.final_render_complete);
 }
 
@@ -960,7 +1033,10 @@ void end_operation_progress(const HWND window) {
     application_state().taskbar->SetProgressState(window, TBPF_NOPROGRESS);
 }
 
-void notify_operation_complete() { MessageBeep(MB_OK); }
+void notify_operation_complete() {
+  if (!application_state().headless)
+    MessageBeep(MB_OK);
+}
 
 void report_preview_progress(void *, const unsigned completed,
                              const unsigned total, const char *const phase) {
@@ -1103,9 +1179,15 @@ void start_preview() {
     report_application_error(L"Preview", L"Preview surface has no usable size");
     return;
   }
-  const bool d3d12_available = plan.use_gpu && update_preview_surface();
-  const auto backend = pano::app::select_gui_backend(
-      plan.use_gpu, plan.gpu_strict, d3d12_available, true);
+  const bool retaining_cpu =
+      runtime_state().active_cpu_preview_owner != nullptr;
+  const bool d3d12_available =
+      !retaining_cpu && plan.use_gpu && update_preview_surface();
+  const auto backend =
+      retaining_cpu
+          ? application_state().backend
+          : pano::app::select_gui_backend(plan.use_gpu, plan.gpu_strict,
+                                          d3d12_available, true);
   if (backend == pano::app::GuiBackendDecision::strict_d3d12_rejection) {
     report_application_error(
         L"Preview", utf8_to_wide(runtime_state().d3d12_error.empty()
@@ -1127,12 +1209,17 @@ void start_preview() {
   if (!begin_owned_operation(pano::app::GuiOperation::preview,
                              operation_generation))
     return;
-  const bool reuse = !cpu && runtime_state().active_preview_owner != nullptr;
+  const bool reuse =
+      cpu ? runtime_state().active_cpu_preview_owner != nullptr
+          : runtime_state().active_preview_owner != nullptr;
   auto *const retained_owner = runtime_state().active_preview_owner;
+  auto *const retained_cpu_owner = runtime_state().active_cpu_preview_owner;
   if (!reuse) {
     discard_active_preview();
   } else {
     runtime_state().active_preview = nullptr;
+    if (cpu)
+      runtime_state().active_cpu_preview_owner = nullptr;
     if (auto *const shell = shell_state(
             runtime_state().refresh_window.load(std::memory_order_acquire));
         shell != nullptr)
@@ -1156,6 +1243,8 @@ void start_preview() {
   result->backend = backend;
   result->reused = reuse;
   result->retained_owner_in_worker = reuse;
+  if (cpu && reuse)
+    result->cpu_preview = retained_cpu_owner;
   runtime_state().preview_building = true;
   set_cancel_enabled(true);
   set_status_text(cpu ? L"Building CPU preview..."
@@ -1174,7 +1263,10 @@ void start_preview() {
           options.viewport_width = viewport_width;
           options.gpu_cancellation = runtime_state().preview_cancellation;
           options.progress = report_preview_progress;
-          if (cpu) {
+          if (cpu && result->reused) {
+            result->succeeded = pano::app::rebuild_cpu_native_preview(
+                result->cpu_preview, plan, options, result->error);
+          } else if (cpu) {
             result->succeeded = pano::app::create_cpu_native_preview(
                 plan, options, &result->cpu_preview, result->error);
           } else if (result->reused) {
@@ -1207,7 +1299,7 @@ void start_preview() {
         });
   } catch (...) {
     runtime_state().preview_building = false;
-    if (reuse) {
+    if (reuse && !cpu) {
       runtime_state().active_preview = pano::app::native_preview_handle(
           runtime_state().active_preview_owner);
       if (auto *const shell = shell_state(
@@ -1242,8 +1334,13 @@ void apply_preview_results() {
         (cpu ? result->cpu_preview == nullptr : result->preview == nullptr);
     if (!result->succeeded || missing_preview) {
       if (result->reused) {
-        runtime_state().active_preview = pano::app::native_preview_handle(
-            runtime_state().active_preview_owner);
+        if (cpu) {
+          runtime_state().active_cpu_preview_owner = result->cpu_preview;
+          result->cpu_preview = nullptr;
+        } else {
+          runtime_state().active_preview = pano::app::native_preview_handle(
+              runtime_state().active_preview_owner);
+        }
         const HWND window =
             runtime_state().refresh_window.load(std::memory_order_acquire);
         if (auto *const shell =
@@ -1276,18 +1373,18 @@ void apply_preview_results() {
       report_application_error(L"Preview", utf8_to_wide(result->error));
       continue;
     }
-    if (!result->reused) {
-      if (cpu) {
+    if (cpu) {
+      if (!result->reused) {
         pano_gpu_preview_surface_destroy(&runtime_state().preview_surface);
         pano_gpu_device_destroy(&runtime_state().preview_device);
         pano::app::destroy_native_preview(
             &runtime_state().active_preview_owner);
-        runtime_state().active_cpu_preview_owner = result->cpu_preview;
-        result->cpu_preview = nullptr;
-      } else {
-        runtime_state().active_preview_owner = result->preview;
-        result->preview = nullptr;
       }
+      runtime_state().active_cpu_preview_owner = result->cpu_preview;
+      result->cpu_preview = nullptr;
+    } else if (!result->reused) {
+      runtime_state().active_preview_owner = result->preview;
+      result->preview = nullptr;
     }
     runtime_state().active_preview =
         cpu ? nullptr
@@ -1479,7 +1576,11 @@ void apply_exposure_results() {
       if (window != nullptr)
         layout_controls(window);
       complete_owned_operation(result->operation_generation);
-      report_application_error(L"Exposure", utf8_to_wide(result->error));
+      report_application_error(
+          result->command == ExposureCommand::automatic
+              ? L"Automatic exposure"
+              : L"Exposure",
+          utf8_to_wide(result->error));
       if (!update_preview_surface() || !present_preview_view())
         discard_active_preview();
       continue;
@@ -1837,6 +1938,10 @@ void apply_session_selection(const HWND window, const std::size_t index) {
         record.session.session_id);
     if (stitched_name.has_value()) {
       shell->output_name = utf8_to_wide(*stitched_name);
+      if (const auto format =
+              pano::app::gui_output_format_from_filename(*stitched_name);
+          format.has_value())
+        shell->output_format = *format;
     } else {
       const std::string extension = shell->output_format == "jpeg"
                                         ? ".jpg"
@@ -2063,6 +2168,10 @@ void start_render() {
   auto result = std::make_unique<RenderResult>();
   result->generation = generation;
   result->operation_generation = operation_generation;
+  result->session_id =
+      runtime_state().validation_state.plan->session.session_id;
+  result->panorama_path =
+      runtime_state().validation_state.plan->outputs.panorama.final_path;
   result->cpu = runtime_state().active_cpu_preview_owner != nullptr;
   auto *const owner = runtime_state().active_preview_owner;
   auto *const cpu_owner = runtime_state().active_cpu_preview_owner;
@@ -2179,26 +2288,20 @@ void apply_render_results() {
         L"Published " + std::to_wstring(result->render.published_paths.size()) +
         L" output file(s)";
     set_status_text(status);
-    if (runtime_state().validation_state.plan.has_value() &&
-        !result->render.published_paths.empty()) {
-      const auto &panorama_path =
-          runtime_state().validation_state.plan->outputs.panorama.final_path;
+    if (!result->render.published_paths.empty()) {
       const auto published = std::find(result->render.published_paths.begin(),
                                        result->render.published_paths.end(),
-                                       panorama_path);
+                                       result->panorama_path);
       if (published == result->render.published_paths.end()) {
         report_application_error(L"Render",
                                  L"Published output omitted the panorama");
         continue;
       }
       const std::string output_name =
-          std::filesystem::u8path(*published)
-              .filename()
-              .u8string();
+          std::filesystem::u8path(*published).filename().u8string();
       pano::app::mark_application_session_stitched(
           application_state().application_settings,
-          wide_to_utf8(application_state().game_directory),
-          runtime_state().validation_state.plan->session.session_id,
+          wide_to_utf8(application_state().game_directory), result->session_id,
           output_name);
       save_gui_settings();
     }
@@ -2891,7 +2994,9 @@ void sync_webview_snapshot(const HWND window) {
        << (presentation.preview_ready ? L"true" : L"false")
        << L",\"exposureOpen\":" << (shell->exposure_open ? L"true" : L"false")
        << L",\"exposureAdjusted\":"
-       << (shell->exposure_edits_applied ? L"true" : L"false")
+       << (shell->exposure_edits_applied || shell->final_exposure_ev != 0.0
+               ? L"true"
+               : L"false")
        << L",\"previewProgress\":" << presentation.preview_progress
        << L",\"previewMessage\":"
        << json_string(presentation.busy && !presentation.rendering
@@ -2959,7 +3064,9 @@ void sync_webview_snapshot(const HWND window) {
          << L",\"poses\":" << record.session.frames.size() << L",\"tag\":"
          << json_string(utf8_to_wide(tag.value_or(""))) << L",\"status\":"
          << json_string(session_status_name(status)) << L",\"detail\":"
-         << json_string(utf8_to_wide(record.error)) << L'}';
+         << json_string(utf8_to_wide(record.error))
+         << L",\"hasCoordinates\":"
+         << (record.session.location.has_value() ? L"true" : L"false") << L'}';
   }
   json << L"]}";
   std::wstring error;
@@ -2991,7 +3098,8 @@ void sync_exposure_webview_snapshot(const HWND window) {
       json << L',';
     json << runtime_state().exposure_selected[index];
   }
-  json << L"],\"poseCount\":" << runtime_state().preview_hovered.size() << L'}';
+  json << L"],\"poseCount\":" << runtime_state().preview_hovered.size()
+       << L",\"finalExposure\":" << shell->final_exposure_ev << L'}';
   std::wstring error;
   if (!shell->exposure_webview->post_snapshot(json.str(), error) &&
       !error.empty())
@@ -3041,6 +3149,17 @@ void handle_exposure_webview_command(const HWND window,
   case pano::app::WebViewCommandKind::toggle_exposure_selection:
     if (valid_pose(command.pose_index))
       toggle_exposure_manual_pose(*command.pose_index);
+    break;
+  case pano::app::WebViewCommandKind::set_final_exposure:
+    if (command.exposure_ev.has_value() && !runtime_state().preview_building &&
+        shell->final_exposure_ev != *command.exposure_ev) {
+      shell->final_exposure_ev = *command.exposure_ev;
+      if (runtime_state().validation_state.plan.has_value()) {
+        runtime_state().validation_state.plan->final_exposure_ev =
+            *command.exposure_ev;
+        start_preview();
+      }
+    }
     break;
   case pano::app::WebViewCommandKind::reset_exposure:
     if (!runtime_state().preview_building) {
@@ -3118,6 +3237,24 @@ void handle_webview_command(const HWND window,
   case pano::app::WebViewCommandKind::select_session:
     if (command.session_index.has_value())
       apply_session_selection(window, *command.session_index);
+    break;
+  case pano::app::WebViewCommandKind::copy_session_coordinates:
+    if (command.session_index.has_value() &&
+        *command.session_index < runtime_state().refresh_state.records.size()) {
+      const auto coordinates = pano::app::gui_session_coordinates(
+          runtime_state().refresh_state.records[*command.session_index].session);
+      if (!coordinates.has_value()) {
+        report_application_error(L"Copy coordinates",
+                                 L"Session coordinates are unavailable");
+      } else {
+        std::wstring clipboard_error;
+        if (copy_text_to_clipboard(window, utf8_to_wide(*coordinates),
+                                   clipboard_error))
+          set_status_text(L"Coordinates copied to clipboard");
+        else
+          report_application_error(L"Copy coordinates", clipboard_error);
+      }
+    }
     break;
   case pano::app::WebViewCommandKind::edit_tag:
     if (command.session_index.has_value())
@@ -3201,6 +3338,7 @@ void handle_webview_command(const HWND window,
   case pano::app::WebViewCommandKind::clear_exposure_hover:
   case pano::app::WebViewCommandKind::set_exposure_reference:
   case pano::app::WebViewCommandKind::toggle_exposure_selection:
+  case pano::app::WebViewCommandKind::set_final_exposure:
   case pano::app::WebViewCommandKind::reset_exposure:
   case pano::app::WebViewCommandKind::equalize_exposure:
     return;
@@ -3701,7 +3839,8 @@ int webview_self_test(const HINSTANCE instance, GuiShellState &shell,
       wide_to_utf8(application_state().game_directory), plan.session.session_id,
       "custom-history.png");
   apply_session_selection(window, 0U);
-  if (shell.output_name != L"custom-history.png")
+  if (shell.output_name != L"custom-history.png" ||
+      shell.output_format != "png")
     return fail(65);
   if (!open_webview_edit_tag(shell, 0U) ||
       !shell.webview_modal.payload.description.empty())
@@ -3772,6 +3911,31 @@ int webview_self_test(const HINSTANCE instance, GuiShellState &shell,
                 shell.backend == pano::app::GuiBackendDecision::d3d12;
   if (!correct_backend || !present_preview_view())
     return fail(56);
+  if (!forced_cpu) {
+    pano_gpu_preview_surface_diagnostics before_update{};
+    before_update.size = sizeof(before_update);
+    before_update.abi_version = PANO_GPU_ABI_VERSION;
+    pano_gpu_preview_surface_diagnostics after_update = before_update;
+    std::array<char, 512> surface_error{};
+    auto *const active_preview = runtime_state().active_preview;
+    runtime_state().active_preview = nullptr;
+    const bool retained_update_preserved_surface =
+        pano_gpu_preview_surface_query_diagnostics(
+            runtime_state().preview_surface, &before_update,
+            surface_error.data(),
+            static_cast<std::uint32_t>(surface_error.size())) ==
+            PANO_GPU_SUCCESS &&
+        update_preview_surface() &&
+        pano_gpu_preview_surface_query_diagnostics(
+            runtime_state().preview_surface, &after_update,
+            surface_error.data(),
+            static_cast<std::uint32_t>(surface_error.size())) ==
+            PANO_GPU_SUCCESS &&
+        after_update.present_count == before_update.present_count;
+    runtime_state().active_preview = active_preview;
+    if (!retained_update_preserved_surface)
+      return fail(77);
+  }
   if (runtime_state().preview_hovered.size() != 2U ||
       !set_exposure_reference_pose(0U))
     return fail(68);
@@ -3786,9 +3950,23 @@ int webview_self_test(const HINSTANCE instance, GuiShellState &shell,
   if (!pump_until([] { return !runtime_state().preview_building; }) ||
       shell.exposure_edits_applied)
     return fail(70);
+  exposure_command.kind = pano::app::WebViewCommandKind::set_final_exposure;
+  exposure_command.exposure_ev = -1.6;
+  handle_exposure_webview_command(window, exposure_command);
+  if (shell.final_exposure_ev != -1.6 ||
+      !runtime_state().validation_state.plan.has_value() ||
+      runtime_state().validation_state.plan->final_exposure_ev != -1.6 ||
+      !pump_until([] { return !runtime_state().preview_building; }) ||
+      shell.final_exposure_ev != -1.6 || !retained_preview_ready() ||
+      !shell.workflow.preview_ready)
+    return fail(76);
+  auto overlay_frames = std::move(runtime_state().preview_overlay_frames);
   SendMessageW(application_state().controls.preview_surface, WM_MOUSEMOVE, 0,
                MAKELPARAM(2, 1));
-  if (runtime_state().preview_view.overview || !present_preview_view())
+  const bool magnified_without_exposure_overlay =
+      !runtime_state().preview_view.overview && present_preview_view();
+  runtime_state().preview_overlay_frames = std::move(overlay_frames);
+  if (!magnified_without_exposure_overlay)
     return fail(57);
 
   command.kind = pano::app::WebViewCommandKind::finalize_preview;
@@ -3917,6 +4095,7 @@ int WINAPI wWinMain(const HINSTANCE instance, HINSTANCE, PWSTR,
     return 22;
   GuiShellState shell;
   shell.runtime = std::make_unique<GuiRuntimeState>();
+  shell.headless = self_test_requested;
   shell.use_gpu = !no_gpu_requested;
   active_application_state = &shell;
   if (self_test_requested) {

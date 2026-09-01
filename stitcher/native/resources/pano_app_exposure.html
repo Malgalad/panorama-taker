@@ -19,6 +19,11 @@
       <button id="reset" class="button" type="button">Reset</button>
       <button id="equalize" class="button primary" type="button">Equalize all</button>
     </div>
+    <hr class="border-gray-500">
+    <label class="flex items-center gap-3">Exposure:
+      <input id="final-exposure" class="input-range flex-1" type="range" min="-2" max="2" step="0.1" value="0">
+      <span id="final-exposure-value" class="w-16 text-cyan-300">0.0 EV</span>
+    </label>
   </main>
   <script src="pano_app_exposure.js"></script>
 </body>

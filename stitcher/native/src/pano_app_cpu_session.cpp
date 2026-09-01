@@ -393,7 +393,8 @@ bool plan_band_height(const ImageInfo &source, const unsigned width,
   return true;
 }
 
-bool make_conversion_request(const ImageInfo &source, const bool contrast,
+bool make_conversion_request(const ImageInfo &source, const double exposure_ev,
+                             const bool contrast,
                              const CpuAutoContrastLevels &levels,
                              const unsigned pixels,
                              CpuSdrConversionRequest &request) {
@@ -402,6 +403,7 @@ bool make_conversion_request(const ImageInfo &source, const bool contrast,
   request.source_primaries = primaries(source.encoding);
   request.reference_white_nits =
       static_cast<float>(source.encoding.reference_white_nits);
+  request.exposure_multiplier = static_cast<float>(std::exp2(exposure_ev));
   request.apply_auto_contrast = contrast;
   request.levels = levels;
   return true;
@@ -417,6 +419,7 @@ public:
   std::vector<std::uint8_t> pixels;
   std::vector<float> gains;
   std::vector<CpuExposureEquation> exposure_equations;
+  unsigned measured_exposure_edge_count = 0U;
   bool exposure_graph_measured = false;
 };
 
@@ -445,7 +448,8 @@ bool recompose_cpu_preview(CpuNativePreview &preview,
   CpuSdrConversionRequest conversion;
   const unsigned pixel_count = preview.diagnostics.preview_width *
                                preview.diagnostics.preview_height;
-  make_conversion_request(preview.source, false, levels, pixel_count,
+  make_conversion_request(preview.source, preview.plan.final_exposure_ev, false,
+                          levels, pixel_count,
                           conversion);
   if (preview.plan.auto_contrast) {
     std::array<std::uint64_t, 4096> histogram{};
@@ -601,6 +605,12 @@ bool measure_cpu_exposure_graph(CpuNativePreview &preview,
             frame_count, measurements.data(), enumerated,
             preview.exposure_equations, error))
       return false;
+    preview.measured_exposure_edge_count = static_cast<unsigned>(std::count_if(
+        measurements.begin(), measurements.end(),
+        [](const CpuExposurePairMeasurement &measurement) {
+          return measurement.reduction.rejection ==
+                 CpuExposurePairRejection::accepted;
+        }));
     preview.exposure_graph_measured = true;
     preview_progress(options, 40U, "Exposure samples ready");
     return true;
@@ -654,8 +664,8 @@ bool create_cpu_native_preview(const RenderPlan &plan,
       return false;
     CpuAutoContrastLevels levels;
     CpuSdrConversionRequest conversion;
-    make_conversion_request(owner->source, false, levels, width * height,
-                            conversion);
+    make_conversion_request(owner->source, plan.final_exposure_ev, false,
+                            levels, width * height, conversion);
     if (plan.auto_contrast) {
       std::array<std::uint64_t, 4096> histogram{};
       if (!accumulate_cpu_auto_contrast_histogram(conversion, band.color.data(),
@@ -691,6 +701,31 @@ bool create_cpu_native_preview(const RenderPlan &plan,
     return true;
   } catch (const std::bad_alloc &) {
     error = "cannot allocate CPU preview";
+    return false;
+  }
+}
+
+bool rebuild_cpu_native_preview(CpuNativePreview *const preview,
+                                const RenderPlan &plan,
+                                const NativePreviewOptions &options,
+                                std::string &error) {
+  if (preview == nullptr || preview->pixels.empty()) {
+    error = "CPU preview is not available";
+    return false;
+  }
+  try {
+    RenderPlan previous = preview->plan;
+    if (!update_cpu_native_preview_render_plan(preview, plan, error))
+      return false;
+    NativeExposureResult rebuilt;
+    if (!recompose_cpu_preview(*preview, preview->gains, options, rebuilt,
+                               error)) {
+      preview->plan = std::move(previous);
+      return false;
+    }
+    return true;
+  } catch (const std::bad_alloc &) {
+    error = "cannot rebuild CPU preview";
     return false;
   }
 }
@@ -744,7 +779,8 @@ bool apply_cpu_native_automatic_exposure(
   std::vector<float> gains;
   if (!solve_reference_exposure_gains(
           preview->diagnostics.frame_count, target,
-          preview->exposure_equations, preview->gains, gains, error) ||
+          preview->exposure_equations, preview->measured_exposure_edge_count,
+          preview->gains, gains, error) ||
       !recompose_cpu_preview(*preview, gains, options, result, error))
     return false;
   result.anchor_frame = target;
@@ -769,7 +805,9 @@ bool apply_cpu_native_manual_exposure_match(
   try {
     std::vector<double> shifts;
     for (const unsigned selected_frame : selected) {
-      for (const auto &equation : preview->exposure_equations) {
+      for (unsigned index = 0; index < preview->measured_exposure_edge_count;
+           ++index) {
+        const auto &equation = preview->exposure_equations[index];
         double raw_shift = 0.0;
         if (equation.left == target && equation.right == selected_frame)
           raw_shift = equation.difference;
@@ -863,7 +901,7 @@ bool render_cpu_target(CpuNativePreview &preview, const OutputTarget &target,
       container == ImageContainer::exr ? "float32" : "uint8";
   writer_options.encoding =
       container == ImageContainer::exr
-          ? ImageEncoding{"float32", "rec2020", "linear",
+          ? ImageEncoding{"float16", "rec2020", "linear",
                           preview.source.encoding.reference_white_nits}
           : ImageEncoding{};
   writer_options.jpeg_quality = preview.plan.jpeg_quality;
@@ -900,8 +938,8 @@ bool render_cpu_target(CpuNativePreview &preview, const OutputTarget &target,
                         cancellation, band, error))
         return false;
       CpuSdrConversionRequest conversion;
-      make_conversion_request(preview.source, false, levels, width * rows,
-                              conversion);
+      make_conversion_request(preview.source, preview.plan.final_exposure_ev,
+                              false, levels, width * rows, conversion);
       if (!accumulate_cpu_auto_contrast_histogram(conversion, band.color.data(),
                                                   band.coverage.data(),
                                                   histogram, error))
@@ -923,8 +961,8 @@ bool render_cpu_target(CpuNativePreview &preview, const OutputTarget &target,
                       cancellation, band, error))
       return false;
     CpuSdrConversionRequest conversion;
-    make_conversion_request(preview.source, auto_contrast, levels, width * rows,
-                            conversion);
+    make_conversion_request(preview.source, preview.plan.final_exposure_ev,
+                            auto_contrast, levels, width * rows, conversion);
     std::vector<std::uint8_t> scratch;
     if (sdr)
       scratch.resize(static_cast<std::size_t>(width) * rows * 3U);

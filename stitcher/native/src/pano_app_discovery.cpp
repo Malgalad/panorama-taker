@@ -5,6 +5,7 @@
 #include <ctime>
 #include <filesystem>
 #include <iomanip>
+#include <locale>
 #include <sstream>
 #include <unordered_set>
 
@@ -125,6 +126,19 @@ std::string gui_session_local_label(const std::string &session_id) {
   if (separator != std::string::npos)
     label << "  #" << session_id.substr(separator + 1U);
   return label.str();
+}
+
+std::optional<std::string>
+gui_session_coordinates(const SessionSummary &session) {
+  if (!session.location.has_value())
+    return std::nullopt;
+  std::ostringstream coordinates;
+  coordinates.imbue(std::locale::classic());
+  coordinates << std::fixed << std::setprecision(9)
+              << session.location->position[0] << ", "
+              << session.location->position[1] << ", "
+              << session.location->position[2];
+  return coordinates.str();
 }
 
 std::uint64_t begin_gui_session_refresh(GuiRefreshState &state) noexcept {

@@ -1243,6 +1243,8 @@ PANO_GPU_API pano_gpu_result pano_gpu_test_read_preview_surface(
     uint64_t rgba8_bytes,
     char *error_buffer,
     uint32_t error_buffer_size) PANO_GPU_NOEXCEPT;
+PANO_GPU_API uint64_t pano_gpu_test_preview_surface_sdr_color_space_set_count(
+    const pano_gpu_preview_surface *surface) PANO_GPU_NOEXCEPT;
 PANO_GPU_API void pano_gpu_test_fail_next_preview_surface_device_removed(
     void) PANO_GPU_NOEXCEPT;
 PANO_GPU_API pano_gpu_result pano_gpu_test_validate_projection_request(

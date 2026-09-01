@@ -232,6 +232,7 @@ bool create_image_writer(const ImageWriterOptions &options,
                   options.encoding.transfer_function != "srgb")) ||
       (is_exr &&
        (options.channels != 3U || options.sample_type != "float32" ||
+        options.encoding.sample_type != "float16" ||
         options.encoding.color_primaries != "rec2020" ||
         options.encoding.transfer_function != "linear" ||
         options.width >
@@ -270,7 +271,7 @@ bool create_image_writer(const ImageWriterOptions &options,
       for (const char *name : {"R", "G", "B"})
         if (result == EXR_ERR_SUCCESS)
           result = exr_add_channel(created->exr_context, part_index, name,
-                                   EXR_PIXEL_FLOAT,
+                                   EXR_PIXEL_HALF,
                                    EXR_PERCEPTUALLY_LOGARITHMIC, 1, 1);
       if (result == EXR_ERR_SUCCESS)
         result = exr_write_header(created->exr_context);

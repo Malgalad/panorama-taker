@@ -32,13 +32,15 @@ int main() {
           Domain::host,        Domain::directories, Domain::directories,
           Domain::directories, Domain::directories, Domain::directories,
           Domain::directories, Domain::sessions,    Domain::sessions,
-          Domain::sessions,    Domain::sessions,    Domain::navigation,
+          Domain::sessions,    Domain::sessions,    Domain::sessions,
+          Domain::navigation,
           Domain::navigation,  Domain::navigation,  Domain::output,
           Domain::output,      Domain::output,      Domain::output,
           Domain::output,      Domain::output,      Domain::modal,
           Domain::modal,       Domain::exposure,    Domain::exposure,
           Domain::exposure,    Domain::exposure,    Domain::exposure,
           Domain::exposure,    Domain::exposure,    Domain::exposure,
+          Domain::exposure,
           Domain::operation,   Domain::operation,   Domain::operation,
           Domain::operation,   Domain::operation,   Domain::modal,
           Domain::modal,       Domain::modal,       Domain::modal,
@@ -77,6 +79,7 @@ int main() {
   CHECK(html.find(L"<style id=\"_style\">") != std::wstring::npos);
   CHECK(html.find(L"<script>") != std::wstring::npos);
   CHECK(html.find(L"tailwindcss v4.3.3") != std::wstring::npos);
+  CHECK(html.find(L".shrink-0 { flex-shrink: 0; }") != std::wstring::npos);
   const std::size_t input_range_style = html.find(L"  .input-range {");
   const std::size_t input_radio_style = html.find(L"  .input-radio {");
   const std::size_t input_checkbox_style = html.find(L"  .input-checkbox {");
@@ -121,6 +124,8 @@ int main() {
   CHECK(html.find(L"function PreviewView({ snapshot })") != std::wstring::npos);
   CHECK(html.find(L"function OutputView({ snapshot })") != std::wstring::npos);
   CHECK(html.find(L"function ModalHost({ modal })") != std::wstring::npos);
+  CHECK(html.find(L"modal?.kind === 'overwrite-output' || modal?.kind === 'notice'") !=
+        std::wstring::npos);
   CHECK(html.find(L"function EditTagModal({ modal })") != std::wstring::npos);
   CHECK(html.find(L"function InputOptionsModal({ modal })") !=
         std::wstring::npos);
@@ -266,6 +271,25 @@ int main() {
   CHECK(html.find(L"pixels ? 99999") == std::wstring::npos);
   CHECK(html.find(L"if (format === 'jpeg')") != std::wstring::npos);
   CHECK(html.find(L"post('render-with-thumbnail')") != std::wstring::npos);
+  const std::size_t footer_start = html.find(L"function Footer");
+  const std::size_t footer_end =
+      html.find(L"function BridgeError", footer_start);
+  CHECK(footer_start != std::wstring::npos && footer_end != std::wstring::npos);
+  const std::wstring_view footer_html(html.data() + footer_start,
+                                      footer_end - footer_start);
+  CHECK(footer_html.find(L"className: 'button sm shrink-0'") !=
+        std::wstring_view::npos);
+  CHECK(footer_html.find(L"className: 'button primary shrink-0'") !=
+        std::wstring_view::npos);
+  CHECK(footer_html.find(L"className: 'button shrink-0'") !=
+        std::wstring_view::npos);
+  std::size_t footer_shrink_count = 0;
+  for (std::size_t offset = footer_html.find(L"shrink-0");
+       offset != std::wstring_view::npos;
+       offset = footer_html.find(L"shrink-0", offset + 1)) {
+    ++footer_shrink_count;
+  }
+  CHECK(footer_shrink_count == 5);
   CHECK(html.find(L"className: 'input-radio'") != std::wstring::npos);
   CHECK(html.find(L"className: 'input-range flex-1'") != std::wstring::npos);
   CHECK(html.find(L"input-text flex-1 min-w-0") != std::wstring::npos);
@@ -274,6 +298,12 @@ int main() {
         std::wstring::npos);
   CHECK(html.find(L"snapshot?.outputComplete ?? false") != std::wstring::npos);
   CHECK(html.find(L"className: 'tag-cell'") == std::wstring::npos);
+  CHECK(html.find(L"label: 'Copy coordinates'") != std::wstring::npos);
+  CHECK(html.find(L"disabled: disabled || !session.hasCoordinates") !=
+        std::wstring::npos);
+  CHECK(html.find(
+            L"onClick: () => post('copy-session-coordinates', { index })") !=
+        std::wstring::npos);
   CHECK(html.find(L"onClick: () => post('edit-tag', { index })") !=
         std::wstring::npos);
   CHECK(html.find(L"pano_app_ui.css") == std::wstring::npos);
@@ -289,6 +319,26 @@ int main() {
   CHECK(exposure_html.find(L"class=\"input-checkbox\"") != std::wstring::npos);
   CHECK(exposure_html.find(L"set-exposure-reference") != std::wstring::npos);
   CHECK(exposure_html.find(L"toggle-exposure-selection") != std::wstring::npos);
+  const auto final_exposure_divider =
+      exposure_html.rfind(L"<hr class=\"border-gray-500\">");
+  const auto final_exposure_label = exposure_html.find(L">Exposure:");
+  CHECK(final_exposure_divider != std::wstring::npos &&
+        final_exposure_label != std::wstring::npos &&
+        final_exposure_divider < final_exposure_label);
+  CHECK(exposure_html.find(L">Exposure:") != std::wstring::npos);
+  CHECK(exposure_html.find(L"id=\"final-exposure\"") != std::wstring::npos);
+  CHECK(exposure_html.find(L"min=\"-2\" max=\"2\" step=\"0.1\"") !=
+        std::wstring::npos);
+  CHECK(exposure_html.find(L"id=\"final-exposure-value\"") !=
+        std::wstring::npos);
+  CHECK(exposure_html.find(
+            L"#final-exposure-value { flex: 0 0 calc(var(--spacing) * 16); "
+            L"white-space: nowrap; }") != std::wstring::npos);
+  CHECK(exposure_html.find(L"set-final-exposure") != std::wstring::npos);
+  CHECK(exposure_html.find(L"pendingExposure ?? snapshot.finalExposure") !=
+        std::wstring::npos);
+  CHECK(exposure_html.find(L"setTimeout(flushPendingExposure, 200)") !=
+        std::wstring::npos);
   CHECK(exposure_html.find(L"post('content-size', {") != std::wstring::npos);
   CHECK(exposure_html.find(L"lastContentHeight = null") != std::wstring::npos);
   CHECK(exposure_html.find(L"aria-disabled") != std::wstring::npos);
@@ -398,10 +448,33 @@ int main() {
   CHECK(command.kind == pano::app::WebViewCommandKind::select_session);
   CHECK(command.session_index == 2U);
   CHECK(pano::app::parse_webview_command_json(
+      R"({"version":1,"kind":"copy-session-coordinates","pageGeneration":4,"index":2})",
+      command, error));
+  CHECK(command.kind ==
+        pano::app::WebViewCommandKind::copy_session_coordinates);
+  CHECK(command.session_index == 2U);
+  CHECK(!pano::app::parse_webview_command_json(
+      R"({"version":1,"kind":"copy-session-coordinates","pageGeneration":4,"index":2,"value":"unexpected"})",
+      command, error));
+  CHECK(pano::app::parse_webview_command_json(
       R"({"version":1,"kind":"set-exposure-overlay","pageGeneration":2,"enabled":true})",
       command, error));
   CHECK(command.kind == pano::app::WebViewCommandKind::set_exposure_overlay);
   CHECK(command.enabled == true);
+  CHECK(pano::app::parse_webview_command_json(
+      R"({"version":1,"kind":"set-final-exposure","pageGeneration":2,"value":-1.7})",
+      command, error));
+  CHECK(command.kind == pano::app::WebViewCommandKind::set_final_exposure);
+  CHECK(command.exposure_ev == -1.7);
+  CHECK(!pano::app::parse_webview_command_json(
+      R"({"version":1,"kind":"set-final-exposure","pageGeneration":2,"value":2.1})",
+      command, error));
+  CHECK(!pano::app::parse_webview_command_json(
+      R"({"version":1,"kind":"set-final-exposure","pageGeneration":2,"value":0.15})",
+      command, error));
+  CHECK(!pano::app::parse_webview_command_json(
+      R"({"version":1,"kind":"set-final-exposure","pageGeneration":2,"value":"1.0"})",
+      command, error));
   CHECK(pano::app::parse_webview_command_json(
       R"({"version":1,"kind":"set-exposure-reference","pageGeneration":2,"index":12})",
       command, error));

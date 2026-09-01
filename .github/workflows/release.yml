@@ -11,7 +11,7 @@ on:
         description: "Version to package; must match stitcher/native/VERSION (without v)"
         required: true
         type: string
-        default: "1.1.0"
+        default: "1.1.1"
       publish:
         description: "Publish archives to the matching GitHub Release"
         required: true

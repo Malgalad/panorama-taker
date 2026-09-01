@@ -33,6 +33,22 @@ gui_option_enablement(const GuiRenderRequestState &state) noexcept {
   return result;
 }
 
+std::optional<std::string>
+gui_output_format_from_filename(const std::string &filename) {
+  std::string extension = fs::u8path(filename).extension().u8string();
+  std::transform(extension.begin(), extension.end(), extension.begin(),
+                 [](const unsigned char character) {
+                   return static_cast<char>(std::tolower(character));
+                 });
+  if (extension == ".jpg" || extension == ".jpeg")
+    return "jpeg";
+  if (extension == ".png")
+    return "png";
+  if (extension == ".exr")
+    return "exr";
+  return std::nullopt;
+}
+
 bool snapshot_gui_render_request(const GuiRenderRequestState &state,
                                  RenderOptions &options, std::string &error) {
   error.clear();
@@ -78,6 +94,11 @@ bool snapshot_gui_render_request(const GuiRenderRequestState &state,
     error = "GPU memory budget requires GPU rendering";
     return false;
   }
+  if (!std::isfinite(state.final_exposure_ev) ||
+      state.final_exposure_ev < -2.0 || state.final_exposure_ev > 2.0) {
+    error = "final exposure must be between -2 and +2 EV";
+    return false;
+  }
 
   std::string output_name = trimmed(state.output_name);
   if (output_name.empty() || output_name == "panorama.png") {
@@ -108,6 +129,7 @@ bool snapshot_gui_render_request(const GuiRenderRequestState &state,
   snapshot.gpu_strict = state.gpu && state.gpu_strict;
   snapshot.allow_incomplete = state.allow_incomplete;
   snapshot.auto_contrast = state.auto_contrast;
+  snapshot.final_exposure_ev = state.final_exposure_ev;
   options = std::move(snapshot);
   return true;
 }

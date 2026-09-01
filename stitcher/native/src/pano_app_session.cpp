@@ -161,6 +161,28 @@ bool number_array(yyjson_val *value, std::array<double, Size> &result,
   return true;
 }
 
+bool parse_session_location(yyjson_val *root, SessionSummary &session,
+                            std::string &error) {
+  auto *location = yyjson_obj_get(root, "location");
+  if (location == nullptr)
+    return true;
+  if (!yyjson_is_obj(location) ||
+      !allowed_keys(location, {"position", "yaw_deg"}, error, "location")) {
+    if (!yyjson_is_obj(location))
+      fail(error, "location", "must be an object");
+    return false;
+  }
+  SessionLocation parsed;
+  if (!number_array(yyjson_obj_get(location, "position"), parsed.position,
+                    error, "location.position") ||
+      !required_number(location, "yaw_deg", parsed.yaw_deg, error,
+                       "location.yaw_deg")) {
+    return false;
+  }
+  session.location = parsed;
+  return true;
+}
+
 bool parse_encoding(yyjson_val *root, ImageEncoding &encoding,
                     std::string &error) {
   auto *value = yyjson_obj_get(root, "image_encoding");
@@ -390,21 +412,8 @@ bool parse_shared(yyjson_val *root, SessionSummary &session,
                     base_orientation, error, "base_pose.orientation_xyzw")) {
     return false;
   }
-  if (auto *location = yyjson_obj_get(root, "location"); location != nullptr) {
-    if (!yyjson_is_obj(location) ||
-        !allowed_keys(location, {"position", "yaw_deg"}, error, "location")) {
-      if (!yyjson_is_obj(location))
-        fail(error, "location", "must be an object");
-      return false;
-    }
-    std::array<double, 3> position{};
-    double yaw = 0.0;
-    if (!number_array(yyjson_obj_get(location, "position"), position, error,
-                      "location.position") ||
-        !required_number(location, "yaw_deg", yaw, error, "location.yaw_deg")) {
-      return false;
-    }
-  }
+  if (!parse_session_location(root, session, error))
+    return false;
   double ignored_step = 0.0;
   if (!required_number(planner, "yaw_step_deg", ignored_step, error,
                        "planner.yaw_step_deg") ||
@@ -507,6 +516,8 @@ bool parse_cet(yyjson_val *root, const fs::path &path,
       !required_array(root, "poses", poses, error, "poses")) {
     return false;
   }
+  if (!parse_session_location(root, session, error))
+    return false;
   if (yyjson_arr_size(poses) == 0)
     return fail(error, "poses", "must contain at least one pose");
 

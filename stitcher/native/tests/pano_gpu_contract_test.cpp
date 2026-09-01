@@ -231,9 +231,9 @@ int main(const int argc, char **const argv)
     natural_request.requested_budget_bytes = 4096ULL * 1024 * 1024;
     natural_request.preview_cache_bytes = 24ULL * 1024 * 1024;
     natural_request.session_workspace_bytes = 64ULL * 1024;
-    natural_request.output_workspace_bytes_per_pixel = 62 + 21 * 30;
+    natural_request.output_workspace_bytes_per_pixel = 62 + 21;
     natural_request.output_workspace_fixed_bytes =
-        4096ULL * sizeof(uint32_t) + (4ULL * 30 + 16) * 64 * 1024;
+        4096ULL * sizeof(uint32_t) + 20ULL * 64 * 1024;
     natural_request.upload_bytes = 100ULL * 1024 * 1024;
     natural_request.readback_bytes_per_pixel = 12;
     natural_request.descriptor_count = 34;
@@ -241,8 +241,7 @@ int main(const int argc, char **const argv)
                &natural_request, &memory_plan, error.data(),
                static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
     EXPECT(memory_plan.available_bytes == natural_request.requested_budget_bytes);
-    EXPECT(memory_plan.output_band_rows >= 32);
-    EXPECT(memory_plan.output_band_rows % 32 == 0);
+    EXPECT(memory_plan.output_band_rows == 1024);
     EXPECT(memory_plan.required_bytes <= natural_request.requested_budget_bytes);
     pano_gpu_diagnostics diagnostics {};
     diagnostics.size = sizeof(diagnostics);
@@ -583,6 +582,15 @@ int main(const int argc, char **const argv)
     EXPECT(pano_gpu_preview_surface_create(
                device, &surface_options, &surface, error.data(),
                static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(pano_gpu_test_preview_surface_sdr_color_space_set_count(surface) == 1);
+    EXPECT(pano_gpu_preview_surface_resize(
+               surface, 5, 3, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(pano_gpu_test_preview_surface_sdr_color_space_set_count(surface) == 2);
+    EXPECT(pano_gpu_preview_surface_resize(
+               surface, 4, 2, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(pano_gpu_test_preview_surface_sdr_color_space_set_count(surface) == 3);
     pano_gpu_preview_surface_present_request surface_request {};
     surface_request.size = sizeof(surface_request);
     surface_request.abi_version = PANO_GPU_ABI_VERSION;

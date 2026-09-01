@@ -34,6 +34,16 @@ bool parse_positive_double(const std::string &text, double &value) {
          std::isfinite(value) && value > 0.0;
 }
 
+bool parse_double(const std::string &text, double &value) {
+  if (text.empty())
+    return false;
+  char *end = nullptr;
+  errno = 0;
+  value = std::strtod(text.c_str(), &end);
+  return errno == 0 && end != text.c_str() && *end == '\0' &&
+         std::isfinite(value);
+}
+
 bool parse_positive_integer_component(const std::string &text,
                                       long double &value) {
   std::size_t index = 0;
@@ -137,6 +147,16 @@ bool parse_render_options(const std::vector<std::string> &arguments,
         return false;
       }
       resolution_was_set = true;
+      continue;
+    }
+    if (argument == "--final-exposure") {
+      if (!take_value(arguments, index, argument, value, error) ||
+          !parse_double(*value, options.final_exposure_ev) ||
+          options.final_exposure_ev < -2.0 ||
+          options.final_exposure_ev > 2.0) {
+        error = "final exposure must be from -2 to +2 EV";
+        return false;
+      }
       continue;
     }
     if (argument == "--width" || argument == "--jpeg-quality" ||

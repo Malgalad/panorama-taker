@@ -63,10 +63,15 @@ file because the release executable uses the Windows GUI subsystem.
 The stitcher does not alter pose exposure unless requested. If the game changed exposure during a
 capture, render a preview, open **Correct exposure**, choose the desired baseline pose with **Target
 exposure**, and click **Automatic correction**. The stitcher propagates exposure matching through
-overlapping poses; disconnected poses produce a warning and remain available for manual correction.
+overlapping poses, preserving current relative exposure across unmeasurable geometric overlaps;
+geometrically disconnected poses remain available for manual correction.
 For manual correction, enable **Show boundaries overlay**, select the affected poses, choose a
 neighboring target, and click **Match exposure**. Corrections are non-destructive, can be discarded,
 and last only for the current stitcher session.
+
+The exposure panel's **Exposure** slider applies a final `-2.0` to `+2.0 EV` adjustment after
+per-pose correction and before SDR conversion and Auto contrast. It updates the retained preview
+and JPEG/PNG output; EXR remains unchanged. The CLI equivalent is `--final-exposure EV`.
 
 For HDR captures, correcting overexposed or underexposed screenshots may leave their colors
 desaturated. To minimize this, preserve as much color information as possible in the source
@@ -75,4 +80,7 @@ apply to SDR captures.
 
 The session list shows the local capture date, whether capture completed, and whether it has been stitched before. The Screenshots field can be used when captures were moved from the game directory. The default memory budget is 1024 MiB.
 
-The session actions can delete only the JSON, or the JSON and captured screenshots. For stitched sessions, deleting source files preserves the stitched panorama. JSON-only deletion of an incomplete session does not require confirmation; other deletion actions ask for confirmation.
+The session actions can copy saved `x, y, z` coordinates, delete only the JSON, or delete the JSON
+and captured screenshots. Coordinate copying is available for sessions that contain location data.
+For stitched sessions, deleting source files preserves the stitched panorama. JSON-only deletion of
+an incomplete session does not require confirmation; other deletion actions ask for confirmation.

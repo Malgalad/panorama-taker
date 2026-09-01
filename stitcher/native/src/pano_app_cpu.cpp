@@ -102,10 +102,14 @@ float linear_to_srgb(const float value) {
 bool convert_sdr_pixel(const CpuSdrConversionRequest &request,
                        const float *linear_rgb,
                        std::array<float, 3> &encoded) {
-  if (!std::all_of(linear_rgb, linear_rgb + 3U,
+  if (!std::isfinite(request.exposure_multiplier) ||
+      request.exposure_multiplier <= 0.0F ||
+      !std::all_of(linear_rgb, linear_rgb + 3U,
                    [](const float value) { return std::isfinite(value); }))
     return false;
   std::array<float, 3> working{linear_rgb[0], linear_rgb[1], linear_rgb[2]};
+  for (float &value : working)
+    value *= request.exposure_multiplier;
   if (request.source_transfer == CpuTransferFunction::pq) {
     const float scale = 10000.0F / request.reference_white_nits;
     for (float &value : working) value = std::max(value, 0.0F) * scale;
@@ -1689,10 +1693,12 @@ bool solve_cpu_exposure_graph(
 bool solve_reference_exposure_gains(
     const unsigned frame_count, const unsigned target,
     const std::vector<CpuExposureEquation> &equations,
+    const unsigned measured_equation_count,
     const std::vector<float> &current_gains, std::vector<float> &gains,
     std::string &error) {
   if (frame_count < 2U || target >= frame_count ||
-      current_gains.size() != frame_count || equations.empty() ||
+      static_cast<std::size_t>(measured_equation_count) > equations.size() ||
+      current_gains.size() != frame_count ||
       std::any_of(current_gains.begin(), current_gains.end(),
                   [](const float gain) {
                     return !std::isfinite(gain) || gain <= 0.0F;
@@ -1700,11 +1706,13 @@ bool solve_reference_exposure_gains(
     error = "invalid reference exposure solve request";
     return false;
   }
-  for (const auto &equation : equations) {
+  for (std::size_t index = 0; index < equations.size(); ++index) {
+    const auto &equation = equations[index];
     if (equation.left >= frame_count || equation.right >= frame_count ||
         equation.left == equation.right ||
         !std::isfinite(equation.difference) ||
-        !std::isfinite(equation.weight) || equation.weight <= 0.0) {
+        !std::isfinite(equation.weight) || equation.weight <= 0.0 ||
+        (index >= measured_equation_count && equation.difference != 0.0)) {
       error = "invalid reference exposure equation";
       return false;
     }
@@ -1715,10 +1723,14 @@ bool solve_reference_exposure_gains(
     unsigned corrected = 1U;
     while (corrected < frame_count) {
       std::vector<std::vector<double>> proposals(frame_count);
-      for (const auto &equation : equations) {
+      for (std::size_t index = 0; index < equations.size(); ++index) {
+        const auto &equation = equations[index];
         const double adjusted =
-            equation.difference + std::log(current_gains[equation.left]) -
-            std::log(current_gains[equation.right]);
+            index < measured_equation_count
+                ? equation.difference +
+                      std::log(current_gains[equation.left]) -
+                      std::log(current_gains[equation.right])
+                : 0.0;
         if (corrections[equation.left].has_value() &&
             !corrections[equation.right].has_value())
           proposals[equation.right].push_back(
@@ -1741,8 +1753,9 @@ bool solve_reference_exposure_gains(
         ++added;
       }
       if (added == 0U) {
-        error = "some poses are disconnected from the selected reference; "
-                "use manual correction";
+        error = "automatic exposure cannot reach every pose because the "
+                "geometric overlap graph is disconnected; correct the "
+                "unreachable poses manually";
         return false;
       }
       corrected += added;
@@ -1909,6 +1922,8 @@ bool accumulate_cpu_auto_contrast_histogram(
   if (request.pixel_count == 0U || linear_rgb == nullptr || coverage == nullptr ||
       !std::isfinite(request.reference_white_nits) ||
       request.reference_white_nits <= 0.0F ||
+      !std::isfinite(request.exposure_multiplier) ||
+      request.exposure_multiplier <= 0.0F ||
       (request.source_transfer != CpuTransferFunction::srgb &&
        request.source_transfer != CpuTransferFunction::pq &&
        request.source_transfer != CpuTransferFunction::linear) ||
@@ -1995,6 +2010,8 @@ bool convert_cpu_sdr8_band(const CpuSdrConversionRequest &request,
   if (request.pixel_count == 0U || linear_rgb == nullptr || srgb8 == nullptr ||
       !std::isfinite(request.reference_white_nits) ||
       request.reference_white_nits <= 0.0F ||
+      !std::isfinite(request.exposure_multiplier) ||
+      request.exposure_multiplier <= 0.0F ||
       (request.apply_auto_contrast && !request.levels.valid)) {
     error = "invalid CPU SDR conversion request";
     return false;

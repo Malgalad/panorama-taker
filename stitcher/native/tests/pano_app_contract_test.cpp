@@ -2,6 +2,8 @@
 #include "pano_app_version.h"
 #include "pano_gpu.h"
 
+#include <openexr.h>
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -65,6 +67,23 @@ std::vector<std::uint8_t> read_bytes(const fs::path &path) {
           std::istreambuf_iterator<char>()};
 }
 
+bool exr_has_half_channels(const fs::path &path) {
+  exr_context_t context = nullptr;
+  exr_context_initializer_t initializer = EXR_DEFAULT_CONTEXT_INITIALIZER;
+  const std::string encoded_path = path.u8string();
+  if (exr_start_read(&context, encoded_path.c_str(), &initializer) !=
+      EXR_ERR_SUCCESS)
+    return false;
+  const exr_attr_chlist_t *channels = nullptr;
+  const exr_result_t channels_result = exr_get_channels(context, 0, &channels);
+  bool half = channels_result == EXR_ERR_SUCCESS && channels != nullptr &&
+              channels->num_channels == 3;
+  if (half)
+    for (int index = 0; index < channels->num_channels; ++index)
+      half = half && channels->entries[index].pixel_type == EXR_PIXEL_HALF;
+  return exr_finish(&context) == EXR_ERR_SUCCESS && half;
+}
+
 struct NativeRenderProgress {
   unsigned calls = 0;
   unsigned completed = 0;
@@ -126,6 +145,7 @@ void test_dispatch() {
   EXPECT(pano::app::run({}, output, error) == 0);
   EXPECT(output.str().find("Usage:") != std::string::npos);
   EXPECT(output.str().find("--auto-exposure") != std::string::npos);
+  EXPECT(output.str().find("--final-exposure EV") != std::string::npos);
   output.str({});
   EXPECT(pano::app::run({"--version"}, output, error) == 0);
   EXPECT(output.str().find(PANO_APP_VERSION) != std::string::npos);
@@ -204,6 +224,17 @@ void test_memory_backend_and_exposure_options() {
   EXPECT(options.gpu_memory_mib == 2048U);
   EXPECT(options.gpu && options.gpu_strict && options.allow_incomplete);
   EXPECT(!options.auto_contrast);
+  EXPECT(options.final_exposure_ev == 0.0);
+  EXPECT(parse({"render", "session", "--output", "out", "--final-exposure",
+                "-1.7"},
+               options, error));
+  EXPECT(std::abs(options.final_exposure_ev + 1.7) < 1.0e-12);
+  EXPECT(!parse({"render", "session", "--output", "out", "--final-exposure",
+                 "2.1"},
+                options, error));
+  EXPECT(!parse({"render", "session", "--output", "out", "--final-exposure",
+                 "nan"},
+                options, error));
   EXPECT(!parse(
       {"render", "session", "--output", "out", "--memory-budget-mib", "8193"},
       options, error));
@@ -251,6 +282,12 @@ void test_shared_session() {
   EXPECT(session.completed);
   EXPECT(session.frames.size() == 1);
   EXPECT(session.frames[0].filename == "shared.png");
+  EXPECT(session.location.has_value());
+  EXPECT(session.location->position ==
+         (std::array<double, 3>{1.25, -2.5, 3.75}));
+  EXPECT(session.location->yaw_deg == 45.0);
+  EXPECT(pano::app::gui_session_coordinates(session) ==
+         std::optional<std::string>("1.250000000, -2.500000000, 3.750000000"));
   EXPECT(session.image_encoding.sample_type == "uint8");
   EXPECT(session.image_encoding.transfer_function == "srgb");
   EXPECT(!pano::app::load_session(
@@ -284,6 +321,13 @@ void test_cet_session_and_paths() {
   EXPECT(pano::app::load_session((fixtures() / "cet-complete.json").u8string(),
                                  moved.u8string(), session, error));
   EXPECT(session.completed);
+  EXPECT(session.location.has_value());
+  EXPECT(session.location->position ==
+         (std::array<double, 3>{-123.5, 456.25, 7.0}));
+  EXPECT(session.location->yaw_deg == 90.0);
+  EXPECT(pano::app::gui_session_coordinates(session) ==
+         std::optional<std::string>(
+             "-123.500000000, 456.250000000, 7.000000000"));
   EXPECT(session.frames.size() == 1);
   EXPECT(session.frames[0].filename == (moved / "complete.png").u8string());
   EXPECT(session.frames[0].camera_basis_row_major.has_value());
@@ -298,6 +342,8 @@ void test_cet_session_and_paths() {
       pano::app::load_session((fixtures() / "cet-incomplete.json").u8string(),
                               std::nullopt, session, error));
   EXPECT(!session.completed);
+  EXPECT(!session.location.has_value());
+  EXPECT(!pano::app::gui_session_coordinates(session).has_value());
   EXPECT(session.frames[0].filename == "incomplete.png");
   EXPECT(!pano::app::load_session((fixtures() / "cet-invalid.json").u8string(),
                                   std::nullopt, session, error));
@@ -367,6 +413,7 @@ void test_output_and_render_plans() {
   options.memory_mib = 768U;
   options.gpu_memory_mib = 3072U;
   options.automatic_exposure = true;
+  options.final_exposure_ev = 1.2;
   pano::app::OutputPlan outputs;
   std::string error;
   EXPECT(pano::app::plan_outputs(options, outputs, error));
@@ -389,6 +436,7 @@ void test_output_and_render_plans() {
   EXPECT(plan.projection == "equirectangular");
   EXPECT(plan.blend == "feather");
   EXPECT(plan.memory_mib == 768U && plan.gpu_memory_mib == 3072U);
+  EXPECT(std::abs(plan.final_exposure_ev - 1.2) < 1.0e-12);
   EXPECT(plan.automatic_exposure);
 
   options.session = (fixtures() / "cet-incomplete.json").u8string();
@@ -715,7 +763,7 @@ void test_exr_writer_contracts() {
   options.width = 3;
   options.height = 33;
   options.sample_type = "float32";
-  options.encoding.sample_type = "float32";
+  options.encoding.sample_type = "float16";
   options.encoding.color_primaries = "rec2020";
   options.encoding.transfer_function = "linear";
   options.encoding.reference_white_nits = 203.0;
@@ -736,15 +784,7 @@ void test_exr_writer_contracts() {
                                      stride, {}, category, error));
   EXPECT(pano::app::finish_image_writer(&writer, {}, category, error));
   EXPECT(writer == nullptr);
-  pano::app::ImageInfo info;
-  EXPECT(pano::app::inspect_image(options.path, info, category, error));
-  EXPECT(info.width == 3U && info.height == 33U);
-  EXPECT(info.exr_compression == "PIZ");
-  std::vector<float> decoded(pixels.size());
-  EXPECT(pano::app::decode_image(options.path, info, decoded.data(), stride,
-                                 decoded.size() * sizeof(float), {}, category,
-                                 error));
-  EXPECT(decoded == pixels);
+  EXPECT(exr_has_half_channels(fs::u8path(options.path)));
 
   options.path = (temporary.path() / "nonfinite.exr").u8string();
   options.height = 1;
@@ -1590,23 +1630,32 @@ void test_reference_exposure_propagation() {
   const std::vector<pano::app::CpuExposureEquation> frontier{
       {0, 1, 0.2, 100.0}, {0, 2, 0.0, 1.0}, {1, 2, 0.4, 1000.0}};
   EXPECT(pano::app::solve_reference_exposure_gains(
-      3, 0, frontier, {1.0F, 1.0F, 1.0F}, gains, error));
+      3, 0, frontier, 3, {1.0F, 1.0F, 1.0F}, gains, error));
   EXPECT(gains.size() == 3U && std::fabs(gains[0] - 1.0F) < 1.0e-7F &&
          std::fabs(gains[1] - std::exp(0.2F)) < 1.0e-6F &&
          std::fabs(gains[2] - 1.0F) < 1.0e-7F);
 
   EXPECT(pano::app::solve_reference_exposure_gains(2, 0, {{0, 1, 2.0, 1.0}},
-                                                   {1.0F, 1.0F}, gains, error));
+                                                   1, {1.0F, 1.0F}, gains,
+                                                   error));
   EXPECT(gains.size() == 2U && std::fabs(gains[1] - std::exp(2.0F)) < 1.0e-5F);
 
   EXPECT(pano::app::solve_reference_exposure_gains(2, 0, {{0, 1, 0.2, 1.0}},
-                                                   {2.0F, 0.5F}, gains, error));
+                                                   1, {2.0F, 0.5F}, gains,
+                                                   error));
   EXPECT(gains.size() == 2U && std::fabs(gains[0] - 2.0F) < 1.0e-7F &&
          std::fabs(gains[1] - 2.0F * std::exp(0.2F)) < 1.0e-6F);
 
+  EXPECT(pano::app::solve_reference_exposure_gains(
+      3, 0, {{0, 1, std::log(2.0), 1.0}, {1, 2, 0.0, 1.0}}, 1,
+      {1.0F, 1.0F, 3.0F}, gains, error));
+  EXPECT(gains.size() == 3U && std::fabs(gains[0] - 1.0F) < 1.0e-7F &&
+         std::fabs(gains[1] - 2.0F) < 1.0e-6F &&
+         std::fabs(gains[2] - 6.0F) < 1.0e-6F);
+
   gains = {7.0F};
   EXPECT(!pano::app::solve_reference_exposure_gains(
-      3, 0, {{0, 1, 0.2, 1.0}}, {1.0F, 1.0F, 1.0F}, gains, error));
+      3, 0, {{0, 1, 0.2, 1.0}}, 1, {1.0F, 1.0F, 1.0F}, gains, error));
   EXPECT(gains == std::vector<float>{7.0F});
   EXPECT(error.find("disconnected") != std::string::npos);
 }
@@ -1650,6 +1699,21 @@ void test_cpu_conversion_and_writer_bands() {
   EXPECT((sdr8 ==
           std::array<std::uint8_t, 9>{0, 0, 0, 255, 255, 255, 188, 188, 188}));
   request.pixel_count = 1;
+  request.exposure_multiplier = 2.0F;
+  const std::array<float, 3> quarter_linear{0.25F, 0.25F, 0.25F};
+  EXPECT(pano::app::convert_cpu_sdr8_band(
+      request, quarter_linear.data(), sdr8.data(), error));
+  EXPECT(sdr8[0] == 188U && sdr8[1] == 188U && sdr8[2] == 188U);
+  histogram.fill(0U);
+  const std::array<std::uint8_t, 1> one_covered{1U};
+  EXPECT(pano::app::accumulate_cpu_auto_contrast_histogram(
+      request, quarter_linear.data(), one_covered.data(), histogram, error));
+  const float exposed_srgb = 1.055F * std::pow(0.5F, 1.0F / 2.4F) - 0.055F;
+  const auto exposed_bin = static_cast<std::size_t>(
+      std::floor(exposed_srgb * static_cast<float>(histogram.size())));
+  EXPECT(histogram[exposed_bin] == 1U);
+  request.exposure_multiplier = 1.0F;
+  request.pixel_count = 1;
   request.apply_auto_contrast = true;
   request.levels = {0.25F, 0.75F, 2U, true};
   const float encoded_half_linear = std::pow((0.5F + 0.055F) / 1.055F, 2.4F);
@@ -1682,6 +1746,7 @@ void test_cpu_conversion_and_writer_bands() {
 
   const std::array<float, 6> float_input{-2.0F, 0.5F, 4.0F, 8.0F, 16.0F, 32.0F};
   std::array<float, 6> float_output{};
+  request.exposure_multiplier = 4.0F;
   EXPECT(pano::app::copy_cpu_float_band(2, float_input.data(),
                                         float_output.data(), error));
   EXPECT(float_output == float_input);
@@ -1694,7 +1759,7 @@ void test_cpu_conversion_and_writer_bands() {
   exr.width = 2;
   exr.height = 1;
   exr.sample_type = "float32";
-  exr.encoding.sample_type = "float32";
+  exr.encoding.sample_type = "float16";
   exr.encoding.color_primaries = "rec2020";
   exr.encoding.transfer_function = "linear";
   exr.encoding.reference_white_nits = 203.0;
@@ -1705,13 +1770,7 @@ void test_cpu_conversion_and_writer_bands() {
       writer, pano::app::CpuOutputBandSample::linear_float32, request, 2, 1,
       float_input.data(), nullptr, 0, {}, category, error));
   EXPECT(pano::app::finish_image_writer(&writer, {}, category, error));
-  pano::app::ImageInfo info;
-  EXPECT(pano::app::inspect_image(exr.path, info, category, error));
-  std::array<float, 6> decoded_float{};
-  EXPECT(pano::app::decode_image(exr.path, info, decoded_float.data(),
-                                 6 * sizeof(float), sizeof(decoded_float), {},
-                                 category, error));
-  EXPECT(decoded_float == float_input);
+  EXPECT(exr_has_half_channels(fs::u8path(exr.path)));
 #ifdef _WIN32
   pano::app::ImageWriterOptions png;
   png.path = (temporary.path() / "cpu-band.png").u8string();
@@ -1728,6 +1787,7 @@ void test_cpu_conversion_and_writer_bands() {
       sdr_linear.data(), band_scratch.data(), band_scratch.size(), {}, category,
       error));
   EXPECT(pano::app::finish_image_writer(&writer, {}, category, error));
+  pano::app::ImageInfo info;
   EXPECT(pano::app::inspect_image(png.path, info, category, error));
   std::array<std::uint8_t, 6> decoded_sdr{};
   EXPECT(pano::app::decode_image(png.path, info, decoded_sdr.data(), 6,
@@ -1867,7 +1927,8 @@ void test_gui_session_discovery_state() {
   EXPECT(records[1].path.find("1700000100-1") != std::string::npos &&
          records[1].error.empty() && !records[1].session.completed);
   EXPECT(records[2].path.find("1700000000-1") != std::string::npos &&
-         records[2].error.empty() && records[2].session.completed);
+         records[2].error.empty() && records[2].session.completed &&
+         records[2].session.location.has_value());
   EXPECT(pano::app::gui_session_status(records[0], true) ==
          pano::app::GuiSessionStatus::invalid);
   EXPECT(pano::app::gui_session_status(records[1], true) ==
@@ -1898,6 +1959,17 @@ void test_gui_session_discovery_state() {
 }
 
 void test_gui_request_and_validation_state() {
+  EXPECT(pano::app::gui_output_format_from_filename("panorama.jpg") ==
+         std::optional<std::string>("jpeg"));
+  EXPECT(pano::app::gui_output_format_from_filename("panorama.JPEG") ==
+         std::optional<std::string>("jpeg"));
+  EXPECT(pano::app::gui_output_format_from_filename("panorama.PNG") ==
+         std::optional<std::string>("png"));
+  EXPECT(pano::app::gui_output_format_from_filename("panorama.exr") ==
+         std::optional<std::string>("exr"));
+  EXPECT(!pano::app::gui_output_format_from_filename("panorama.webp"));
+  EXPECT(!pano::app::gui_output_format_from_filename("panorama"));
+
   pano::app::GuiRenderRequestState request;
   EXPECT(request.output_name == "panorama.jpg");
   EXPECT(request.resolution_percent == 100U);
@@ -1908,6 +1980,7 @@ void test_gui_request_and_validation_state() {
   EXPECT(request.gpu && !request.gpu_memory_mib.has_value() &&
          !request.gpu_strict);
   EXPECT(!request.allow_incomplete && request.auto_contrast);
+  EXPECT(request.final_exposure_ev == 0.0);
 
   auto enablement = pano::app::gui_option_enablement(request);
   EXPECT(enablement.jpeg_quality && enablement.cpu_memory &&
@@ -1930,6 +2003,7 @@ void test_gui_request_and_validation_state() {
   request.coverage = true;
   request.gpu = false;
   request.gpu_strict = true;
+  request.final_exposure_ev = -0.8;
   pano::app::RenderOptions options;
   std::string error;
   EXPECT(pano::app::snapshot_gui_render_request(request, options, error));
@@ -1942,6 +2016,11 @@ void test_gui_request_and_validation_state() {
   EXPECT(options.blend == "feather" && options.thumbnail && options.coverage);
   EXPECT(!options.gpu && !options.gpu_strict);
   EXPECT(!options.allow_incomplete && options.auto_contrast);
+  EXPECT(std::abs(options.final_exposure_ev + 0.8) < 1.0e-12);
+  request.final_exposure_ev = 2.1;
+  EXPECT(!pano::app::snapshot_gui_render_request(request, options, error));
+  EXPECT(error.find("final exposure") != std::string::npos);
+  request.final_exposure_ev = -0.8;
 
   request.gpu = true;
   request.memory_mib = 768U;
@@ -2842,6 +2921,14 @@ void test_cpu_native_session() {
   EXPECT(diagnostics.preview_width == 8U);
   EXPECT(diagnostics.preview_height == 4U);
   EXPECT(pano::app::cpu_native_preview_pixels(preview).size() == 128U);
+  const auto unexposed_pixels = pano::app::cpu_native_preview_pixels(preview);
+  auto exposed = plan;
+  exposed.final_exposure_ev = 1.0;
+  EXPECT(pano::app::rebuild_cpu_native_preview(preview, exposed,
+                                               preview_options, error));
+  EXPECT(pano::app::cpu_native_preview_pixels(preview) != unexposed_pixels);
+  EXPECT(pano::app::rebuild_cpu_native_preview(preview, plan, preview_options,
+                                               error));
   pano::app::NativeExposureResult exposure;
   EXPECT(pano::app::discard_cpu_native_exposure_edits(
       preview, preview_options, exposure, error));

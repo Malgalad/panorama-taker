@@ -84,6 +84,11 @@ bool make_render_plan(const RenderOptions &options, RenderPlan &plan,
     error = "session is incomplete; use --allow-incomplete to render it";
     return false;
   }
+  if (!std::isfinite(options.final_exposure_ev) ||
+      options.final_exposure_ev < -2.0 || options.final_exposure_ev > 2.0) {
+    error = "final exposure must be from -2 to +2 EV";
+    return false;
+  }
   const auto frame_count = session.frames.size();
   if (options.exposure_target.has_value() &&
       *options.exposure_target >= frame_count) {
@@ -136,6 +141,7 @@ bool make_render_plan(const RenderOptions &options, RenderPlan &plan,
   parsed.gpu_strict = options.gpu_strict;
   parsed.allow_incomplete = options.allow_incomplete;
   parsed.auto_contrast = options.auto_contrast;
+  parsed.final_exposure_ev = options.final_exposure_ev;
   parsed.automatic_exposure = options.automatic_exposure;
   parsed.exposure_target = options.exposure_target;
   parsed.exposure_sources = options.exposure_sources;
