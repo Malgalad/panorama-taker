@@ -51,6 +51,25 @@ try {
         return
     }
 
+    $dumpbinCommand = Get-Command dumpbin.exe -CommandType Application `
+        -ErrorAction SilentlyContinue
+    $dumpbin = if ($dumpbinCommand) { $dumpbinCommand.Source } else { "" }
+    if (-not $dumpbin) {
+        $vswhere = Join-Path ${env:ProgramFiles(x86)} `
+            "Microsoft Visual Studio\Installer\vswhere.exe"
+        if (Test-Path -LiteralPath $vswhere -PathType Leaf) {
+            $dumpbin = @(& $vswhere -latest -products * `
+                -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 `
+                -find "VC\Tools\MSVC\*\bin\Hostx64\x64\dumpbin.exe") |
+                Sort-Object -Descending |
+                Select-Object -First 1
+        }
+    }
+    if (-not $dumpbin -or -not (Test-Path -LiteralPath $dumpbin -PathType Leaf)) {
+        throw "Cannot locate the x64 Visual C++ dependency tool dumpbin.exe"
+    }
+    Write-Host "Using dumpbin: $dumpbin"
+
     $runtimeResults = @()
     $quotedProbeResult = "`"$probeResult`""
     foreach ($executable in $executables) {
@@ -69,7 +88,7 @@ try {
 
     $peDependencies = @()
     foreach ($binary in @($executables) + @($nativeDll[0])) {
-        $dependencies = & dumpbin.exe /dependents $binary.FullName
+        $dependencies = & $dumpbin /dependents $binary.FullName
         if ($LASTEXITCODE -ne 0) {
             throw "dumpbin failed for $($binary.Name)"
         }
