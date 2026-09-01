@@ -77,6 +77,8 @@ enum class WebViewModalKind {
   notice
 };
 
+enum class GuiValidationPurpose { preview, output };
+
 struct WebViewModalPayload {
   std::wstring title;
   std::wstring description;
@@ -185,6 +187,7 @@ struct RefreshResult {
 
 struct ValidationResult {
   std::uint64_t generation = 0;
+  GuiValidationPurpose purpose = GuiValidationPurpose::preview;
   std::optional<pano::app::RenderPlan> plan;
   std::string error;
 };
@@ -237,6 +240,8 @@ struct GuiRuntimeState {
   std::vector<std::thread> refresh_threads;
   std::atomic<HWND> refresh_window{nullptr};
   pano::app::GuiValidationState validation_state;
+  GuiValidationPurpose scheduled_validation = GuiValidationPurpose::preview;
+  std::optional<GuiValidationPurpose> completed_validation;
   std::mutex validation_mutex;
   std::vector<std::unique_ptr<ValidationResult>> validation_results;
   std::vector<std::thread> validation_threads;
@@ -298,7 +303,8 @@ void reap_completed_workers() {
 
 LRESULT CALLBACK preview_window_procedure(HWND window, UINT message,
                                           WPARAM wparam, LPARAM lparam);
-void schedule_validation(HWND window, bool discard_preview);
+void schedule_validation(HWND window, bool discard_preview,
+                         GuiValidationPurpose purpose);
 
 LRESULT CALLBACK exposure_window_procedure(HWND window, UINT message,
                                            WPARAM wparam, LPARAM lparam);
@@ -519,8 +525,9 @@ void load_gui_settings() {
       application_state().application_settings.debug_coverage;
 }
 
-bool capture_gui_request(pano::app::GuiRenderRequestState &request,
-                         std::string &error) {
+bool capture_gui_request(
+    pano::app::GuiRenderRequestState &request, std::string &error,
+    const GuiValidationPurpose purpose = GuiValidationPurpose::output) {
   pano::app::GuiRenderRequestState captured;
   const HWND window =
       runtime_state().refresh_window.load(std::memory_order_acquire);
@@ -561,24 +568,36 @@ bool capture_gui_request(pano::app::GuiRenderRequestState &request,
   captured.output_name = wide_to_utf8(shell->output_name);
   captured.format = shell->output_format;
   captured.blend = shell->blend;
-  std::optional<unsigned> parsed;
-  if (!parse_value(shell->jpeg_quality, false, parsed))
-    return false;
-  captured.jpeg_quality = *parsed;
-  if (shell != nullptr && shell->resolution_pixels) {
-    captured.resolution_percent = 100U;
-    if (!parse_value(shell->explicit_width, false, captured.width))
-      return false;
-    if (shell->output_maximum_width != 0U &&
-        *captured.width > shell->output_maximum_width) {
-      error = "output width exceeds the retained preview 100% scale";
-      return false;
+  if (purpose == GuiValidationPurpose::output) {
+    std::optional<unsigned> parsed;
+    if (captured.format == "jpeg") {
+      if (!parse_value(shell->jpeg_quality, false, parsed))
+        return false;
+      captured.jpeg_quality = *parsed;
+    }
+    if (shell->resolution_pixels) {
+      captured.resolution_percent = 100U;
+      if (!parse_value(shell->explicit_width, false, captured.width))
+        return false;
+      if (shell->output_maximum_width != 0U &&
+          *captured.width > shell->output_maximum_width) {
+        error = "output width exceeds the retained preview 100% scale";
+        return false;
+      }
+    } else {
+      if (!parse_value(shell->resolution_percent, false, parsed))
+        return false;
+      captured.resolution_percent = *parsed;
+      captured.width.reset();
     }
   } else {
-    if (!parse_value(shell->resolution_percent, false, parsed))
-      return false;
-    captured.resolution_percent = *parsed;
+    captured.output_name = "preview.png";
+    captured.resolution_percent = 100U;
     captured.width.reset();
+    captured.jpeg_quality = 95U;
+    if (captured.format != "jpeg" && captured.format != "png" &&
+        captured.format != "exr")
+      captured.format = "png";
   }
   captured.memory_mib = shell->cpu_memory_mib;
   captured.workers = shell->cpu_workers;
@@ -614,7 +633,7 @@ void select_output_format(const HWND window, const int selection) {
                              : utf8_to_wide("." + shell->output_format));
   shell->output_name = name.wstring();
   update_option_enablement();
-  schedule_validation(window, false);
+  schedule_validation(window, false, GuiValidationPurpose::output);
 }
 
 bool copy_text_to_clipboard(const HWND owner, const std::wstring_view text,
@@ -1894,7 +1913,9 @@ LRESULT CALLBACK exposure_window_procedure(const HWND window,
   }
 }
 
-void schedule_validation(HWND window, bool discard_preview = true);
+void schedule_validation(
+    HWND window, bool discard_preview = true,
+    GuiValidationPurpose purpose = GuiValidationPurpose::preview);
 void confirm_render(HWND window);
 void open_webview_overwrite_output(GuiShellState &shell,
                                    std::vector<std::string> paths);
@@ -1911,6 +1932,7 @@ void reset_session_for_game_change(const HWND window) {
   shell->workflow.validation_ready = false;
   invalidate_preview();
   pano::app::begin_gui_validation(runtime_state().validation_state);
+  runtime_state().completed_validation.reset();
 }
 
 void apply_session_selection(const HWND window, const std::size_t index) {
@@ -2019,10 +2041,13 @@ void start_refresh() {
   }
 }
 
-void schedule_validation(const HWND window, const bool discard_preview) {
+void schedule_validation(const HWND window, const bool discard_preview,
+                         const GuiValidationPurpose purpose) {
   if (discard_preview)
     invalidate_preview();
   pano::app::begin_gui_validation(runtime_state().validation_state);
+  runtime_state().scheduled_validation = purpose;
+  runtime_state().completed_validation.reset();
   if (auto *const shell = shell_state(window); shell != nullptr)
     shell->workflow.validation_ready = false;
   KillTimer(window, validation_timer_id);
@@ -2038,16 +2063,40 @@ void schedule_preview_option_validation(const HWND window) {
 }
 
 void start_validation() {
+  const GuiValidationPurpose purpose = runtime_state().scheduled_validation;
   pano::app::GuiRenderRequestState request;
   std::string error;
-  if (!capture_gui_request(request, error)) {
+  if (!capture_gui_request(request, error, purpose)) {
     runtime_state().validation_state.error = error;
+    if (auto *const shell = shell_state(
+            runtime_state().refresh_window.load(std::memory_order_acquire));
+        shell != nullptr)
+      shell->pending_render_with_thumbnail.reset();
     set_status_text(utf8_to_wide(error));
     return;
   }
   pano::app::RenderOptions options;
-  if (!pano::app::snapshot_gui_render_request(request, options, error)) {
+  bool captured = false;
+  if (purpose == GuiValidationPurpose::preview) {
+    try {
+      const std::string temporary_directory =
+          (pano::app::webview_user_data_folder().parent_path() / L"Temp")
+              .u8string();
+      captured = pano::app::snapshot_gui_preview_request(
+          request, temporary_directory, options, error);
+    } catch (const std::exception &exception) {
+      error = "cannot locate preview temporary directory: " +
+              std::string(exception.what());
+    }
+  } else {
+    captured = pano::app::snapshot_gui_render_request(request, options, error);
+  }
+  if (!captured) {
     runtime_state().validation_state.error = error;
+    if (auto *const shell = shell_state(
+            runtime_state().refresh_window.load(std::memory_order_acquire));
+        shell != nullptr)
+      shell->pending_render_with_thumbnail.reset();
     set_status_text(utf8_to_wide(error));
     return;
   }
@@ -2056,9 +2105,10 @@ void start_validation() {
   try {
     reap_completed_workers();
     runtime_state().validation_threads.emplace_back(
-        [generation, options = std::move(options)] {
+        [generation, purpose, options = std::move(options)] {
           auto result = std::make_unique<ValidationResult>();
           result->generation = generation;
+          result->purpose = purpose;
           pano::app::RenderPlan plan;
           if (pano::app::make_render_plan(options, plan, result->error))
             result->plan = std::move(plan);
@@ -2091,6 +2141,9 @@ void apply_validation_results() {
         runtime_state().refresh_window.load(std::memory_order_acquire);
     auto *const shell = window == nullptr ? nullptr : shell_state(window);
     bool valid = runtime_state().validation_state.plan.has_value();
+    runtime_state().completed_validation =
+        valid ? std::optional<GuiValidationPurpose>(result->purpose)
+              : std::nullopt;
     bool retained_update_failed = false;
     if (valid && retained_preview_ready() &&
         (shell == nullptr || !shell->rebuild_preview_after_validation)) {
@@ -2106,6 +2159,7 @@ void apply_validation_results() {
       if (!updated) {
         discard_active_preview();
         valid = false;
+        runtime_state().completed_validation.reset();
         retained_update_failed = true;
         report_application_error(L"Validation", utf8_to_wide(update_error));
       }
@@ -2148,6 +2202,7 @@ void report_render_progress(void *, const unsigned completed,
 
 void start_render() {
   if (!runtime_state().validation_state.plan.has_value() ||
+      runtime_state().completed_validation != GuiValidationPurpose::output ||
       !retained_preview_ready() || runtime_state().preview_building)
     return;
   std::uint64_t operation_generation = 0;
@@ -2320,7 +2375,8 @@ void apply_render_results() {
 }
 
 void confirm_render(const HWND window) {
-  if (!runtime_state().validation_state.plan.has_value())
+  if (!runtime_state().validation_state.plan.has_value() ||
+      runtime_state().completed_validation != GuiValidationPurpose::output)
     return;
   const auto paths = pano::app::gui_existing_output_paths(
       *runtime_state().validation_state.plan);
@@ -2337,9 +2393,15 @@ void request_render(const HWND window, const bool with_thumbnail) {
   if (shell == nullptr || runtime_state().preview_building ||
       !retained_preview_ready())
     return;
+  if (shell->output_directory.empty()) {
+    shell->pending_render_with_thumbnail.reset();
+    set_status_text(L"Choose an output directory");
+    return;
+  }
   shell->thumbnail = with_thumbnail;
   const bool plan_matches =
       runtime_state().validation_state.plan.has_value() &&
+      runtime_state().completed_validation == GuiValidationPurpose::output &&
       runtime_state().validation_state.plan->outputs.thumbnail.has_value() ==
           with_thumbnail;
   if (plan_matches) {
@@ -2347,7 +2409,7 @@ void request_render(const HWND window, const bool with_thumbnail) {
     return;
   }
   shell->pending_render_with_thumbnail = with_thumbnail;
-  schedule_validation(window, false);
+  schedule_validation(window, false, GuiValidationPurpose::output);
 }
 
 void confirm_delete_session(const HWND window) {
@@ -3210,7 +3272,7 @@ void handle_webview_command(const HWND window,
     break;
   case pano::app::WebViewCommandKind::set_output_directory:
     shell->output_directory = command.value;
-    schedule_validation(window, false);
+    schedule_validation(window, false, GuiValidationPurpose::output);
     break;
   case pano::app::WebViewCommandKind::browse_game_directory:
     if (const auto path = choose_path(window, true)) {
@@ -3228,7 +3290,7 @@ void handle_webview_command(const HWND window,
   case pano::app::WebViewCommandKind::browse_output_directory:
     if (const auto path = choose_path(window, true)) {
       shell->output_directory = *path;
-      schedule_validation(window, false);
+      schedule_validation(window, false, GuiValidationPurpose::output);
     }
     break;
   case pano::app::WebViewCommandKind::refresh:
@@ -3266,17 +3328,27 @@ void handle_webview_command(const HWND window,
     break;
   case pano::app::WebViewCommandKind::navigate_input:
     navigate_stage(window, pano::app::GuiStage::input);
+    if (shell->workflow.operation == pano::app::GuiOperation::idle &&
+        !runtime_state().completed_validation.has_value())
+      schedule_validation(window, false, GuiValidationPurpose::preview);
     break;
   case pano::app::WebViewCommandKind::navigate_preview:
     navigate_stage(window, pano::app::GuiStage::preview);
+    if (shell->workflow.operation == pano::app::GuiOperation::idle &&
+        !runtime_state().completed_validation.has_value())
+      schedule_validation(window, false, GuiValidationPurpose::preview);
     break;
   case pano::app::WebViewCommandKind::navigate_output:
-    if (retained_preview_ready())
+    if (retained_preview_ready()) {
       navigate_stage(window, pano::app::GuiStage::output);
+      if (shell->workflow.operation == pano::app::GuiOperation::idle &&
+          runtime_state().completed_validation != GuiValidationPurpose::output)
+        schedule_validation(window, false, GuiValidationPurpose::output);
+    }
     break;
   case pano::app::WebViewCommandKind::set_output_name:
     shell->output_name = command.value;
-    schedule_validation(window, false);
+    schedule_validation(window, false, GuiValidationPurpose::output);
     break;
   case pano::app::WebViewCommandKind::toggle_resolution_mode:
     if (!shell->resolution_pixels && shell->explicit_width.empty()) {
@@ -3286,11 +3358,11 @@ void handle_webview_command(const HWND window,
         shell->explicit_width = std::to_wstring(width);
     }
     shell->resolution_pixels = !shell->resolution_pixels;
-    schedule_validation(window, false);
+    schedule_validation(window, false, GuiValidationPurpose::output);
     break;
   case pano::app::WebViewCommandKind::set_resolution_percent:
     shell->resolution_percent = command.value;
-    schedule_validation(window, false);
+    schedule_validation(window, false, GuiValidationPurpose::output);
     break;
   case pano::app::WebViewCommandKind::set_output_width:
     try {
@@ -3301,13 +3373,13 @@ void handle_webview_command(const HWND window,
             shell->output_maximum_width != 0U
                 ? std::min<unsigned long>(value, shell->output_maximum_width)
                 : value);
-        schedule_validation(window, false);
+        schedule_validation(window, false, GuiValidationPurpose::output);
         break;
       }
     } catch (const std::exception &) {
     }
     shell->explicit_width = command.value;
-    schedule_validation(window, false);
+    schedule_validation(window, false, GuiValidationPurpose::output);
     break;
   case pano::app::WebViewCommandKind::set_output_format:
     if (command.value == L"jpeg")
@@ -3319,7 +3391,7 @@ void handle_webview_command(const HWND window,
     break;
   case pano::app::WebViewCommandKind::set_jpeg_quality:
     shell->jpeg_quality = command.value;
-    schedule_validation(window, false);
+    schedule_validation(window, false, GuiValidationPurpose::output);
     break;
   case pano::app::WebViewCommandKind::open_settings:
     open_webview_app_settings(*shell);
@@ -3352,8 +3424,11 @@ void handle_webview_command(const HWND window,
     }
     break;
   case pano::app::WebViewCommandKind::finalize_preview:
-    if (retained_preview_ready())
+    if (retained_preview_ready()) {
       navigate_stage(window, pano::app::GuiStage::output);
+      if (runtime_state().completed_validation != GuiValidationPurpose::output)
+        schedule_validation(window, false, GuiValidationPurpose::output);
+    }
     break;
   case pano::app::WebViewCommandKind::render:
     request_render(window, false);
@@ -3775,12 +3850,32 @@ int webview_self_test(const HINSTANCE instance, GuiShellState &shell,
   pano::app::GuiRenderRequestState captured_request;
   std::string capture_error;
   if (!capture_gui_request(captured_request, capture_error) ||
+      !captured_request.output_directory.empty() ||
       captured_request.gpu == forced_cpu ||
       (forced_cpu && (captured_request.gpu_memory_mib.has_value() ||
                       captured_request.gpu_strict)) ||
       (!forced_cpu && (!captured_request.gpu_memory_mib.has_value() ||
                        *captured_request.gpu_memory_mib == 0U)))
     return fail(62);
+  shell.jpeg_quality = L"invalid";
+  shell.resolution_percent = L"invalid";
+  shell.explicit_width = L"invalid";
+  pano::app::GuiRenderRequestState preview_request;
+  if (!capture_gui_request(preview_request, capture_error,
+                           GuiValidationPurpose::preview) ||
+      preview_request.output_name != "preview.png" ||
+      preview_request.resolution_percent != 100U ||
+      preview_request.width.has_value() || preview_request.jpeg_quality != 95U)
+    return fail(78);
+  shell.output_format = "png";
+  shell.resolution_percent = L"100";
+  pano::app::GuiRenderRequestState png_request;
+  if (!capture_gui_request(png_request, capture_error) ||
+      png_request.jpeg_quality != 95U)
+    return fail(79);
+  shell.output_format = "jpeg";
+  shell.jpeg_quality = L"95";
+  shell.explicit_width.clear();
 
   const std::filesystem::path output_directory =
       std::filesystem::temp_directory_path() /
@@ -3799,6 +3894,7 @@ int webview_self_test(const HINSTANCE instance, GuiShellState &shell,
       std::filesystem::remove_all(directory, ignored);
     }
   } output_cleanup{output_directory};
+  shell.output_directory = output_directory.wstring();
 
   pano::app::RenderPlan plan;
   plan.session.schema_version = 5U;
@@ -3860,6 +3956,7 @@ int webview_self_test(const HINSTANCE instance, GuiShellState &shell,
   shell.webview_modal = {};
   KillTimer(window, validation_timer_id);
   runtime_state().validation_state.plan = plan;
+  runtime_state().completed_validation = GuiValidationPurpose::output;
   shell.workflow.validation_ready = true;
   sync_webview_snapshot(window);
 

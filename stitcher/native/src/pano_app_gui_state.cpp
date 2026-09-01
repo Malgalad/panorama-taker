@@ -65,7 +65,8 @@ bool snapshot_gui_render_request(const GuiRenderRequestState &state,
     error = "format must be jpeg, png, or exr";
     return false;
   }
-  if (state.jpeg_quality < 1U || state.jpeg_quality > 100U) {
+  if (state.format == "jpeg" &&
+      (state.jpeg_quality < 1U || state.jpeg_quality > 100U)) {
     error = "JPEG quality must be between 1 and 100";
     return false;
   }
@@ -132,6 +133,25 @@ bool snapshot_gui_render_request(const GuiRenderRequestState &state,
   snapshot.final_exposure_ev = state.final_exposure_ev;
   options = std::move(snapshot);
   return true;
+}
+
+bool snapshot_gui_preview_request(const GuiRenderRequestState &state,
+                                  const std::string &temporary_directory,
+                                  RenderOptions &options, std::string &error) {
+  if (temporary_directory.empty()) {
+    error = "preview temporary directory is unavailable";
+    return false;
+  }
+  GuiRenderRequestState preview = state;
+  preview.output_directory = temporary_directory;
+  preview.output_name = "preview.png";
+  preview.width.reset();
+  preview.resolution_percent = 100U;
+  preview.format = "png";
+  preview.jpeg_quality = 95U;
+  preview.thumbnail = false;
+  preview.coverage = false;
+  return snapshot_gui_render_request(preview, options, error);
 }
 
 std::uint64_t begin_gui_validation(GuiValidationState &state) noexcept {

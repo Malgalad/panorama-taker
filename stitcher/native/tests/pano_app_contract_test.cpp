@@ -1991,6 +1991,37 @@ void test_gui_request_and_validation_state() {
   EXPECT(!enablement.jpeg_quality && !enablement.gpu_strict);
 
   TemporaryDirectory temporary;
+  pano::app::GuiRenderRequestState preview_request;
+  preview_request.session = (fixtures() / "shared-valid.json").u8string();
+  preview_request.output_name = "invalid?.name";
+  preview_request.width = 0U;
+  preview_request.resolution_percent = 0U;
+  preview_request.format = "invalid";
+  preview_request.jpeg_quality = 0U;
+  preview_request.thumbnail = true;
+  preview_request.coverage = true;
+  pano::app::RenderOptions preview_options;
+  std::string preview_error;
+  EXPECT(!pano::app::snapshot_gui_render_request(
+      preview_request, preview_options, preview_error));
+  EXPECT(preview_error.find("output directory") != std::string::npos);
+  const auto preview_directory = temporary.path() / "local-app-data";
+  EXPECT(pano::app::snapshot_gui_preview_request(
+      preview_request, preview_directory.u8string(), preview_options,
+      preview_error));
+  EXPECT(fs::u8path(preview_options.output) ==
+         preview_directory / "preview.png");
+  EXPECT(!preview_options.width.has_value() &&
+         std::abs(preview_options.resolution - 1.0) < 1.0e-12 &&
+         preview_options.format == "png" &&
+         preview_options.jpeg_quality == 95U && !preview_options.thumbnail &&
+         !preview_options.coverage);
+  pano::app::RenderPlan preview_plan;
+  EXPECT(pano::app::make_render_plan(preview_options, preview_plan,
+                                     preview_error));
+  EXPECT(preview_plan.session.session_id == "shared-valid" &&
+         preview_plan.outputs.panorama.final_path == preview_options.output);
+
   request.session = (fixtures() / "shared-valid.json").u8string();
   request.session_id = u8"сессия-1";
   request.image_dir = u8"изображения";
@@ -2037,6 +2068,14 @@ void test_gui_request_and_validation_state() {
   request.gpu = true;
   request.gpu_memory_mib.reset();
   request.memory_mib = 1024U;
+
+  request.format = "png";
+  request.jpeg_quality = 0U;
+  EXPECT(pano::app::snapshot_gui_render_request(request, options, error));
+  request.format = "jpeg";
+  EXPECT(!pano::app::snapshot_gui_render_request(request, options, error));
+  EXPECT(error.find("JPEG quality") != std::string::npos);
+  request.jpeg_quality = 95U;
 
   request.resolution_percent = 0U;
   EXPECT(!pano::app::snapshot_gui_render_request(request, options, error));

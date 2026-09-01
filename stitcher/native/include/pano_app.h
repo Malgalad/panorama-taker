@@ -809,6 +809,9 @@ std::optional<std::string>
 gui_output_format_from_filename(const std::string &filename);
 bool snapshot_gui_render_request(const GuiRenderRequestState &state,
                                  RenderOptions &options, std::string &error);
+bool snapshot_gui_preview_request(const GuiRenderRequestState &state,
+                                  const std::string &temporary_directory,
+                                  RenderOptions &options, std::string &error);
 std::uint64_t begin_gui_validation(GuiValidationState &state) noexcept;
 bool complete_gui_validation(GuiValidationState &state,
                              std::uint64_t generation,
