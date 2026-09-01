@@ -2011,6 +2011,8 @@ PANO_GPU_API uint64_t pano_gpu_test_session_first_upload_slot_fence(
     const pano_gpu_session *session) PANO_GPU_NOEXCEPT;
 PANO_GPU_API uint64_t pano_gpu_test_session_second_upload_slot_fence(
     const pano_gpu_session *session) PANO_GPU_NOEXCEPT;
+PANO_GPU_API uint32_t pano_gpu_test_session_upload_command_allocator_count(
+    const pano_gpu_session *session) PANO_GPU_NOEXCEPT;
 PANO_GPU_API pano_gpu_result pano_gpu_test_read_session_rotations(
     const pano_gpu_session *session,
     void *rotations,

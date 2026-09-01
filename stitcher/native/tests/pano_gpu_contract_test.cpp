@@ -1750,6 +1750,7 @@ int main(const int argc, char **const argv)
     EXPECT(pano_gpu_test_session_second_upload_slot_bytes(session) == 0);
     EXPECT(pano_gpu_session_allocate_second_upload_slot(
                session, error.data(), static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(pano_gpu_test_session_upload_command_allocator_count(session) == 0);
     EXPECT(pano_gpu_test_session_second_upload_slot_bytes(session) == 64ULL * 1024);
     EXPECT(pano_gpu_session_allocate_second_upload_slot(
                session, error.data(), static_cast<uint32_t>(error.size())) == PANO_GPU_INVALID_ARGUMENT);
@@ -4120,6 +4121,62 @@ int main(const int argc, char **const argv)
     EXPECT(scratch_diagnostics.sample_count == 0);
     EXPECT(scratch_diagnostics.device_bytes == 0);
     EXPECT(scratch_diagnostics.resource_count == 0);
+    diagnostics.abi_version = PANO_GPU_ABI_VERSION;
+    EXPECT(pano_gpu_query_diagnostics(
+               &diagnostics, error.data(), static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    const uint32_t upload_teardown_baseline = diagnostics.live_session_count;
+    pano_gpu_source_upload teardown_upload = source_upload;
+    teardown_upload.frame_index = 0;
+    pano_gpu_session *teardown_session = nullptr;
+    EXPECT(pano_gpu_session_create(
+               device, &session_options, &teardown_session, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(pano_gpu_session_allocate_source(
+               teardown_session, error.data(), static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(pano_gpu_session_allocate_upload_slot(
+               teardown_session, error.data(), static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(pano_gpu_session_upload_frame_zero(
+               teardown_session, &teardown_upload, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(pano_gpu_test_session_upload_command_allocator_count(teardown_session) == 1);
+    pano_gpu_cancellation_token *teardown_token = nullptr;
+    EXPECT(pano_gpu_cancellation_token_create(
+               &teardown_token, error.data(), static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    pano_gpu_cancellation_token_cancel(teardown_token);
+    EXPECT(pano_gpu_session_finish_uploads_cancellable(
+               teardown_session, teardown_token, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_CANCELLED);
+    EXPECT(pano_gpu_test_session_upload_command_allocator_count(teardown_session) == 1);
+    pano_gpu_cancellation_token_destroy(&teardown_token);
+    pano_gpu_session_destroy(&teardown_session);
+    EXPECT(teardown_session == nullptr);
+    EXPECT(pano_gpu_query_diagnostics(
+               &diagnostics, error.data(), static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(diagnostics.live_session_count == upload_teardown_baseline);
+
+    pano_gpu_session *untracked_session = nullptr;
+    EXPECT(pano_gpu_session_create(
+               device, &session_options, &untracked_session, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(pano_gpu_session_allocate_source(
+               untracked_session, error.data(), static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(pano_gpu_session_allocate_upload_slot(
+               untracked_session, error.data(), static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    pano_gpu_test_fail_next_fence_signal();
+    EXPECT(pano_gpu_session_upload_frame_zero(
+               untracked_session, &teardown_upload, error.data(),
+               static_cast<uint32_t>(error.size())) == PANO_GPU_UNAVAILABLE);
+    EXPECT(pano_gpu_test_session_upload_command_allocator_count(untracked_session) == 1);
+    EXPECT(pano_gpu_session_finish_uploads(
+               untracked_session, error.data(), static_cast<uint32_t>(error.size())) ==
+           PANO_GPU_UNAVAILABLE);
+    EXPECT(pano_gpu_test_session_upload_command_allocator_count(untracked_session) == 1);
+    pano_gpu_session_destroy(&untracked_session);
+    EXPECT(untracked_session == nullptr);
+    EXPECT(pano_gpu_query_diagnostics(
+               &diagnostics, error.data(), static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(diagnostics.live_session_count == upload_teardown_baseline);
+
     EXPECT(pano_gpu_session_allocate_source(session, error.data(), static_cast<uint32_t>(error.size())) ==
            PANO_GPU_SUCCESS);
     EXPECT(pano_gpu_session_allocate_upload_slot(
@@ -4128,6 +4185,7 @@ int main(const int argc, char **const argv)
                session, error.data(), static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
     std::array<uint8_t, 48> second_source_data {};
     std::array<uint8_t, 48> third_source_data {};
+    EXPECT(pano_gpu_test_session_upload_command_allocator_count(session) == 0);
     for (size_t index = 0; index < second_source_data.size(); ++index)
     {
         second_source_data[index] = static_cast<uint8_t>(255U - index * 3U);
@@ -4137,13 +4195,10 @@ int main(const int argc, char **const argv)
     pano_gpu_cancellation_token *active_upload_token = nullptr;
     EXPECT(pano_gpu_cancellation_token_create(
                &active_upload_token, error.data(), static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
-    pano_gpu_test_fail_next_fence_signal();
-    EXPECT(pano_gpu_session_upload_frame_cancellable(
-               session, &second_upload, active_upload_token, error.data(),
-               static_cast<uint32_t>(error.size())) == PANO_GPU_UNAVAILABLE);
     EXPECT(pano_gpu_session_upload_frame_cancellable(
                session, &second_upload, active_upload_token, error.data(),
                static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(pano_gpu_test_session_upload_command_allocator_count(session) == 1);
     pano_gpu_cancellation_token_destroy(&active_upload_token);
     const uint64_t first_upload_fence = pano_gpu_test_session_first_upload_slot_fence(session);
     EXPECT(first_upload_fence != 0);
@@ -4164,11 +4219,13 @@ int main(const int argc, char **const argv)
                static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
     EXPECT(cancelled_upload_diagnostics.upload_count == 1);
     EXPECT(cancelled_upload_diagnostics.uploaded_bytes == source_data.size());
+    EXPECT(pano_gpu_test_session_upload_command_allocator_count(session) == 1);
     pano_gpu_cancellation_token_destroy(&cancelled_upload_token);
     EXPECT(pano_gpu_session_upload_frame(
                session, &second_upload, error.data(), static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
     const uint64_t second_upload_fence = pano_gpu_test_session_second_upload_slot_fence(session);
     EXPECT(second_upload_fence != 0);
+    EXPECT(pano_gpu_test_session_upload_command_allocator_count(session) == 2);
     second_upload.frame_index = 2;
     second_upload.data = third_source_data.data();
     pano_gpu_cancellation_token *post_wait_upload_token = nullptr;
@@ -4179,6 +4236,7 @@ int main(const int argc, char **const argv)
                session, &second_upload, post_wait_upload_token, error.data(),
                static_cast<uint32_t>(error.size())) == PANO_GPU_CANCELLED);
     EXPECT(pano_gpu_test_session_first_upload_slot_fence(session) == first_upload_fence);
+    EXPECT(pano_gpu_test_session_upload_command_allocator_count(session) == 1);
     EXPECT(pano_gpu_test_read_session_frame(
                session, 0, read_source_data.data(), read_source_data.size(), error.data(),
                static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
@@ -4189,15 +4247,18 @@ int main(const int argc, char **const argv)
     EXPECT(pano_gpu_test_session_upload_slot_bytes(session) == 64ULL * 1024);
     EXPECT(pano_gpu_test_session_first_upload_slot_fence(session) > first_upload_fence);
     EXPECT(pano_gpu_test_session_second_upload_slot_fence(session) == second_upload_fence);
+    EXPECT(pano_gpu_test_session_upload_command_allocator_count(session) == 2);
     pano_gpu_cancellation_token *finish_token = nullptr;
     EXPECT(pano_gpu_cancellation_token_create(
                &finish_token, error.data(), static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
     pano_gpu_test_cancel_after_next_upload_finish_wait();
     EXPECT(pano_gpu_session_finish_uploads_cancellable(
                session, finish_token, error.data(), static_cast<uint32_t>(error.size())) == PANO_GPU_CANCELLED);
+    EXPECT(pano_gpu_test_session_upload_command_allocator_count(session) == 1);
     pano_gpu_cancellation_token_destroy(&finish_token);
     EXPECT(pano_gpu_session_finish_uploads(
                session, error.data(), static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    EXPECT(pano_gpu_test_session_upload_command_allocator_count(session) == 0);
     pano_gpu_session_diagnostics finished_upload_diagnostics {};
     finished_upload_diagnostics.size = sizeof(finished_upload_diagnostics);
     finished_upload_diagnostics.abi_version = PANO_GPU_ABI_VERSION;

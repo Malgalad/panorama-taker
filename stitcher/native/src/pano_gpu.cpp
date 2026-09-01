@@ -94,6 +94,7 @@ std::atomic<bool> fail_next_preview_surface_device_removed {false};
 #if defined(PANO_GPU_TEST_HOOKS)
 std::atomic<bool> fail_next_fence_wait {false};
 #endif
+bool drain_session_uploads_for_release(pano_gpu_session *session) noexcept;
 } // namespace
 
 struct pano_gpu_cancellation_token
@@ -162,6 +163,7 @@ struct pano_gpu_session
     uint32_t upload_count {0};
     uint64_t uploaded_bytes {0};
     uint64_t last_completed_upload_fence {0};
+    bool upload_submission_untracked {false};
     std::vector<uint64_t> frame_upload_fences;
     bool source_is_shader_readable {false};
     uint64_t exposure_proxy_bytes {0};
@@ -209,8 +211,10 @@ struct pano_gpu_session
     Microsoft::WRL::ComPtr<ID3D12Resource> rotations;
     Microsoft::WRL::ComPtr<ID3D12Resource> encoding_metadata;
     Microsoft::WRL::ComPtr<ID3D12Resource> upload_slot;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> first_upload_command_allocator;
     void *mapped_upload_slot {nullptr};
     Microsoft::WRL::ComPtr<ID3D12Resource> second_upload_slot;
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> second_upload_command_allocator;
     void *mapped_second_upload_slot {nullptr};
 #endif
     bool count_registered {false};
@@ -377,7 +381,15 @@ struct pano_gpu_preview_surface
 void release_session(pano_gpu_session *const session)
 {
     if (session != nullptr && session->reference_count.fetch_sub(1, std::memory_order_acq_rel) == 1)
+    {
+        if (!drain_session_uploads_for_release(session))
+        {
+            // A live queue may still reference every session-owned upload object.
+            debug_log("session retained because GPU upload completion could not be proven");
+            return;
+        }
         delete session;
+    }
 }
 
 
@@ -626,6 +638,7 @@ void dump_dred(ID3D12Device *const device, const char *const operation) noexcept
 struct upload_slot_selection
 {
     ID3D12Resource *resource {nullptr};
+    Microsoft::WRL::ComPtr<ID3D12CommandAllocator> *command_allocator {nullptr};
     void *mapped {nullptr};
     uint64_t *last_fence {nullptr};
 };
@@ -731,6 +744,65 @@ pano_gpu_result wait_for_fence(
     return PANO_GPU_SUCCESS;
 }
 #endif
+
+bool drain_session_uploads_for_release(pano_gpu_session *const session) noexcept
+{
+#if !defined(_WIN32)
+    (void)session;
+    return true;
+#else
+    if (session == nullptr || !session->device_core)
+        return true;
+    const bool has_retained_allocator = session->first_upload_command_allocator != nullptr ||
+        session->second_upload_command_allocator != nullptr;
+    if (!has_retained_allocator && !session->upload_submission_untracked)
+        return true;
+
+    pano_gpu_device_core *const device_core = session->device_core.get();
+    uint64_t drain_fence = 0;
+    if (session->upload_submission_untracked)
+    {
+        const HRESULT removal_reason = device_core->d3d_device->GetDeviceRemovedReason();
+        if (FAILED(removal_reason))
+        {
+            debug_log(
+                "source upload teardown skipped after device removal reason=0x%08lx",
+                static_cast<unsigned long>(removal_reason));
+            return true;
+        }
+        drain_fence = device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
+        const HRESULT signal_result =
+            device_core->queue->Signal(device_core->fence.Get(), drain_fence);
+        debug_log(
+            "source upload teardown recovery signal HRESULT=0x%08lx fence=%llu",
+            static_cast<unsigned long>(signal_result),
+            static_cast<unsigned long long>(drain_fence));
+        if (FAILED(signal_result))
+        {
+            const HRESULT post_signal_reason = device_core->d3d_device->GetDeviceRemovedReason();
+            if (FAILED(post_signal_reason))
+                return true;
+            return false;
+        }
+    }
+    else
+    {
+        if (session->first_upload_command_allocator)
+            drain_fence = std::max(drain_fence, session->first_upload_slot_fence);
+        if (session->second_upload_command_allocator)
+            drain_fence = std::max(drain_fence, session->second_upload_slot_fence);
+    }
+    if (drain_fence == 0)
+        return false;
+
+    const pano_gpu_result wait_result = wait_for_fence(
+        device_core, drain_fence, nullptr, 0, "D3D12 source upload teardown fence timed out");
+    const uint64_t completed_fence = device_core->fence->GetCompletedValue();
+    if (wait_result == PANO_GPU_SUCCESS || completed_fence >= drain_fence)
+        return true;
+    return FAILED(device_core->d3d_device->GetDeviceRemovedReason());
+#endif
+}
 
 bool valid_probe_arguments(
     const pano_gpu_probe_options *options, pano_gpu_adapter_info *adapter, char *error_buffer,
@@ -3148,6 +3220,8 @@ pano_gpu_result pano_gpu_session_allocate_upload_slot(
     session->upload_slot = upload_slot;
     session->mapped_upload_slot = mapped;
     session->upload_slot_bytes = upload_slot_bytes;
+    if (debug_diagnostics_enabled())
+        session->upload_slot->SetName(L"PanoramaCapture source upload slot 0");
     return PANO_GPU_SUCCESS;
 #endif
 }
@@ -3203,6 +3277,8 @@ pano_gpu_result pano_gpu_session_allocate_second_upload_slot(
     session->second_upload_slot = upload_slot;
     session->mapped_second_upload_slot = mapped;
     session->second_upload_slot_bytes = session->upload_slot_bytes;
+    if (debug_diagnostics_enabled())
+        session->second_upload_slot->SetName(L"PanoramaCapture source upload slot 1");
     return PANO_GPU_SUCCESS;
 #endif
 }
@@ -3234,14 +3310,23 @@ pano_gpu_result upload_frame_impl(
     const bool use_second_slot = session->second_upload_slot && (session->upload_count % 2U) != 0;
     const upload_slot_selection selected_slot = use_second_slot
         ? upload_slot_selection {
-              session->second_upload_slot.Get(), session->mapped_second_upload_slot,
+              session->second_upload_slot.Get(), &session->second_upload_command_allocator,
+              session->mapped_second_upload_slot,
               &session->second_upload_slot_fence}
         : upload_slot_selection {
-              session->upload_slot.Get(), session->mapped_upload_slot, &session->first_upload_slot_fence};
-    if (!session->source || selected_slot.resource == nullptr || selected_slot.mapped == nullptr)
+              session->upload_slot.Get(), &session->first_upload_command_allocator,
+              session->mapped_upload_slot, &session->first_upload_slot_fence};
+    if (!session->source || selected_slot.resource == nullptr ||
+        selected_slot.command_allocator == nullptr || selected_slot.mapped == nullptr)
     {
         write_error(error_buffer, error_buffer_size, "D3D12 source upload storage is not allocated");
         return PANO_GPU_INVALID_ARGUMENT;
+    }
+    if (session->upload_submission_untracked ||
+        (*selected_slot.last_fence == 0 && selected_slot.command_allocator->Get() != nullptr))
+    {
+        write_error(error_buffer, error_buffer_size, "D3D12 source upload slot has untracked GPU work");
+        return PANO_GPU_UNAVAILABLE;
     }
     if (token != nullptr && token->cancelled.load(std::memory_order_relaxed))
         return PANO_GPU_CANCELLED;
@@ -3254,6 +3339,8 @@ pano_gpu_result upload_frame_impl(
     }
     session->last_completed_upload_fence =
         std::max(session->last_completed_upload_fence, *selected_slot.last_fence);
+    if (reusing_slot)
+        selected_slot.command_allocator->Reset();
 #if defined(PANO_GPU_TEST_HOOKS)
     if (reusing_slot && token != nullptr &&
         cancel_after_next_upload_slot_wait.exchange(false, std::memory_order_relaxed))
@@ -3288,6 +3375,12 @@ pano_gpu_result upload_frame_impl(
     }
     if (debug_diagnostics_enabled())
     {
+        wchar_t allocator_name[112] {};
+        std::swprintf(
+            allocator_name, std::size(allocator_name),
+            L"PanoramaCapture source upload allocator slot %u frame %u",
+            use_second_slot ? 1U : 0U, upload->frame_index);
+        allocator->SetName(allocator_name);
         wchar_t list_name[96] {};
         std::swprintf(list_name, std::size(list_name), L"PanoramaCapture source upload frame %u",
                       upload->frame_index);
@@ -3312,21 +3405,23 @@ pano_gpu_result upload_frame_impl(
         return PANO_GPU_UNAVAILABLE;
     }
     ID3D12CommandList *lists[] = {list.Get()};
+    *selected_slot.command_allocator = allocator;
     session->device_core->queue->ExecuteCommandLists(1, lists);
     session->source_is_shader_readable = false;
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
 #if defined(PANO_GPU_TEST_HOOKS)
-    const bool injected_signal_failure =
+    const bool inject_signal_failure =
         fail_next_fence_signal.exchange(false, std::memory_order_relaxed);
 #else
-    const bool injected_signal_failure = false;
+    constexpr bool inject_signal_failure = false;
 #endif
-    const HRESULT signal_result = injected_signal_failure
+    const HRESULT signal_result = inject_signal_failure
         ? E_FAIL
         : session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value);
     if (FAILED(signal_result))
     {
+        session->upload_submission_untracked = true;
         write_device_error(
             error_buffer, error_buffer_size, "cannot signal D3D12 source upload fence",
             signal_result, session->device_core->d3d_device.Get());
@@ -3386,6 +3481,14 @@ pano_gpu_result finish_uploads_impl(
     write_error(error_buffer, error_buffer_size, "D3D12 is available only on Windows");
     return PANO_GPU_UNAVAILABLE;
 #else
+    if (session->upload_submission_untracked)
+    {
+        write_device_error(
+            error_buffer, error_buffer_size,
+            "cannot finish D3D12 source uploads after an untracked queue submission", E_FAIL,
+            session->device_core->d3d_device.Get());
+        return PANO_GPU_UNAVAILABLE;
+    }
     if (token != nullptr && token->cancelled.load(std::memory_order_relaxed))
         return PANO_GPU_CANCELLED;
     if (session->first_upload_slot_fence != 0 &&
@@ -3395,6 +3498,7 @@ pano_gpu_result finish_uploads_impl(
     {
         return PANO_GPU_UNAVAILABLE;
     }
+    session->first_upload_command_allocator.Reset();
 #if defined(PANO_GPU_TEST_HOOKS)
     if (token != nullptr &&
         cancel_after_next_upload_finish_wait.exchange(false, std::memory_order_relaxed))
@@ -3420,6 +3524,7 @@ pano_gpu_result finish_uploads_impl(
         return PANO_GPU_CANCELLED;
     session->last_completed_upload_fence =
         std::max(session->last_completed_upload_fence, session->second_upload_slot_fence);
+    session->second_upload_command_allocator.Reset();
     bool has_uploaded_frame = false;
     for (const uint64_t frame_fence : session->frame_upload_fences)
         has_uploaded_frame = has_uploaded_frame || frame_fence != 0;
@@ -16035,6 +16140,20 @@ uint64_t pano_gpu_test_session_first_upload_slot_fence(const pano_gpu_session *c
 uint64_t pano_gpu_test_session_second_upload_slot_fence(const pano_gpu_session *const session) noexcept
 {
     return session == nullptr ? 0 : session->second_upload_slot_fence;
+}
+
+uint32_t pano_gpu_test_session_upload_command_allocator_count(
+    const pano_gpu_session *const session) noexcept
+{
+#if !defined(_WIN32)
+    (void)session;
+    return 0;
+#else
+    if (session == nullptr)
+        return 0;
+    return (session->first_upload_command_allocator ? 1U : 0U) +
+        (session->second_upload_command_allocator ? 1U : 0U);
+#endif
 }
 
 pano_gpu_result pano_gpu_test_read_session_rotations(
