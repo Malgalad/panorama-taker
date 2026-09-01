@@ -21,6 +21,11 @@ foreach ($entry in $declarations.GetEnumerator()) {
         throw "$($entry.Key) does not match native version $version"
     }
 }
+$releaseWorkflow = Get-Content -LiteralPath `
+    (Join-Path $projectRoot ".github\workflows\release.yml") -Raw
+if (-not $releaseWorkflow.Contains('          ref: ${{ github.ref }}')) {
+    throw "Release workflow must check out the triggering ref"
+}
 
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("pano-version-policy-" + [guid]::NewGuid())
 try {
