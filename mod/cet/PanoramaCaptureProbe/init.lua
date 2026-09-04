@@ -1,4 +1,4 @@
-local MOD_VERSION = "1.1.4"
+local MOD_VERSION = "1.1.5"
 local DEVELOPMENT_MODE = false
 
 local function log(message)
@@ -29,6 +29,7 @@ local nativeSettings = nil
 local settingsDraftSettle = nil
 local settingsDraftScreenshotCooldown = nil
 local settingsDraftCaptureFov = nil
+local settingsDraftInstantAutoExposure = nil
 local nativeSettingsCaptureSummaryOption = nil
 local updateCaptureSummary = nil
 local bridgeCaptureRange = "unknown"
@@ -37,6 +38,7 @@ local SETTINGS_FILE = "settings.json"
 local SETTINGS_DEFAULTS = {
     settleSeconds = 1.0,
     screenshotCooldownSeconds = 3.1,
+    instantAutoExposure = true,
 }
 
 local function isFiniteNumber(value)
@@ -51,6 +53,7 @@ local captureConfig = {
     -- nil uses the active in-game display FoV for this session.
     captureFov = nil,
     screenshotCooldownSeconds = SETTINGS_DEFAULTS.screenshotCooldownSeconds,
+    instantAutoExposure = SETTINGS_DEFAULTS.instantAutoExposure,
     screenshotAckTimeoutSeconds = 15.0,
     -- Release captures require true after installing PanoramaCaptureReShade.addon64.
     automatedScreenshots = true,
@@ -62,12 +65,15 @@ local CAMERA_POSITION_TOLERANCE = 0.001
 local CAMERA_FOV_TOLERANCE_DEGREES = 0.05
 local CAMERA_PITCH_TOLERANCE_DEGREES = 0.25
 local CAMERA_YAW_TOLERANCE_DEGREES = 0.25
+local INSTANT_AUTO_EXPOSURE_CATEGORY = "Rendering"
+local INSTANT_AUTO_EXPOSURE_OPTION = "ForcedInstantAutoExposure"
 
 local function savePersistentSettings()
     local settings = {
         schemaVersion = 1,
         settleSeconds = captureConfig.settleSeconds,
         screenshotCooldownSeconds = captureConfig.screenshotCooldownSeconds,
+        instantAutoExposure = captureConfig.instantAutoExposure,
     }
     if captureConfig.captureFov ~= nil then
         settings.captureFov = captureConfig.captureFov
@@ -116,6 +122,9 @@ local function loadPersistentSettings()
     if isFiniteNumber(settings.captureFov) and settings.captureFov >= 30 and settings.captureFov <= 120 then
         captureConfig.captureFov = settings.captureFov
     end
+    if type(settings.instantAutoExposure) == "boolean" then
+        captureConfig.instantAutoExposure = settings.instantAutoExposure
+    end
 end
 
 local function nativeSettingsCaptureFovDefault()
@@ -147,6 +156,7 @@ local function registerNativeSettings()
     settingsDraftSettle = captureConfig.settleSeconds
     settingsDraftScreenshotCooldown = captureConfig.screenshotCooldownSeconds
     settingsDraftCaptureFov = captureConfig.captureFov
+    settingsDraftInstantAutoExposure = captureConfig.instantAutoExposure
     local visibleCaptureFov = settingsDraftCaptureFov or nativeSettingsCaptureFovDefault()
     local okApi = pcall(function()
         nativeSettings.addTab("/PanoramaCapture", "Panorama Capture", nil)
@@ -171,6 +181,19 @@ local function registerNativeSettings()
             end,
             1
         )
+        nativeSettings.addSwitch(
+            "/PanoramaCapture/Capture",
+            "Instant auto exposure",
+            "Force exposure to adapt immediately for each capture pose. Turn off only to compare normal temporal adaptation.",
+            settingsDraftInstantAutoExposure,
+            SETTINGS_DEFAULTS.instantAutoExposure,
+            function(value)
+                settingsDraftInstantAutoExposure = value
+                captureConfig.instantAutoExposure = value
+                savePersistentSettings()
+            end,
+            2
+        )
         nativeSettings.addRangeFloat(
             "/PanoramaCapture/Capture",
             "ReShade toast cooldown",
@@ -189,7 +212,7 @@ local function registerNativeSettings()
                     updateCaptureSummary()
                 end
             end,
-            2
+            3
         )
         nativeSettings.addRangeFloat(
             "/PanoramaCapture/Capture",
@@ -209,7 +232,7 @@ local function registerNativeSettings()
                     updateCaptureSummary()
                 end
             end,
-            3
+            4
         )
         nativeSettingsCaptureSummaryOption = nativeSettings.addCustom(
             "/PanoramaCapture/Capture",
@@ -229,7 +252,7 @@ local function registerNativeSettings()
                 text:Reparent(parent, -1)
                 option.textWidget = text
             end,
-            4
+            5
         )
         if updateCaptureSummary ~= nil then
             updateCaptureSummary()
@@ -237,8 +260,10 @@ local function registerNativeSettings()
         nativeSettings.registerRestoreDefaultsCallback("/PanoramaCapture/Capture", false, function()
             settingsDraftSettle = SETTINGS_DEFAULTS.settleSeconds
             settingsDraftScreenshotCooldown = SETTINGS_DEFAULTS.screenshotCooldownSeconds
+            settingsDraftInstantAutoExposure = SETTINGS_DEFAULTS.instantAutoExposure
             captureConfig.settleSeconds = SETTINGS_DEFAULTS.settleSeconds
             captureConfig.screenshotCooldownSeconds = SETTINGS_DEFAULTS.screenshotCooldownSeconds
+            captureConfig.instantAutoExposure = SETTINGS_DEFAULTS.instantAutoExposure
             settingsDraftCaptureFov = nil
             captureConfig.captureFov = nil
             savePersistentSettings()
@@ -264,9 +289,15 @@ local function syncNativeSettings()
     if settingsDraftCaptureFov ~= nil then
         captureConfig.captureFov = settingsDraftCaptureFov
     end
+    if settingsDraftInstantAutoExposure ~= nil then
+        captureConfig.instantAutoExposure = settingsDraftInstantAutoExposure
+    end
 end
 
 local function configurationError()
+    if type(captureConfig.instantAutoExposure) ~= "boolean" then
+        return "instantAutoExposure must be a boolean"
+    end
     if not isFiniteNumber(captureConfig.overlap) or captureConfig.overlap < 0 or captureConfig.overlap >= 0.5 then
         return "overlap must be a finite number in [0, 0.5)"
     end
@@ -1094,6 +1125,61 @@ local function hasConflictingTimeDilation()
     return false
 end
 
+local function readInstantAutoExposure()
+    local ok, value = pcall(function()
+        return GameOptions.Get(INSTANT_AUTO_EXPOSURE_CATEGORY, INSTANT_AUTO_EXPOSURE_OPTION)
+    end)
+    if not ok or (value ~= "true" and value ~= "false") then
+        return nil, "instant auto-exposure option is unavailable"
+    end
+    return value == "true", nil
+end
+
+local function applyInstantAutoExposureOverride(environment)
+    local original, readError = readInstantAutoExposure()
+    if original == nil then
+        return false, readError
+    end
+    environment.originalInstantAutoExposure = original
+    environment.instantAutoExposureSnapshotTaken = true
+    local ok, setError = pcall(function()
+        GameOptions.SetBool(
+            INSTANT_AUTO_EXPOSURE_CATEGORY,
+            INSTANT_AUTO_EXPOSURE_OPTION,
+            environment.instantAutoExposureTarget
+        )
+    end)
+    if not ok then
+        return false, "instant auto-exposure assignment failed: " .. tostring(setError)
+    end
+    local applied, verifyError = readInstantAutoExposure()
+    if applied ~= environment.instantAutoExposureTarget then
+        return false, verifyError or "auto-exposure mode assignment was not applied"
+    end
+    return true, nil
+end
+
+local function restoreInstantAutoExposure(environment)
+    if not environment.instantAutoExposureSnapshotTaken then
+        return
+    end
+    local ok, restoreError = pcall(function()
+        GameOptions.SetBool(
+            INSTANT_AUTO_EXPOSURE_CATEGORY,
+            INSTANT_AUTO_EXPOSURE_OPTION,
+            environment.originalInstantAutoExposure
+        )
+    end)
+    if not ok then
+        log("Instant auto-exposure restore failed: " .. tostring(restoreError))
+        return
+    end
+    local restored = readInstantAutoExposure()
+    if restored ~= environment.originalInstantAutoExposure then
+        log("Instant auto-exposure restore failed: restored value did not match the snapshot")
+    end
+end
+
 local inputRestrictions = {
     "GameplayRestriction.NoMovement",
     "GameplayRestriction.NoCameraControl",
@@ -1143,6 +1229,10 @@ local function applyEnvironmentControls(environment)
     if hasConflictingTimeDilation() then
         return false, "conflicting time dilation is active"
     end
+    local exposureApplied, exposureError = applyInstantAutoExposureOverride(environment)
+    if not exposureApplied then
+        return false, exposureError
+    end
     local timeSystem = Game.GetTimeSystem()
     local okTime, timeError = pcall(function()
         timeSystem:SetIgnoreTimeDilationOnLocalPlayerZero(true)
@@ -1183,6 +1273,7 @@ local function restoreEnvironmentControls(environment)
             timeSystem:SetIgnoreTimeDilationOnLocalPlayerZero(false)
         end)
     end
+    restoreInstantAutoExposure(environment)
 end
 
 local function showCaptureExitStatus(completed, reason)
@@ -1477,15 +1568,17 @@ local function beginProductionCapture(environment)
         spawnElapsed = 0.0,
     }
     environment.state = "camera_spawn_pending"
+    local exposureMode = environment.instantAutoExposureTarget and "instant" or "normal"
     log(
         string.format(
-            "Production session started: %d poses, %dx%d, HFoV=%.3f VFoV=%.3f, adaptive yaw guard=%.1f%%.",
+            "Production session started: %d poses, %dx%d, HFoV=%.3f VFoV=%.3f, adaptive yaw guard=%.1f%%, exposure=%s.",
             #plan.poses,
             plan.columns,
             plan.rows,
             captureHorizontal,
             captureVertical,
-            plan.adaptiveYawGuard * 100.0
+            plan.adaptiveYawGuard * 100.0,
+            exposureMode
         )
     )
     return true, nil
@@ -1560,6 +1653,8 @@ local function startProductionSession()
         targetYaw = 0.0,
         targetPitch = 0.0,
         timeApplied = false,
+        instantAutoExposureTarget = captureConfig.instantAutoExposure,
+        instantAutoExposureSnapshotTaken = false,
         restoreRequested = false,
     }
     local started, startError = beginProductionCapture(environmentSequence)
@@ -1709,6 +1804,12 @@ end
 
 local function requestProductionScreenshot()
     if productionSession == nil or environmentSequence == nil then
+        return
+    end
+    local instantExposure, exposureError = readInstantAutoExposure()
+    if instantExposure ~= environmentSequence.instantAutoExposureTarget then
+        log("Production session cancelled: " .. tostring(exposureError or "auto-exposure mode changed during capture"))
+        requestEnvironmentRestore(exposureError or "auto-exposure mode changed during capture")
         return
     end
     local observed, observedError = observedCameraMetadata()

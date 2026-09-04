@@ -22,7 +22,7 @@ Bind these CET actions:
 - `Panorama: abort full-sphere pose session`
 - `Panorama: report capture status` (development builds only)
 
-Start captures in normal gameplay. Do not use Photo Mode, vehicles, scripted cameras, or an active AMM camera during capture. FreeFly is supported because PanoramaCapture spawns a fixed standalone camera and does not rotate the player. It hides the HUD and player meshes, drives each camera pose, requests screenshots through the ReShade add-on, and restores the original state after completion or abort.
+Start captures in normal gameplay. Do not use Photo Mode, vehicles, scripted cameras, or an active AMM camera during capture. FreeFly is supported because PanoramaCapture spawns a fixed standalone camera and does not rotate the player. It hides the HUD and player meshes, drives each camera pose, requests screenshots through the ReShade add-on, and restores the original state after completion or abort. The default-on **Instant auto exposure** Native Settings option requests immediate adaptation for every pose; turn it off for a normal-adaptation comparison capture. The engine option's previous value is restored after either kind of session.
 
 Completed sessions write `PanoramaCaptureBridge.pano-<session-id>.json` beside the mod. Keep that JSON file with all screenshots from the session.
 

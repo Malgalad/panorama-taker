@@ -2,15 +2,54 @@
 
 ## Status
 
-This is a future capture-side idea, not an implementation decision. No current
-capture behavior, dependency, setting, or restoration contract changes.
+The production capture transaction now has an **Instant auto exposure** Native
+Settings switch. It applies the selected value to REDengine's hidden
+`Rendering/ForcedInstantAutoExposure` option, verifies it again immediately
+before every screenshot request, and restores its exact previous value on every
+exit path. The switch defaults on; turning it off provides a normal temporal
+adaptation control session for A/B testing. In-game validation is still required
+to confirm its visual behavior in representative SDR, HDR, interior, exterior,
+and local-exposure-volume scenes.
 
 Cyberpunk's automatic exposure can change when the panorama camera turns toward
 different luminance distributions. The stitcher compensates for resulting
 overlap discontinuities, but preventing the changes during capture may preserve
 more consistent source pixels.
 
+## Instant adaptation path
+
+The installed Weather Switcher 1.7.6 exposes the engine option as **Instant Auto
+Exposure** and applies it with:
+
+```lua
+GameOptions.SetBool("Rendering", "ForcedInstantAutoExposure", true)
+```
+
+The option also appears in the installed game executable beside other renderer
+exposure controls. CET's `GameOptions.Get` can distinguish an unavailable option
+from a present boolean value, while `SetBool` changes the live hidden option.
+PanoramaCapture therefore reads and verifies the option instead of assuming the
+write succeeded. It explicitly writes either the enabled or disabled value for
+the session, so an A/B test does not inherit another mod's prior setting.
+
+The user's 3DWorldMapFixedDevkit observation does not identify an engine tick.
+Its `SendPosition` function only reads `GetPlayer():GetWorldPosition()` and starts
+an HTTP GET. It does not change time dilation, teleport, queue a game event, or
+touch a camera. The intermittent exposure update is consistent with input or
+request timing perturbing a rendered-frame update, but it is not deterministic
+enough to use during capture.
+
+`ForcedInstantAutoExposure` is intended to remove temporal adaptation delay; it
+does not pin all poses to one exposure value. Each pose should therefore receive
+the exposure calculated for its own luminance distribution without inheriting a
+stale value from the previous view. Existing pose settling remains necessary for
+streaming, lighting, and other temporal rendering systems.
+
 ## Candidate Codeware path
+
+The curve-mutation path below remains a separate future experiment for pinning
+every pose to one explicit EV. It is not needed merely to prevent stale temporal
+adaptation.
 
 The installed Codeware native declarations expose the pieces needed for a
 development probe from CET Lua:
@@ -95,6 +134,14 @@ bypass the pin.
 
 ## Sources inspected
 
+- Installed Cyberpunk 2077 executable renderer-option strings, including
+  `Rendering/ForcedInstantAutoExposure` and related exposure controls.
+- Installed Weather Switcher 1.7.6 `Modules/SettingsManager.lua` and
+  `Modules/TogglesTab.lua`.
+- Installed 3DWorldMapFixedDevkit `init.lua` and FreeFly 2.1 time-dilation and
+  update paths.
+- Cyber Engine Tweaks `GameOptions` implementation:
+  <https://github.com/maximegmd/CyberEngineTweaks/blob/9a8522f2a3d66729d971c48ae48f1053abfb5208/src/scripting/GameOptions.cpp>.
 - Installed Codeware generated declarations in
   `red4ext/plugins/Codeware/Scripts/Codeware.Global.reds`.
 - Codeware resource-reference API:

@@ -22,7 +22,7 @@ Control are not required.
 
 ## Capture
 
-Use normal gameplay outside Photo Mode, vehicles, menus, scripted camera scenes, and active AMM cameras. FreeFly may remain active because PanoramaCapture spawns and controls its own fixed camera without rotating the player. Frame the scene and press the start binding. The mod captures the planned views automatically, requests a ReShade screenshot for each view, and restores the camera and game state when finished.
+Use normal gameplay outside Photo Mode, vehicles, menus, scripted camera scenes, and active AMM cameras. FreeFly may remain active because PanoramaCapture spawns and controls its own fixed camera without rotating the player. Frame the scene and press the start binding. The mod captures the planned views automatically and restores the camera and prior game state when finished. The default-on **Instant auto exposure** Native Settings option requests immediate adaptation for every pose; turn it off for a normal-adaptation comparison capture.
 
 If capture stops, inspect the latest `[PanoramaCaptureProbe]` message in the CET log. Keep the generated `PanoramaCaptureBridge.pano-<session-id>.json` and its screenshots together.
 
