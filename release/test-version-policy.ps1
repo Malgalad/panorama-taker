@@ -32,6 +32,18 @@ if ($releaseWorkflow.Contains('"msbuild=$(& msbuild -version -nologo')) {
 if (-not $releaseWorkflow.Contains('-requires Microsoft.Component.MSBuild')) {
     throw "Release workflow must locate MSBuild through Visual Studio Installer"
 }
+if (-not $releaseWorkflow.Contains('"SOURCE_DATE_EPOCH=$epoch"')) {
+    throw "Release workflow must export the source commit timestamp"
+}
+$releaseBuilder = Get-Content -LiteralPath `
+    (Join-Path $projectRoot "release\build-windows-release.ps1") -Raw
+if (-not $releaseBuilder.Contains('git -C $projectRoot show -s --format=%ct HEAD') -or
+    -not $releaseBuilder.Contains('$entry.LastWriteTime = $archiveTimestamp')) {
+    throw "Release archives must use the source commit timestamp"
+}
+if ($releaseBuilder.Contains('$env:SOURCE_DATE_EPOCH = "946684800"')) {
+    throw "Release builder must not restore the fixed archive timestamp"
+}
 
 $testRoot = Join-Path ([IO.Path]::GetTempPath()) ("pano-version-policy-" + [guid]::NewGuid())
 try {

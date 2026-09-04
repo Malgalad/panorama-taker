@@ -4,9 +4,7 @@
   let pageGeneration = 0;
   let contentSizeFrame = 0;
   let lastContentHeight = null;
-  let exposureTimer = 0;
   let pendingExposure = null;
-  let snapshotBusy = false;
 
   const byId = id => document.getElementById(id);
   const post = (kind, fields = {}) => window.chrome.webview.postMessage({
@@ -16,22 +14,6 @@
     ...fields
   });
   const formatEv = value => `${value > 0 ? '+' : ''}${value.toFixed(1)} EV`;
-
-  function flushPendingExposure() {
-    exposureTimer = 0;
-    if (pendingExposure === null) return;
-    if (snapshotBusy) {
-      exposureTimer = setTimeout(flushPendingExposure, 200);
-      return;
-    }
-    post('set-final-exposure', { value: pendingExposure });
-  }
-
-  function queueExposure(value) {
-    pendingExposure = value;
-    if (exposureTimer) clearTimeout(exposureTimer);
-    exposureTimer = setTimeout(flushPendingExposure, 200);
-  }
 
   function reportContentSize() {
     contentSizeFrame = 0;
@@ -48,7 +30,6 @@
   function render(snapshot) {
     if (snapshot.version !== protocolVersion || snapshot.kind !== 'exposure-snapshot') return;
     pageGeneration = snapshot.pageGeneration;
-    snapshotBusy = snapshot.busy;
     byId('show-overlay').checked = snapshot.overlay;
     byId('show-overlay').disabled = snapshot.busy;
     if (pendingExposure !== null &&
@@ -59,9 +40,6 @@
     byId('final-exposure').value = String(displayedExposure);
     byId('final-exposure').disabled = snapshot.busy;
     byId('final-exposure-value').textContent = formatEv(displayedExposure);
-    if (!snapshotBusy && pendingExposure !== null && !exposureTimer) {
-      exposureTimer = setTimeout(flushPendingExposure, 200);
-    }
     byId('reference').textContent = snapshot.reference === null
       ? '<none>'
       : String(snapshot.reference + 1);
@@ -100,9 +78,11 @@
     post('set-exposure-overlay', { enabled: event.currentTarget.checked }));
   byId('final-exposure').addEventListener('input', event => {
     const value = Number(event.currentTarget.value);
+    pendingExposure = value;
     byId('final-exposure-value').textContent = formatEv(value);
-    queueExposure(value);
   });
+  byId('final-exposure').addEventListener('change', event =>
+    post('set-final-exposure', { value: Number(event.currentTarget.value) }));
   byId('reset').addEventListener('click', () => post('reset-exposure'));
   byId('equalize').addEventListener('click', () => post('equalize-exposure'));
   window.chrome.webview.addEventListener('message', event => render(event.data));

@@ -24,6 +24,7 @@
  * @property {'snapshot'} kind Message discriminator.
  * @property {number} pageGeneration Current HTML document generation.
  * @property {number} layoutGeneration Current preview-layout generation.
+ * @property {boolean} maximized Whether the native window is maximized.
  * @property {WorkflowStage} stage
  * @property {string} gameDirectory
  * @property {string} screenshotsDirectory
@@ -575,6 +576,17 @@
         }
       }
     }, () => {
+      h('td', { className: 'w-12 p-2' }, () => {
+        h('input', {
+          className: 'input-checkbox',
+          type: 'checkbox',
+          checked: selected,
+          disabled,
+          'aria-label': `Select ${session.name}`,
+          'data-focus-target': 'selection',
+          onClick: event => event.preventDefault()
+        });
+      });
       h('td', {
         className: classes('p-2', statusClass),
         title: session.detail || null
@@ -631,6 +643,7 @@
       h('table', { className: 'w-full', 'aria-label': 'Panorama sessions' }, () => {
         h('thead', { className: 'sticky top-0' }, () => {
           h('tr', { className: 'bg-gray-600' }, () => {
+            h('th', { className: 'w-12 p-2', 'aria-label': 'Selected' });
             h('th', { className: 'p-2 text-left' }, 'Session');
             h('th', { className: 'p-2 text-left' }, '#');
             h('th', { className: 'p-2 text-left' }, 'Tag');
@@ -691,16 +704,17 @@
       hidden: !preview
     }, () => {
       h('div', {
-        id: 'preview-placeholder',
-        className: 'flex aspect-[2/1] w-full items-center justify-center overflow-hidden'
+        id: 'preview-frame'
       }, () => {
-        h('span', { id: 'preview-message' },
-          ready ? '' : snapshot?.previewMessage ?? 'Loading...');
+        h('div', {
+          id: 'preview-placeholder',
+          className: 'flex aspect-[2/1] w-full items-center justify-center overflow-hidden'
+        }, () => {
+          h('span', { id: 'preview-message' },
+            ready ? '' : snapshot?.previewMessage ?? 'Loading...');
+        });
       });
-      h('div', {
-        className: 'flex items-center gap-4',
-        hidden: !preview || !ready
-      }, () => {
+      h('div', { className: 'flex items-center gap-4' }, () => {
         h('span', {
           id: 'exposure-adjusted',
           className: 'flex-1 text-gray-400 italic'
@@ -1237,7 +1251,10 @@
     const modal = snapshot?.modal ?? null;
     h('main', {
       id: 'app',
-      className: 'flex min-h-screen w-full flex-col gap-4 bg-gray-950 p-4 text-gray-300',
+      className: classes(
+        'flex min-h-screen w-full flex-col gap-4 bg-gray-950 p-4 text-gray-300',
+        snapshot?.maximized && 'maximized'
+      ),
       inert: modal !== null
     }, () => {
       h(WorkflowNavigation, { snapshot });
@@ -1310,6 +1327,7 @@
     const rect = placeholder.getBoundingClientRect();
     const snapshot = runtime.snapshot;
     const fullyVisible = snapshot?.stage === 'preview' &&
+      snapshot.previewReady &&
       snapshot.modal === null &&
       !byId('preview-view').hidden &&
       rect.width > 0 && rect.height > 0 &&
@@ -1353,12 +1371,12 @@
 
   function handleWindowResize() {
     updateDocumentOverflow();
+    queueContentSize();
     queuePreviewGeometry();
     if (runtime.deviceScale !== window.devicePixelRatio) {
       runtime.deviceScale = window.devicePixelRatio;
       runtime.lastContentHeight = null;
       runtime.lastContentLayoutGeneration = null;
-      queueContentSize();
     }
   }
 

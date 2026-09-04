@@ -5,7 +5,6 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$env:SOURCE_DATE_EPOCH = "946684800"
 
 function New-DeterministicZip {
     param(
@@ -29,7 +28,7 @@ function New-DeterministicZip {
             ForEach-Object {
                 $relative = $_.FullName.Substring($source.Length + 1).Replace("\", "/")
                 $entry = $archive.CreateEntry($relative, [IO.Compression.CompressionLevel]::Optimal)
-                $entry.LastWriteTime = [DateTimeOffset]::new(2000, 1, 1, 0, 0, 0, [TimeSpan]::Zero)
+                $entry.LastWriteTime = $archiveTimestamp
                 $inputStream = $_.OpenRead()
                 $outputStream = $entry.Open()
                 try {
@@ -47,6 +46,28 @@ function New-DeterministicZip {
 }
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$sourceDateEpoch = $env:SOURCE_DATE_EPOCH
+if (-not $sourceDateEpoch) {
+    $sourceDateEpoch = (& git -C $projectRoot show -s --format=%ct HEAD).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        throw "Cannot determine the source commit timestamp"
+    }
+}
+$sourceDateEpochSeconds = 0L
+if (-not [long]::TryParse($sourceDateEpoch, [ref]$sourceDateEpochSeconds)) {
+    throw "SOURCE_DATE_EPOCH must be a Unix timestamp"
+}
+try {
+    $archiveTimestamp = [DateTimeOffset]::FromUnixTimeSeconds($sourceDateEpochSeconds)
+}
+catch {
+    throw "SOURCE_DATE_EPOCH is outside the supported timestamp range"
+}
+if ($archiveTimestamp.Year -lt 1980 -or $archiveTimestamp.Year -gt 2107) {
+    throw "SOURCE_DATE_EPOCH is outside the ZIP timestamp range"
+}
+$env:SOURCE_DATE_EPOCH = $sourceDateEpochSeconds.ToString()
+
 $versionFile = Join-Path $projectRoot "stitcher\native\VERSION"
 $version = (Get-Content -LiteralPath $versionFile -Raw).Trim()
 if ($version -notmatch '^\d+\.\d+\.\d+$') {

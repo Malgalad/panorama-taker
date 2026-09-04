@@ -1,4 +1,4 @@
-local MOD_VERSION = "1.1.3"
+local MOD_VERSION = "1.1.4"
 local DEVELOPMENT_MODE = false
 
 local function log(message)
@@ -1185,6 +1185,28 @@ local function restoreEnvironmentControls(environment)
     end
 end
 
+local function showCaptureExitStatus(completed, reason)
+    local text = completed and "Panorama capture complete"
+        or "Panorama capture aborted: " .. tostring(reason or "unknown reason")
+    local ok, notificationError = pcall(function()
+        local message = SimpleScreenMessage.new()
+        message.duration = 5.0
+        message.message = text
+        message.isInstant = true
+        message.isShown = true
+        message.type = completed and SimpleMessageType.Neutral or SimpleMessageType.Negative
+        local definitions = Game.GetAllBlackboardDefs()
+        Game.GetBlackboardSystem():Get(definitions.UI_Notifications):SetVariant(
+            definitions.UI_Notifications.WarningMessage,
+            ToVariant(message),
+            true
+        )
+    end)
+    if not ok then
+        log("Exit notification failed: " .. tostring(notificationError))
+    end
+end
+
 local function photoModeActive()
     local ok, active = pcall(function()
         local definitions = Game.GetAllBlackboardDefs()
@@ -1547,7 +1569,18 @@ local function startProductionSession()
         restoreEnvironmentControls(environmentSequence)
         environmentSequence = nil
         log("Production session cancelled: " .. tostring(startError))
+        showCaptureExitStatus(false, startError)
     end
+end
+
+local function requestEnvironmentRestore(reason)
+    if environmentSequence == nil then
+        return
+    end
+    if reason ~= nil and environmentSequence.abortReason == nil then
+        environmentSequence.abortReason = reason
+    end
+    environmentSequence.restoreRequested = true
 end
 
 local function queueNextProductionPose()
@@ -1555,7 +1588,7 @@ local function queueNextProductionPose()
         return
     end
     if productionSession.index >= #productionSession.plan.poses then
-        environmentSequence.restoreRequested = true
+        requestEnvironmentRestore(nil)
         devLog("Production session: final screenshot acknowledged; restoration queued.")
         return
     end
@@ -1608,7 +1641,7 @@ registerInput("panorama_capture_abort", "Panorama: abort full-sphere pose sessio
     if down and environmentSequence ~= nil then
         os.remove(bridgeFile("request"))
         os.remove(bridgeFile("ack"))
-        environmentSequence.restoreRequested = true
+        requestEnvironmentRestore("user aborted")
         log("Production session: abort queued.")
     end
 end)
@@ -1658,7 +1691,7 @@ registerDevelopmentInput("panorama_capture_status", "Panorama: report capture st
     end
 end)
 
-local function abortEnvironment(reason)
+local function abortEnvironment(reason, suppressNotification)
     if environmentSequence == nil then
         return
     end
@@ -1671,6 +1704,9 @@ local function abortEnvironment(reason)
     environmentSequence = nil
     productionSession = nil
     log("Production session aborted (" .. reason .. ").")
+    if not suppressNotification then
+        showCaptureExitStatus(false, reason)
+    end
 end
 
 local function requestProductionScreenshot()
@@ -1680,7 +1716,7 @@ local function requestProductionScreenshot()
     local observed, observedError = observedCameraMetadata()
     if observed == nil then
         log("Production session cancelled: pre-screenshot camera readback failed: " .. tostring(observedError))
-        environmentSequence.restoreRequested = true
+        requestEnvironmentRestore("camera readback failed: " .. tostring(observedError))
         return
     end
     if environmentSequence.standaloneCamera ~= nil and environmentSequence.standaloneCamera.handle ~= nil then
@@ -1693,7 +1729,7 @@ local function requestProductionScreenshot()
     end
     if observed.cameraPosition == nil then
         log("Production session cancelled: standalone camera position readback failed")
-        environmentSequence.restoreRequested = true
+        requestEnvironmentRestore("standalone camera position readback failed")
         return
     end
     if
@@ -1709,7 +1745,7 @@ local function requestProductionScreenshot()
                 observed.verticalFov
             )
         )
-        environmentSequence.restoreRequested = true
+        requestEnvironmentRestore("standalone camera FoV mismatch")
         return
     end
     local reference = environmentSequence.standaloneCamera.referencePosition
@@ -1718,7 +1754,7 @@ local function requestProductionScreenshot()
     local dz = observed.cameraPosition.z - reference.z
     if math.sqrt(dx * dx + dy * dy + dz * dz) > CAMERA_POSITION_TOLERANCE then
         log("Production session cancelled: standalone camera moved beyond position tolerance")
-        environmentSequence.restoreRequested = true
+        requestEnvironmentRestore("standalone camera moved beyond position tolerance")
         return
     end
     productionSession.pendingMetadata =
@@ -1727,7 +1763,7 @@ local function requestProductionScreenshot()
     local requestOk, requestError = writeBridgeRequest(productionSession.sessionId, productionSession.index, token)
     if not requestOk then
         log("Production session cancelled: " .. tostring(requestError))
-        environmentSequence.restoreRequested = true
+        requestEnvironmentRestore(requestError)
         return
     end
     productionSession.awaitingScreenshot = true
@@ -1839,7 +1875,7 @@ registerForEvent("onUpdate", function(deltaTime)
                 productionSession.awaitingScreenshot = false
                 discardBridgeFiles()
                 log("Production session cancelled: ReShade screenshot acknowledgement timed out.")
-                environmentSequence.restoreRequested = true
+                requestEnvironmentRestore("ReShade screenshot acknowledgement timed out")
             else
                 local acknowledgement = readBridgeAck()
                 if acknowledgement ~= nil then
@@ -1852,7 +1888,7 @@ registerForEvent("onUpdate", function(deltaTime)
                         if acknowledgement.path:sub(1, 6) == "ERROR:" then
                             log("Production session cancelled: ReShade bridge error " .. acknowledgement.path)
                             discardBridgeFiles()
-                            environmentSequence.restoreRequested = true
+                            requestEnvironmentRestore("ReShade bridge error: " .. acknowledgement.path)
                         else
                             local metadata = productionSession.pendingMetadata
                             if metadata ~= nil then
@@ -1865,7 +1901,7 @@ registerForEvent("onUpdate", function(deltaTime)
                             if not writeSessionMetadata(productionSession, metadataState) then
                                 productionSession.metadataFailed = true
                                 log("Production session cancelled: metadata publication failed.")
-                                environmentSequence.restoreRequested = true
+                                requestEnvironmentRestore("metadata publication failed")
                             else
                                 devLog(
                                     string.format(
@@ -1904,7 +1940,7 @@ registerForEvent("onUpdate", function(deltaTime)
             local meshesHidden, meshError = hideCaptureMeshes(environmentSequence)
             if not hidden or not meshesHidden then
                 log("Production session cancelled: transition re-hide failed: " .. tostring(hideError or meshError))
-                environmentSequence.restoreRequested = true
+                requestEnvironmentRestore("transition re-hide failed: " .. tostring(hideError or meshError))
                 environmentSequence.state = "active"
             else
                 environmentSequence.state = "settling"
@@ -1919,10 +1955,10 @@ registerForEvent("onUpdate", function(deltaTime)
                 local observed, observedError = observedCameraMetadata()
                 if observed == nil then
                     log("Production session cancelled: " .. tostring(observedError))
-                    environmentSequence.restoreRequested = true
+                    requestEnvironmentRestore(observedError)
                 elseif not observed.basisValid then
                     log("Production session cancelled: active camera basis is not orthonormal")
-                    environmentSequence.restoreRequested = true
+                    requestEnvironmentRestore("active camera basis is not orthonormal")
                 else
                     productionSession.lastSettleSeconds = environmentSequence.settleElapsed
                     local pose = productionSession.plan.poses[productionSession.index]
@@ -1939,7 +1975,9 @@ registerForEvent("onUpdate", function(deltaTime)
                                 CAMERA_PITCH_TOLERANCE_DEGREES
                             )
                         )
-                        environmentSequence.restoreRequested = true
+                        requestEnvironmentRestore(
+                            string.format("pose %d pitch was outside tolerance", productionSession.index)
+                        )
                         environmentSequence.state = "active"
                     elseif yawError == nil or math.abs(yawError) > CAMERA_YAW_TOLERANCE_DEGREES then
                         log(
@@ -1950,7 +1988,9 @@ registerForEvent("onUpdate", function(deltaTime)
                                 CAMERA_YAW_TOLERANCE_DEGREES
                             )
                         )
-                        environmentSequence.restoreRequested = true
+                        requestEnvironmentRestore(
+                            string.format("pose %d yaw was outside tolerance", productionSession.index)
+                        )
                         environmentSequence.state = "active"
                     else
                         productionSession.pendingMetadata = logPoseMetadata(productionSession, pose, observed)
@@ -1983,8 +2023,10 @@ registerForEvent("onUpdate", function(deltaTime)
             environmentSequence.state = "restore_correcting"
         elseif environmentSequence.state == "restore_correcting" then
             local completedProductionSession = false
+            local abortReason = environmentSequence.abortReason
             if productionSession ~= nil then
                 local completed = not productionSession.metadataFailed
+                    and abortReason == nil
                     and productionSession.index >= #productionSession.plan.poses
                     and productionSession.pendingMetadata == nil
                 completedProductionSession = completed
@@ -1992,6 +2034,7 @@ registerForEvent("onUpdate", function(deltaTime)
                     if not writeSessionMetadata(productionSession, "completed") then
                         productionSession.metadataFailed = true
                         completedProductionSession = false
+                        abortReason = "final metadata publication failed"
                         log("Production session aborted: final metadata publication failed.")
                         finalizeAbortedSessionMetadata(productionSession)
                     end
@@ -2005,8 +2048,10 @@ registerForEvent("onUpdate", function(deltaTime)
             productionSession = nil
             if completedProductionSession then
                 log("Production session completed.")
+                showCaptureExitStatus(true)
             else
                 log("Production session aborted.")
+                showCaptureExitStatus(false, abortReason or "capture did not complete")
             end
         end
     end
@@ -2050,6 +2095,6 @@ end)
 
 registerForEvent("onShutdown", function()
     if environmentSequence ~= nil then
-        abortEnvironment("CET shutdown/reload")
+        abortEnvironment("CET shutdown/reload", true)
     end
 end)

@@ -120,6 +120,10 @@ int main() {
   CHECK(html.find(L"function hu(target, properties") != std::wstring::npos);
   CHECK(html.find(L"function App({ snapshot, bridgeFailed })") !=
         std::wstring::npos);
+  CHECK(html.find(L"snapshot?.maximized && 'maximized'") != std::wstring::npos);
+  CHECK(html.find(L"main.maximized { height: 100vh") != std::wstring::npos);
+  CHECK(html.find(L"main.maximized > nav, main.maximized > footer") !=
+        std::wstring::npos);
   CHECK(html.find(L"function InputView({ snapshot })") != std::wstring::npos);
   CHECK(html.find(L"function PreviewView({ snapshot })") != std::wstring::npos);
   CHECK(html.find(L"function OutputView({ snapshot })") != std::wstring::npos);
@@ -222,8 +226,26 @@ int main() {
         std::wstring::npos);
   CHECK(html.find(L"'data-session-index': index") != std::wstring::npos);
   CHECK(html.find(L"'data-focus-target': 'actions'") != std::wstring::npos);
+  CHECK(html.find(L"'data-focus-target': 'selection'") != std::wstring::npos);
   CHECK(html.find(L"'aria-disabled': disabled") != std::wstring::npos);
   CHECK(html.find(L"disabled: snapshot.busy") != std::wstring::npos);
+  const std::size_t session_row = html.find(L"function SessionRow");
+  const std::size_t session_table = html.find(L"function SessionTable");
+  CHECK(session_row != std::wstring::npos &&
+        session_table != std::wstring::npos);
+  const std::wstring_view session_row_html(html.data() + session_row,
+                                           session_table - session_row);
+  CHECK(session_row_html.find(L"className: 'input-checkbox'") !=
+        std::wstring_view::npos);
+  CHECK(session_row_html.find(L"type: 'checkbox'") != std::wstring_view::npos);
+  CHECK(session_row_html.find(L"checked: selected") != std::wstring_view::npos);
+  CHECK(session_row_html.find(L"'aria-label': `Select ${session.name}`") !=
+        std::wstring_view::npos);
+  CHECK(session_row_html.find(L"onClick: event => event.preventDefault()") !=
+        std::wstring_view::npos);
+  CHECK(html.find(
+            L"h('th', { className: 'w-12 p-2', 'aria-label': 'Selected' });") !=
+        std::wstring::npos);
   CHECK(html.find(L"document.addEventListener('toggle'") !=
         std::wstring::npos);
   CHECK(html.find(L"document.addEventListener('pointerdown'") !=
@@ -246,6 +268,24 @@ int main() {
   CHECK(html.find(L"contentFits ? 'hidden' : 'auto'") != std::wstring::npos);
   CHECK(html.find(L"runtime.lastPreviewGeometry === signature") !=
         std::wstring::npos);
+  const std::size_t resize_handler =
+      html.find(L"function handleWindowResize()");
+  const std::size_t resize_content =
+      html.find(L"queueContentSize();", resize_handler);
+  const std::size_t resize_geometry =
+      html.find(L"queuePreviewGeometry();", resize_content);
+  CHECK(resize_handler != std::wstring::npos &&
+        resize_content != std::wstring::npos &&
+        resize_geometry != std::wstring::npos);
+  const std::size_t preview_visibility =
+      html.find(L"const fullyVisible = snapshot?.stage === 'preview'");
+  const std::size_t preview_readiness =
+      html.find(L"snapshot.previewReady &&", preview_visibility);
+  const std::size_t preview_modal =
+      html.find(L"snapshot.modal === null", preview_readiness);
+  CHECK(preview_visibility != std::wstring::npos &&
+        preview_readiness != std::wstring::npos &&
+        preview_modal != std::wstring::npos);
   CHECK(html.find(L"runtime.deviceScale !== window.devicePixelRatio") !=
         std::wstring::npos);
   CHECK(html.find(L"addEventListener('resize', handleWindowResize)") !=
@@ -254,7 +294,30 @@ int main() {
         std::wstring::npos);
   CHECK(html.find(L"id: 'input-view'") != std::wstring::npos);
   CHECK(html.find(L"id: 'preview-view'") != std::wstring::npos);
+  CHECK(html.find(L"id: 'preview-frame'") != std::wstring::npos);
   CHECK(html.find(L"id: 'preview-placeholder'") != std::wstring::npos);
+  CHECK(html.find(L"main.maximized #preview-placeholder { width: min(100%, "
+                  L"200cqh); }") != std::wstring::npos);
+  const std::size_t preview_view = html.find(L"function PreviewView");
+  const std::size_t output_range =
+      html.find(L"function OutputRange", preview_view);
+  CHECK(preview_view != std::wstring::npos &&
+        output_range != std::wstring::npos);
+  const std::wstring_view preview_html(html.data() + preview_view,
+                                       output_range - preview_view);
+  const std::size_t exposure_actions =
+      preview_html.find(L"className: 'flex items-center gap-4'");
+  const std::size_t exposure_button =
+      preview_html.find(L"id: 'adjust-exposure'", exposure_actions);
+  const std::size_t exposure_button_end =
+      preview_html.find(L"}, 'Adjust exposure", exposure_button);
+  CHECK(exposure_actions != std::wstring_view::npos &&
+        exposure_button != std::wstring_view::npos &&
+        exposure_button_end != std::wstring_view::npos);
+  const std::wstring_view exposure_actions_html = preview_html.substr(
+      exposure_actions, exposure_button_end - exposure_actions);
+  CHECK(exposure_actions_html.find(L"hidden:") == std::wstring_view::npos);
+  CHECK(exposure_actions_html.find(L"disabled:") == std::wstring_view::npos);
   CHECK(html.find(L"id: 'output-view'") != std::wstring::npos);
   CHECK(html.find(L"hidden: !output") != std::wstring::npos);
   const std::size_t output_view = html.find(L"function OutputView");
@@ -337,8 +400,27 @@ int main() {
   CHECK(exposure_html.find(L"set-final-exposure") != std::wstring::npos);
   CHECK(exposure_html.find(L"pendingExposure ?? snapshot.finalExposure") !=
         std::wstring::npos);
-  CHECK(exposure_html.find(L"setTimeout(flushPendingExposure, 200)") !=
-        std::wstring::npos);
+  const auto exposure_input_listener =
+      exposure_html.find(L"byId('final-exposure').addEventListener('input'");
+  const auto pending_exposure_assignment =
+      exposure_html.find(L"pendingExposure = value;", exposure_input_listener);
+  const auto exposure_value_update = exposure_html.find(
+      L"byId('final-exposure-value').textContent = formatEv(value);",
+      pending_exposure_assignment);
+  const auto exposure_change_listener =
+      exposure_html.find(L"byId('final-exposure').addEventListener('change'",
+                         exposure_value_update);
+  const auto exposure_post = exposure_html.find(L"post('set-final-exposure'",
+                                                exposure_change_listener);
+  CHECK(exposure_input_listener != std::wstring::npos &&
+        pending_exposure_assignment != std::wstring::npos &&
+        exposure_value_update != std::wstring::npos &&
+        exposure_change_listener != std::wstring::npos &&
+        exposure_post != std::wstring::npos);
+  CHECK(exposure_html.find(L"post('set-final-exposure'",
+                           exposure_input_listener) == exposure_post);
+  CHECK(exposure_html.find(L"queueExposure") == std::wstring::npos);
+  CHECK(exposure_html.find(L"flushPendingExposure") == std::wstring::npos);
   CHECK(exposure_html.find(L"post('content-size', {") != std::wstring::npos);
   CHECK(exposure_html.find(L"lastContentHeight = null") != std::wstring::npos);
   CHECK(exposure_html.find(L"aria-disabled") != std::wstring::npos);
@@ -466,6 +548,18 @@ int main() {
       command, error));
   CHECK(command.kind == pano::app::WebViewCommandKind::set_final_exposure);
   CHECK(command.exposure_ev == -1.7);
+  CHECK(pano::app::parse_webview_command_json(
+      R"({"version":1,"kind":"set-final-exposure","pageGeneration":2,"value":-2})",
+      command, error));
+  CHECK(command.exposure_ev == -2.0);
+  CHECK(pano::app::parse_webview_command_json(
+      R"({"version":1,"kind":"set-final-exposure","pageGeneration":2,"value":1})",
+      command, error));
+  CHECK(command.exposure_ev == 1.0);
+  CHECK(pano::app::parse_webview_command_json(
+      R"({"version":1,"kind":"set-final-exposure","pageGeneration":2,"value":2})",
+      command, error));
+  CHECK(command.exposure_ev == 2.0);
   CHECK(!pano::app::parse_webview_command_json(
       R"({"version":1,"kind":"set-final-exposure","pageGeneration":2,"value":2.1})",
       command, error));

@@ -124,6 +124,7 @@ struct GuiShellState {
   bool webview_width_resize_dirty = false;
   bool webview_sizing_active = false;
   bool webview_sizing_changed_width = false;
+  bool webview_maximized = false;
   std::uint64_t webview_layout_generation = 1U;
   std::optional<pano::app::GuiStage> webview_snapshot_stage;
   std::optional<double> webview_content_height;
@@ -2987,7 +2988,6 @@ void apply_webview_preview_geometry(
                                                    client.right, client.bottom,
                                                    preview_bounds, error)) {
     hide_webview_preview(*shell);
-    report_application_error(L"Preview", utf8_to_wide(error));
     return;
   }
   if (!SetWindowPos(application_state().controls.preview_surface, HWND_TOP,
@@ -3033,6 +3033,8 @@ std::optional<int> webview_outer_height(const HWND window,
 void apply_webview_content_height(const HWND window, const double css_height) {
   auto *const shell = shell_state(window);
   if (shell == nullptr || shell->webview == nullptr)
+    return;
+  if (shell->webview_maximized)
     return;
   const std::optional<int> outer_height =
       webview_outer_height(window, css_height);
@@ -3151,7 +3153,8 @@ void sync_webview_snapshot(const HWND window) {
   std::wostringstream json;
   json << L"{\"version\":1,\"kind\":\"snapshot\",\"pageGeneration\":"
        << shell->webview->page_generation() << L",\"layoutGeneration\":"
-       << shell->webview_layout_generation << L",\"stage\":"
+       << shell->webview_layout_generation << L",\"maximized\":"
+       << (shell->webview_maximized ? L"true" : L"false") << L",\"stage\":"
        << json_string(
               shell->workflow.stage == pano::app::GuiStage::preview ? L"preview"
               : shell->workflow.stage == pano::app::GuiStage::output ? L"output"
@@ -3747,12 +3750,17 @@ LRESULT CALLBACK window_procedure(const HWND window, const UINT message,
     const bool width_changed =
         size_shell == nullptr || size_shell->window_width != width;
     if (size_shell != nullptr) {
+      const bool maximized =
+          wparam == SIZE_MAXIMIZED ||
+          (wparam == SIZE_MINIMIZED && size_shell->webview_maximized);
+      const bool maximized_changed = size_shell->webview_maximized != maximized;
+      size_shell->webview_maximized = maximized;
       size_shell->window_width = width;
       size_shell->window_height = height;
       if (size_shell->webview != nullptr) {
         const RECT bounds{0, 0, width, height};
         size_shell->webview->resize(bounds);
-        if (width_changed) {
+        if (width_changed || maximized_changed) {
           if (size_shell->webview_sizing_active)
             size_shell->webview_sizing_changed_width = true;
           size_shell->webview_width_resize_dirty = true;
@@ -4124,6 +4132,23 @@ int webview_self_test(const HINSTANCE instance, GuiShellState &shell,
                 shell.backend == pano::app::GuiBackendDecision::d3d12;
   if (!correct_backend || !present_preview_view())
     return fail(56);
+  pano::app::WebViewPreviewGeometry stale_geometry;
+  stale_geometry.layout_generation = shell.webview_layout_generation;
+  stale_geometry.x = -1.0;
+  stale_geometry.y = 0.0;
+  stale_geometry.width = 64.0;
+  stale_geometry.height = 32.0;
+  stale_geometry.device_scale = shell.webview->rasterization_scale();
+  stale_geometry.visible = true;
+  const WebViewModalKind modal_kind = shell.webview_modal.kind;
+  const std::uint64_t modal_generation = shell.webview_modal.generation;
+  const std::wstring status_text = shell.status_text;
+  shell.webview_width_resize_dirty = false;
+  apply_webview_preview_geometry(window, stale_geometry);
+  if (shell.webview_modal.kind != modal_kind ||
+      shell.webview_modal.generation != modal_generation ||
+      shell.status_text != status_text)
+    return fail(78);
   if (!forced_cpu) {
     pano_gpu_preview_surface_diagnostics before_update{};
     before_update.size = sizeof(before_update);

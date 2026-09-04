@@ -23,6 +23,7 @@ target_compile_definitions(PanoramaCaptureReShade PRIVATE
 
 if(MSVC)
   target_compile_options(PanoramaCaptureReShade PRIVATE /W4 /WX /permissive-)
+  target_link_options(PanoramaCaptureReShade PRIVATE /Brepro)
 endif()
 
 set_target_properties(PanoramaCaptureReShade PROPERTIES

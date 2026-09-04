@@ -193,8 +193,7 @@ bool parse_webview_command_json(const std::string_view json,
   }
   if (name == "set-final-exposure") {
     yyjson_val *const value = yyjson_obj_get(root, "value");
-    const double exposure_ev = yyjson_is_num(value) ? yyjson_get_real(value)
-                                                     : 0.0;
+    const double exposure_ev = yyjson_get_num(value);
     if (!exact_object_shape(root,
                             {"version", "kind", "pageGeneration", "value"}) ||
         !yyjson_is_num(value) || !std::isfinite(exposure_ev) ||
