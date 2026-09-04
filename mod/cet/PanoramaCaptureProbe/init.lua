@@ -1196,11 +1196,9 @@ local function showCaptureExitStatus(completed, reason)
         message.isShown = true
         message.type = completed and SimpleMessageType.Neutral or SimpleMessageType.Negative
         local definitions = Game.GetAllBlackboardDefs()
-        Game.GetBlackboardSystem():Get(definitions.UI_Notifications):SetVariant(
-            definitions.UI_Notifications.WarningMessage,
-            ToVariant(message),
-            true
-        )
+        Game.GetBlackboardSystem()
+            :Get(definitions.UI_Notifications)
+            :SetVariant(definitions.UI_Notifications.WarningMessage, ToVariant(message), true)
     end)
     if not ok then
         log("Exit notification failed: " .. tostring(notificationError))
