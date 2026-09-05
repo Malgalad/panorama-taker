@@ -7,7 +7,8 @@ param(
     [string[]]$Formats = @('png', 'jpeg', 'exr'),
     [string[]]$Blends = @('hard', 'feather'),
     [int]$Iterations = 1,
-    [int]$Width = 0
+    [int]$Width = 0,
+    [switch]$FastPng
 )
 $ErrorActionPreference = 'Stop'
 if ($Label -notmatch '^[a-zA-Z0-9_-]+$' -or $Iterations -lt 1) { throw 'Invalid benchmark parameters' }
@@ -26,6 +27,7 @@ foreach ($format in $Formats) {
                 '--format', $format, '--blend', $blend, '--gpu-strict',
                 '--gpu-memory-budget-mib', '4096', '--probe-preview-width', '128')
             if ($Width -gt 0) { $arguments += @('--width', "$Width") }
+            if ($FastPng) { $arguments += '--fast-png' }
             $quoted = $arguments | ForEach-Object {
                 if ($_.Contains('"')) { throw 'Unsupported quote in argument' }
                 '"' + $_ + '"'
@@ -38,7 +40,8 @@ foreach ($format in $Formats) {
             $log = Get-Content -LiteralPath "$prefix.log"
             $record = [ordered]@{
                 label = $Label; format = $format; blend = $blend; iteration = $iteration
-                measurements = @($log | Where-Object { $_ -match '^(render_timings|render_resources|result) ' } | ForEach-Object { "$_" })
+                fast_png = [bool]$FastPng
+                measurements = @($log | Where-Object { $_ -match '^(render_timings|render_resources|result) |^png_encoder=' } | ForEach-Object { "$_" })
                 sha256 = (Get-FileHash -LiteralPath "$prefix.$extension" -Algorithm SHA256).Hash
                 bytes = (Get-Item -LiteralPath "$prefix.$extension").Length
             }

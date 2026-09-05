@@ -22,7 +22,28 @@ and malformed UTF-8 are rejected by the default reader flags.
 
 ## Image codecs (Step 19a)
 
-The native application uses two codec providers:
+### Optional OxiPNG integration (2026-09-05)
+
+RGB8 panorama PNG can optionally use **OxiPNG 10.2.1 / libdeflate 1.26.0**.
+`oxipng/Cargo.lock` pins the Rust dependency graph. The bridge builds as
+`pano_oxipng.dll`, with a static runtime and no extra runtime DLL dependencies.
+Isolation prevents symbol collisions with OpenEXRCore's independent libdeflate.
+The application loads it by an absolute executable-relative path, checks its
+ABI, and falls back to WIC if it is unavailable. No upstream codec fork is used.
+
+Windows builds now require an x64 MSVC Rust toolchain (edition 2024; tested
+Rust 1.98.1). CMake finds Cargo or accepts `PANO_CARGO_EXECUTABLE`. Rust is a
+build prerequisite, not an end-user prerequisite. The release archive includes
+the optional encoder DLL and its upstream notices under `third_party/licenses`.
+Rust standard-library notices are retained unchanged in `licenses/rust-runtime`.
+
+The setting is opt-in except for a persisted first-launch default above 16 GiB
+usable physical RAM. Both GUI and CLI route through the same writer. WIC remains
+the ordinary path and memory/load/allocation fallback. The rejected libpng,
+libspng, zlib-ng, pngloss and pngquant experiments are not build dependencies.
+See [integration behavior and measurements](native-oxipng-integration.md).
+
+The original codec providers remain unchanged:
 
 - Windows Imaging Component (WIC), supplied by Windows, for JPEG and PNG; and
 - OpenEXRCore **3.4.13** for EXR, built statically from upstream commit

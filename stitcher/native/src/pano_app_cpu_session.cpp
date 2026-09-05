@@ -68,8 +68,12 @@ struct ProgressRange {
 void report_progress_range(void *const user_data, const unsigned completed,
                            const unsigned total, const char *const phase) {
   const auto &range = *static_cast<const ProgressRange *>(user_data);
-  if (range.outer == nullptr || total == 0U)
+  if (range.outer == nullptr)
     return;
+  if (total == 0U) {
+    progress(*range.outer, 0U, 0U, phase);
+    return;
+  }
   const auto span = static_cast<std::uint64_t>(range.end - range.begin);
   const auto scaled = static_cast<unsigned>(
       std::min<std::uint64_t>(span, span * completed / total));
@@ -870,7 +874,8 @@ bool render_cpu_target(CpuNativePreview &preview, const OutputTarget &target,
                        const bool rectilinear, const float vertical_fov,
                        const NativeRenderOptions &options,
                        OutputStage **const output_stage,
-                       OutputStage **const coverage_stage, std::string &error) {
+                       OutputStage **const coverage_stage, std::string &error,
+                       PngEncoderStatus *png_encoder = nullptr) {
   CpuCancellationBridge cancellation_bridge{options.cancellation,
                                             options.gpu_cancellation};
   const CancellationCheck cancellation =
@@ -893,6 +898,8 @@ bool render_cpu_target(CpuNativePreview &preview, const OutputTarget &target,
     }
   } cleanup{&writer, &coverage_writer};
   ImageWriterOptions writer_options;
+  writer_options.fast_png = preview.plan.fast_png && !rectilinear;
+  writer_options.png_status = png_encoder;
   writer_options.path = output_stage_path(*output_stage);
   writer_options.container = container;
   writer_options.width = width;
@@ -980,6 +987,8 @@ bool render_cpu_target(CpuNativePreview &preview, const OutputTarget &target,
     progress(options, (auto_contrast ? height : 0U) + row + rows,
              height * (auto_contrast ? 2U : 1U), "CPU render");
   }
+  if (png_encoder != nullptr && *png_encoder == PngEncoderStatus::oxipng)
+    progress(options, 0U, 0U, "Encoding PNG");
   return finish_image_writer(&writer, cancellation, category, error) &&
          (coverage_writer == nullptr ||
           finish_image_writer(&coverage_writer, cancellation, category,
@@ -1046,10 +1055,11 @@ bool render_cpu_native_session(CpuNativePreview *const preview,
     const NativeRenderOptions panorama_options =
         ranged_options(options, panorama_range, 5U, has_thumbnail ? 75U : 95U);
     progress(options, 5U, 100U, "Preparing CPU output");
+    PngEncoderStatus png_encoder = PngEncoderStatus::wic;
     if (!render_cpu_target(*preview, preview->plan.outputs.panorama,
                            preview->plan.outputs.coverage, width, height, false,
-                           90.0F, panorama_options, &panorama, &coverage,
-                           error))
+                           90.0F, panorama_options, &panorama, &coverage, error,
+                           &png_encoder))
       return false;
     if (has_thumbnail) {
       const float thumbnail_vertical_fov = static_cast<float>(
@@ -1079,6 +1089,11 @@ bool render_cpu_native_session(CpuNativePreview *const preview,
     if (!publish_output_stages(stages, {}, category, error))
       return false;
     result.width = width;
+    result.png_encoder =
+        output_container(preview->plan.outputs.panorama.final_path) ==
+                ImageContainer::png
+            ? png_encoder_message(png_encoder)
+            : "";
     result.height = height;
     result.published_paths.clear();
     if (preview->plan.outputs.coverage.has_value())

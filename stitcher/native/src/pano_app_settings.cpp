@@ -90,7 +90,8 @@ bool valid_tag(const std::string &tag) noexcept {
 
 bool load_application_settings(const std::string &path,
                                ApplicationSettings &settings,
-                               std::string &error) {
+                               std::string &error,
+                               std::optional<std::uint64_t> first_launch_ram) {
   ApplicationSettings loaded;
   if (path.empty()) {
     error = "application settings path is empty";
@@ -102,6 +103,12 @@ bool load_application_settings(const std::string &path,
       std::error_code exists_error;
       const bool exists = fs::exists(fs::u8path(path), exists_error);
       if (!exists && !exists_error) {
+        HostMemoryStatus memory;
+        if (!first_launch_ram.has_value() && query_host_memory(memory))
+          first_launch_ram = memory.total_bytes;
+        loaded.fast_png = default_fast_png(first_launch_ram.value_or(0U));
+        if (!save_application_settings(path, loaded, error))
+          return false;
         settings = std::move(loaded);
         error.clear();
         return true;
@@ -136,6 +143,9 @@ bool load_application_settings(const std::string &path,
     read_string("game_dir", loaded.game_directory);
     read_string("image_dir", loaded.image_directory);
     read_string("output_dir", loaded.output_directory);
+    if (yyjson_val *fast = yyjson_obj_get(root, "fast_png");
+        yyjson_is_bool(fast))
+      loaded.fast_png = yyjson_get_bool(fast);
     if (yyjson_val *contrast = yyjson_obj_get(root, "auto_contrast");
         yyjson_is_bool(contrast))
       loaded.auto_contrast = yyjson_get_bool(contrast);
@@ -214,6 +224,8 @@ bool save_application_settings(const std::string &path,
     yyjson_mut_val *history = yyjson_mut_obj(document);
     yyjson_mut_val *tags = yyjson_mut_obj(document);
     bool built = root != nullptr && history != nullptr && tags != nullptr &&
+                 yyjson_mut_obj_add_bool(document, root, "fast_png",
+                                         settings.fast_png) &&
                  add_string(root, "game_dir", settings.game_directory) &&
                  add_string(root, "image_dir", settings.image_directory) &&
                  add_string(root, "output_dir", settings.output_directory) &&

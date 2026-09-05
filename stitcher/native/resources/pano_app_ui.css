@@ -1,4 +1,8 @@
 /*! tailwindcss v4.3.3 | MIT License | https://tailwindcss.com */
+@keyframes encoding-progress {
+  from { background-position: -60% 0; }
+  to { background-position: 160% 0; }
+}
 @layer properties;
 @layer theme, base, components, utilities;
 @layer theme {
@@ -283,6 +287,15 @@
       background-repeat: no-repeat;
       background-size: var(--progress);
       background-image: linear-gradient(90deg, var(--color-green-800), var(--color-green-500));
+    }
+    &.progress-indeterminate {
+      background-size: 50% 100%;
+      background-image: linear-gradient(90deg, transparent, var(--color-green-500), transparent);
+      animation: encoding-progress 1.5s linear infinite;
+      @media (prefers-reduced-motion: reduce) {
+        animation: none;
+        background-position: center;
+      }
     }
     &.progress-done {
       &[aria-current="true"]::before, &::before {

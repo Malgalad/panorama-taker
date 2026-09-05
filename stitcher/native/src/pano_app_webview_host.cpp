@@ -138,9 +138,11 @@ bool parse_webview_command_json(const std::string_view json,
     return true;
   }
   if (name == "set-modal-value" || name == "set-modal-toggle" ||
-      name == "submit-modal" || name == "dismiss-modal") {
+      name == "set-modal-fast-png" || name == "submit-modal" ||
+      name == "dismiss-modal") {
     const bool sets_value = name == "set-modal-value";
-    const bool sets_toggle = name == "set-modal-toggle";
+    const bool sets_toggle =
+        name == "set-modal-toggle" || name == "set-modal-fast-png";
     const bool valid_shape =
         sets_value
             ? exact_object_shape(root, {"version", "kind", "pageGeneration",
@@ -160,7 +162,9 @@ bool parse_webview_command_json(const std::string_view json,
       error = "invalid WebView modal command";
       return false;
     }
-    command.kind = sets_value    ? WebViewCommandKind::set_modal_value
+    command.kind = sets_value ? WebViewCommandKind::set_modal_value
+                   : name == "set-modal-fast-png"
+                       ? WebViewCommandKind::set_modal_fast_png
                    : sets_toggle ? WebViewCommandKind::set_modal_toggle
                    : name == "submit-modal" ? WebViewCommandKind::submit_modal
                                             : WebViewCommandKind::dismiss_modal;

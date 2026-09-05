@@ -33,16 +33,15 @@ int main() {
           Domain::directories, Domain::directories, Domain::directories,
           Domain::directories, Domain::sessions,    Domain::sessions,
           Domain::sessions,    Domain::sessions,    Domain::sessions,
-          Domain::navigation,
-          Domain::navigation,  Domain::navigation,  Domain::output,
+          Domain::navigation,  Domain::navigation,  Domain::navigation,
           Domain::output,      Domain::output,      Domain::output,
-          Domain::output,      Domain::output,      Domain::modal,
-          Domain::modal,       Domain::exposure,    Domain::exposure,
+          Domain::output,      Domain::output,      Domain::output,
+          Domain::modal,       Domain::modal,       Domain::exposure,
           Domain::exposure,    Domain::exposure,    Domain::exposure,
           Domain::exposure,    Domain::exposure,    Domain::exposure,
-          Domain::exposure,
+          Domain::exposure,    Domain::exposure,    Domain::operation,
           Domain::operation,   Domain::operation,   Domain::operation,
-          Domain::operation,   Domain::operation,   Domain::modal,
+          Domain::operation,   Domain::modal,       Domain::modal,
           Domain::modal,       Domain::modal,       Domain::modal,
           Domain::layout,      Domain::layout,      Domain::host,
       };
@@ -127,6 +126,11 @@ int main() {
   CHECK(html.find(L"function InputView({ snapshot })") != std::wstring::npos);
   CHECK(html.find(L"function PreviewView({ snapshot })") != std::wstring::npos);
   CHECK(html.find(L"function OutputView({ snapshot })") != std::wstring::npos);
+  CHECK(html.find(L"snapshot.outputIndeterminate") != std::wstring::npos);
+  CHECK(html.find(L"indeterminate && 'progress-indeterminate'") !=
+        std::wstring::npos);
+  CHECK(html.find(L"@keyframes encoding-progress") != std::wstring::npos);
+  CHECK(html.find(L"prefers-reduced-motion: reduce") != std::wstring::npos);
   CHECK(html.find(L"function ModalHost({ modal })") != std::wstring::npos);
   CHECK(html.find(L"modal?.kind === 'overwrite-output' || modal?.kind === 'notice'") !=
         std::wstring::npos);
@@ -470,6 +474,16 @@ int main() {
       R"({"version":1,"kind":"set-modal-toggle","pageGeneration":4,"modalGeneration":9,"enabled":true})",
       command, error));
   CHECK(command.kind == pano::app::WebViewCommandKind::set_modal_toggle);
+  CHECK(pano::app::parse_webview_command_json(
+      R"({"version":1,"kind":"set-modal-fast-png","pageGeneration":4,"modalGeneration":9,"enabled":true})",
+      command, error));
+  CHECK(command.kind == pano::app::WebViewCommandKind::set_modal_fast_png);
+  CHECK(!pano::app::parse_webview_command_json(
+      R"({"version":1,"kind":"set-modal-fast-png","pageGeneration":4,"modalGeneration":9,"enabled":1})",
+      command, error));
+  CHECK(pano::app::parse_webview_command_json(
+      R"({"version":1,"kind":"set-modal-fast-png","pageGeneration":4,"modalGeneration":9,"enabled":true})",
+      command, error));
   CHECK(command.modal_generation == 9U && command.enabled == true);
   CHECK(pano::app::webview_modal_command_is_current(true, 9U, command));
   CHECK(!pano::app::webview_modal_command_is_current(true, 10U, command));

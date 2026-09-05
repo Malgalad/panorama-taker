@@ -82,6 +82,7 @@ enum class WebViewModalKind {
 enum class GuiValidationPurpose { preview, output };
 
 struct WebViewModalPayload {
+  bool fast_png = false;
   std::wstring title;
   std::wstring description;
   std::wstring value;
@@ -147,6 +148,7 @@ struct GuiShellState {
   bool allow_incomplete = false;
   bool auto_contrast = true;
   bool debug_coverage = false;
+  bool fast_png = false;
   bool use_gpu = true;
   bool require_gpu = false;
   pano::app::GuiBackendDecision backend =
@@ -165,6 +167,7 @@ struct GuiShellState {
   bool exposure_edits_applied = false;
   double final_exposure_ev = 0.0;
   unsigned operation_progress_percent = 0U;
+  bool operation_progress_indeterminate = false;
   unsigned output_width = 0U;
   unsigned output_height = 0U;
   unsigned output_maximum_width = 0U;
@@ -608,6 +611,8 @@ void load_gui_settings() {
           : application_state().application_settings.gpu_memory_mib;
   application_state().debug_coverage =
       application_state().application_settings.debug_coverage;
+  application_state().fast_png =
+      application_state().application_settings.fast_png;
 }
 
 bool capture_gui_request(
@@ -690,6 +695,7 @@ bool capture_gui_request(
   captured.coverage = shell->debug_coverage;
   captured.allow_incomplete = shell->allow_incomplete;
   captured.auto_contrast = shell->auto_contrast;
+  captured.fast_png = shell->fast_png;
   captured.final_exposure_ev = shell->final_exposure_ev;
   captured.gpu = shell->use_gpu;
   if (shell->use_gpu)
@@ -1108,8 +1114,10 @@ void set_operation_title(const HWND window, const std::wstring &detail,
 }
 
 void begin_operation_progress(const HWND window) {
-  if (auto *const shell = shell_state(window); shell != nullptr)
+  if (auto *const shell = shell_state(window); shell != nullptr) {
     shell->operation_progress_percent = 0U;
+    shell->operation_progress_indeterminate = false;
+  }
   if (application_state().taskbar != nullptr) {
     application_state().taskbar->SetProgressState(window, TBPF_NORMAL);
     application_state().taskbar->SetProgressValue(window, 0U, 100U);
@@ -1118,8 +1126,13 @@ void begin_operation_progress(const HWND window) {
 
 void update_operation_progress(const HWND window, const unsigned completed,
                                const unsigned total) {
-  if (total == 0U)
+  if (auto *const shell = shell_state(window); shell != nullptr)
+    shell->operation_progress_indeterminate = total == 0U;
+  if (total == 0U) {
+    if (application_state().taskbar != nullptr)
+      application_state().taskbar->SetProgressState(window, TBPF_INDETERMINATE);
     return;
+  }
   if (auto *const shell = shell_state(window); shell != nullptr)
     shell->operation_progress_percent =
         static_cast<unsigned>(std::min<std::uint64_t>(
@@ -1131,8 +1144,10 @@ void update_operation_progress(const HWND window, const unsigned completed,
 }
 
 void end_operation_progress(const HWND window) {
-  if (auto *const shell = shell_state(window); shell != nullptr)
+  if (auto *const shell = shell_state(window); shell != nullptr) {
     shell->operation_progress_percent = 0U;
+    shell->operation_progress_indeterminate = false;
+  }
   if (application_state().taskbar != nullptr)
     application_state().taskbar->SetProgressState(window, TBPF_NOPROGRESS);
 }
@@ -2307,10 +2322,11 @@ void report_render_progress(void *, const unsigned completed,
   {
     std::lock_guard<std::mutex> lock(runtime_state().render_progress_mutex);
     runtime_state().render_progress_phase = phase == nullptr ? "render" : phase;
+    runtime_state().render_progress_completed.store(completed,
+                                                    std::memory_order_release);
+    runtime_state().render_progress_total.store(total,
+                                                std::memory_order_release);
   }
-  runtime_state().render_progress_completed.store(completed,
-                                                  std::memory_order_release);
-  runtime_state().render_progress_total.store(total, std::memory_order_release);
   const HWND target =
       runtime_state().refresh_window.load(std::memory_order_acquire);
   if (target != nullptr)
@@ -2386,13 +2402,15 @@ void start_render() {
 }
 
 void apply_render_progress() {
-  const unsigned completed =
-      runtime_state().render_progress_completed.load(std::memory_order_acquire);
-  const unsigned total =
-      runtime_state().render_progress_total.load(std::memory_order_acquire);
+  unsigned completed;
+  unsigned total;
   std::string phase;
   {
     std::lock_guard<std::mutex> lock(runtime_state().render_progress_mutex);
+    completed = runtime_state().render_progress_completed.load(
+        std::memory_order_acquire);
+    total =
+        runtime_state().render_progress_total.load(std::memory_order_acquire);
     phase = runtime_state().render_progress_phase;
   }
   const std::wstring label =
@@ -2458,7 +2476,10 @@ void apply_render_results() {
     }
     const std::wstring status =
         L"Published " + std::to_wstring(result->render.published_paths.size()) +
-        L" output file(s)";
+        L" output file(s)" +
+        (result->render.png_encoder.empty()
+             ? L""
+             : L" - " + utf8_to_wide(result->render.png_encoder));
     set_status_text(status);
     if (!result->render.published_paths.empty()) {
       const auto published = std::find(result->render.published_paths.begin(),
@@ -2746,6 +2767,7 @@ void open_webview_preview_options(GuiShellState &shell) {
 void open_webview_app_settings(GuiShellState &shell) {
   WebViewModalPayload payload;
   payload.title = L"App Settings";
+  payload.fast_png = shell.fast_png;
   payload.value = std::to_wstring(shell.gpu_memory_mib);
   payload.checked = shell.debug_coverage;
   payload.read_only = shell.workflow.operation != pano::app::GuiOperation::idle;
@@ -2893,6 +2915,7 @@ bool save_webview_app_settings(const HWND window, GuiShellState &shell,
   updated.auto_contrast = shell.auto_contrast;
   updated.gpu_memory_mib = *parsed;
   updated.debug_coverage = payload.checked;
+  updated.fast_png = payload.fast_png;
   if (application_state().persistence_enabled &&
       application_state().settings_loaded &&
       !application_state().application_settings_path.empty() &&
@@ -2903,6 +2926,7 @@ bool save_webview_app_settings(const HWND window, GuiShellState &shell,
   application_state().application_settings = std::move(updated);
   shell.gpu_memory_mib = *parsed;
   shell.debug_coverage = payload.checked;
+  shell.fast_png = payload.fast_png;
   if (budget_changed || runtime_state().validation_state.plan.has_value()) {
     if (decreased && preview_was_ready)
       shell.rebuild_preview_after_validation = true;
@@ -3198,6 +3222,10 @@ void sync_webview_snapshot(const HWND window) {
        << (presentation.render_enabled ? L"true" : L"false")
        << L",\"rendering\":" << (presentation.rendering ? L"true" : L"false")
        << L",\"outputProgress\":" << presentation.output_progress
+       << L",\"outputIndeterminate\":"
+       << (presentation.rendering && shell->operation_progress_indeterminate
+               ? L"true"
+               : L"false")
        << L",\"outputComplete\":"
        << (presentation.output_complete ? L"true" : L"false") << L",\"modal\":";
   if (shell->webview_modal.kind == WebViewModalKind::none) {
@@ -3222,6 +3250,8 @@ void sync_webview_snapshot(const HWND window) {
          << (shell->webview_modal.payload.read_only ? L"true" : L"false")
          << L",\"checked\":"
          << (shell->webview_modal.payload.checked ? L"true" : L"false")
+         << L",\"fastPng\":"
+         << (shell->webview_modal.payload.fast_png ? L"true" : L"false")
          << L"}}";
   }
   json << L",\"sessions\":[";
@@ -3572,6 +3602,13 @@ void handle_webview_command(const HWND window,
         shell->webview_modal.payload.value = command.value;
       }
     }
+    break;
+  case pano::app::WebViewCommandKind::set_modal_fast_png:
+    if (pano::app::webview_modal_command_is_current(
+            shell->webview_modal.kind == WebViewModalKind::app_settings,
+            shell->webview_modal.generation, command) &&
+        command.enabled.has_value() && !shell->webview_modal.payload.read_only)
+      shell->webview_modal.payload.fast_png = *command.enabled;
     break;
   case pano::app::WebViewCommandKind::set_modal_toggle:
     if (pano::app::webview_modal_command_is_current(
@@ -4077,6 +4114,32 @@ int webview_self_test(const HINSTANCE instance, GuiShellState &shell,
   open_webview_app_settings(shell);
   if (!shell.webview_modal.payload.description.empty())
     return fail(74);
+  {
+    const bool original_fast_png = shell.fast_png;
+    pano::app::WebViewCommand toggle;
+    toggle.kind = pano::app::WebViewCommandKind::set_modal_fast_png;
+    toggle.page_generation = shell.webview->page_generation();
+    toggle.modal_generation = shell.webview_modal.generation - 1U;
+    toggle.enabled = !original_fast_png;
+    handle_webview_command(window, toggle);
+    if (shell.webview_modal.payload.fast_png != original_fast_png)
+      return fail(75);
+    toggle.modal_generation = shell.webview_modal.generation;
+    shell.webview_modal.payload.read_only = true;
+    handle_webview_command(window, toggle);
+    if (shell.webview_modal.payload.fast_png != original_fast_png)
+      return fail(76);
+    shell.webview_modal.payload.read_only = false;
+    handle_webview_command(window, toggle);
+    if (shell.webview_modal.payload.fast_png == original_fast_png)
+      return fail(77);
+    std::string settings_error;
+    if (!save_webview_app_settings(window, shell, settings_error) ||
+        shell.fast_png == original_fast_png)
+      return fail(78);
+    shell.fast_png = original_fast_png;
+    application_state().application_settings.fast_png = original_fast_png;
+  }
   shell.webview_modal = {};
   KillTimer(window, validation_timer_id);
   runtime_state().validation_state.plan = plan;
@@ -4243,6 +4306,23 @@ int webview_self_test(const HINSTANCE instance, GuiShellState &shell,
       std::wstring_view(rendered_title.data()).find(L"2/4") ==
           std::wstring_view::npos)
     return fail(75);
+  report_render_progress(nullptr, 0U, 0U, "Encoding PNG");
+  apply_render_progress();
+  GetWindowTextW(window, rendered_title.data(),
+                 static_cast<int>(rendered_title.size()));
+  if (!shell.operation_progress_indeterminate ||
+      shell.status_text != L"Encoding PNG..." ||
+      std::wstring_view(rendered_title.data()).find(L"Encoding PNG") ==
+          std::wstring_view::npos ||
+      std::wstring_view(rendered_title.data()).find(L"/") !=
+          std::wstring_view::npos)
+    return fail(75);
+  report_render_progress(nullptr, 95U, 100U, "Publishing output");
+  apply_render_progress();
+  if (shell.operation_progress_indeterminate ||
+      shell.operation_progress_percent != 95U)
+    return fail(75);
+  end_operation_progress(window);
   set_operation_title(window, L"");
   const auto stitched_name = pano::app::application_stitched_name(
       application_state().application_settings,

@@ -88,6 +88,14 @@ apply to SDR captures.
 
 The session list shows the local capture date, whether capture completed, and whether it has been stitched before. The Screenshots field can be used when captures were moved from the game directory. The default memory budget is 1024 MiB.
 
+**App Settings → Faster PNG encoding (uses more RAM)** enables lossless OxiPNG
+for the final RGB PNG panorama. WIC remains the fallback when available memory
+is insufficient or the optional encoder cannot load. The setting defaults off
+for existing installations; a fresh installation enables it automatically only
+when Windows reports over 16 GiB of usable physical RAM. Saved choices are kept.
+This option may exceed the normal host-memory budget. JPEG, EXR, thumbnails,
+and coverage encoding are unchanged. The CLI equivalent is `--fast-png`.
+
 The session actions can copy saved `x, y, z` coordinates, delete only the JSON, or delete the JSON
 and captured screenshots. Coordinate copying is available for sessions that contain location data.
 For stitched sessions, deleting source files preserves the stitched panorama. JSON-only deletion of

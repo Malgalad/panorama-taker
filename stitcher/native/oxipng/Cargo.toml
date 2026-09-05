@@ -1,0 +1,11 @@
+[package]
+name = "pano-oxipng"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+oxipng = { version = "=10.2.1", default-features = false }

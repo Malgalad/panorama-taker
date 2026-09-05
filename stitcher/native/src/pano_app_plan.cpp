@@ -134,6 +134,7 @@ bool make_render_plan(const RenderOptions &options, RenderPlan &plan,
   parsed.resolution = options.resolution;
   parsed.blend = options.blend;
   parsed.jpeg_quality = options.jpeg_quality;
+  parsed.fast_png = options.fast_png;
   parsed.memory_mib = options.memory_mib;
   parsed.workers = options.workers;
   parsed.use_gpu = options.gpu;

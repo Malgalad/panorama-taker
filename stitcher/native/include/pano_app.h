@@ -45,7 +45,29 @@ enum class CodecErrorCategory {
 
 enum class ImageContainer { jpeg, png, exr };
 
+enum class PngEncoderStatus {
+  wic,
+  oxipng,
+  low_memory,
+  unavailable,
+  allocation
+};
+
+struct HostMemoryStatus {
+  std::uint64_t total_bytes = 0;
+  std::uint64_t available_bytes = 0;
+  std::uint64_t available_commit_bytes = 0;
+};
+
+bool query_host_memory(HostMemoryStatus &memory) noexcept;
+bool default_fast_png(std::uint64_t total_bytes) noexcept;
+bool fast_png_memory_admitted(unsigned width, unsigned height,
+                              const HostMemoryStatus &memory,
+                              bool input_buffered = false) noexcept;
+const char *png_encoder_message(PngEncoderStatus status) noexcept;
+
 struct RenderOptions {
+  bool fast_png = false;
   std::string session;
   std::string image_dir;
   std::string output;
@@ -90,6 +112,10 @@ struct ImageInfo {
 };
 
 struct ImageWriterOptions {
+  bool fast_png = false;
+  PngEncoderStatus *png_status = nullptr;
+  bool (*memory_query)(void *, HostMemoryStatus &) = nullptr;
+  void *memory_query_data = nullptr;
   std::string path;
   ImageContainer container = ImageContainer::png;
   unsigned width = 0;
@@ -355,6 +381,7 @@ struct GuiRefreshState {
 };
 
 struct GuiRenderRequestState {
+  bool fast_png = false;
   std::string session;
   std::string session_id;
   std::string image_dir;
@@ -423,6 +450,7 @@ struct OutputPlan {
 };
 
 struct RenderPlan {
+  bool fast_png = false;
   SessionSummary session;
   OutputPlan outputs;
   std::optional<unsigned> output_width;
@@ -566,6 +594,7 @@ struct NativeExposureResult {
   bool warning = false;
 };
 
+// A zero total denotes an indeterminate stage; completed is ignored.
 using NativeRenderProgressCallback = NativeProgressCallback;
 
 struct NativeRenderTimings {
@@ -591,6 +620,7 @@ struct NativeRenderOptions {
 };
 
 struct NativeRenderResult {
+  std::string png_encoder;
   unsigned width = 0;
   unsigned height = 0;
   std::vector<std::string> published_paths;
@@ -607,6 +637,7 @@ struct SessionTagEntry {
 };
 
 struct ApplicationSettings {
+  bool fast_png = false;
   std::string game_directory;
   std::string image_directory;
   std::string output_directory;
@@ -970,9 +1001,9 @@ bool render_cpu_native_session(CpuNativePreview *preview,
                                const NativeRenderOptions &options,
                                NativeRenderResult &result, std::string &error);
 void destroy_cpu_native_preview(CpuNativePreview **preview) noexcept;
-bool load_application_settings(const std::string &path,
-                               ApplicationSettings &settings,
-                               std::string &error);
+bool load_application_settings(
+    const std::string &path, ApplicationSettings &settings, std::string &error,
+    std::optional<std::uint64_t> first_launch_ram = std::nullopt);
 bool save_application_settings(const std::string &path,
                                const ApplicationSettings &settings,
                                std::string &error);

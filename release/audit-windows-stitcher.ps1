@@ -39,8 +39,9 @@ try {
     }
     $executables = @($files | Where-Object { $_.Name -eq "PanoramaCaptureStitcher.exe" })
     $nativeDll = @($files | Where-Object { $_.Name -eq "pano_gpu.dll" })
-    if ($executables.Count -ne 1 -or $nativeDll.Count -ne 1) {
-        throw "Archive must contain exactly PanoramaCaptureStitcher.exe and pano_gpu.dll"
+    $oxiDll = @($files | Where-Object { $_.Name -eq "pano_oxipng.dll" })
+    if ($executables.Count -ne 1 -or $nativeDll.Count -ne 1 -or $oxiDll.Count -ne 1) {
+        throw "Archive must contain exactly PanoramaCaptureStitcher.exe, pano_gpu.dll and pano_oxipng.dll"
     }
     $forbidden = @($files | Where-Object { $_.Extension -match '(?i)^\.(hlsl|cso|pdb)$' })
     if ($forbidden.Count -gt 0) {
@@ -87,7 +88,7 @@ try {
     }
 
     $peDependencies = @()
-    foreach ($binary in @($executables) + @($nativeDll[0])) {
+    foreach ($binary in @($executables) + @($nativeDll[0]) + @($oxiDll[0])) {
         $dependencies = & $dumpbin /dependents $binary.FullName
         if ($LASTEXITCODE -ne 0) {
             throw "dumpbin failed for $($binary.Name)"

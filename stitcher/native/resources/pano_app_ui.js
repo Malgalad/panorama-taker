@@ -49,6 +49,7 @@
  * @property {boolean} renderEnabled
  * @property {boolean} rendering
  * @property {number} outputProgress Combined render progress from 0 through 100.
+ * @property {boolean} outputIndeterminate Whether encoding progress is unknown.
  * @property {boolean} outputComplete Whether the current preview has a published render.
  * @property {PanoramaModalSnapshot | null} modal Native-authoritative modal state.
  * @property {PanoramaSessionSnapshot[]} sessions
@@ -67,7 +68,8 @@
  *   charactersRemaining: number,
  *   canSubmit: boolean,
  *   readOnly: boolean,
- *   checked: boolean
+ *   checked: boolean,
+ *   fastPng: boolean
  * }} payload
  */
 
@@ -405,6 +407,7 @@
    *   active: boolean,
    *   disabled?: boolean,
    *   progress?: number | null,
+   *   indeterminate?: boolean,
    *   done?: boolean,
    *   onClick?: EventListener
    * }} properties
@@ -415,6 +418,7 @@
     active,
     disabled = false,
     progress = null,
+    indeterminate = false,
     done = false,
     onClick = null
   }) {
@@ -423,6 +427,7 @@
       className: classes(
         'button tab flex-1/3',
         progress !== null && 'progress',
+        indeterminate && 'progress-indeterminate',
         done && 'progress-done'
       ),
       'aria-current': active,
@@ -459,6 +464,7 @@
         active: stage === 'output',
         disabled: !(snapshot?.previewReady ?? false),
         progress: snapshot?.rendering ? snapshot.outputProgress : null,
+        indeterminate: snapshot?.rendering && snapshot.outputIndeterminate,
         done: !(snapshot?.rendering ?? false) &&
           (snapshot?.outputComplete ?? false),
         onClick: () => post('navigate', { target: 'output' })
@@ -1089,6 +1095,21 @@
 
   /** @param {PanoramaModalSnapshot} modal */
   function AppSettingsModal({ modal }) {
+    h('label', { className: 'flex items-center gap-2' }, () => {
+      h('input', {
+        id: 'modal-fast-png',
+        className: 'input-checkbox',
+        type: 'checkbox',
+        checked: modal.payload.fastPng,
+        disabled: modal.payload.readOnly,
+        onChange: event => post('set-modal-fast-png', {
+          modalGeneration: modal.generation,
+          enabled: event.currentTarget.checked
+        })
+      });
+      h('span', {}, 'Faster PNG encoding (uses more RAM)');
+    });
+    h('p', {}, 'Lossless OxiPNG. Automatically falls back to WIC when memory is low.');
     h('label', { className: 'flex flex-col gap-2' }, () => {
       h('span', {}, 'D3D12 allocation (MiB):');
       h('input', {

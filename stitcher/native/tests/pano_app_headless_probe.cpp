@@ -437,6 +437,7 @@ int wmain(const int argc, wchar_t **const argv) {
             << " finish_ms=" << render_timings.finish_ms
             << " publish_ms=" << render_timings.publish_ms
             << " total_ms=" << render_timings.total_ms << '\n';
+  std::cout << "png_encoder=" << result.png_encoder << '\n';
   write_phase("teardown");
   pano::app::destroy_native_preview(&preview);
   pano_gpu_device_destroy(&device);

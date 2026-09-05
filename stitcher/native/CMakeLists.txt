@@ -32,6 +32,7 @@ add_library(pano_app_core STATIC
     src/pano_app_gui_state.cpp
     src/pano_app_options.cpp
     src/pano_app_plan.cpp
+    src/pano_app_png_memory.cpp
     src/pano_app_preview.cpp
     src/pano_app_publication.cpp
     src/pano_app_session.cpp
@@ -56,6 +57,7 @@ else()
 endif()
 
 if(WIN32)
+    include(cmake/PanoOxiPng.cmake)
     include(cmake/PanoWebView2Dependency.cmake)
     set(PANO_APP_UI_SOURCE_HTML
         "${CMAKE_CURRENT_SOURCE_DIR}/resources/pano_app_ui.html")

@@ -120,6 +120,7 @@ bool snapshot_gui_render_request(const GuiRenderRequestState &state,
   snapshot.resolution = static_cast<double>(state.resolution_percent) / 100.0;
   snapshot.format = state.format;
   snapshot.jpeg_quality = state.jpeg_quality;
+  snapshot.fast_png = state.fast_png;
   snapshot.blend = state.blend;
   snapshot.thumbnail = state.thumbnail;
   snapshot.coverage = state.coverage;

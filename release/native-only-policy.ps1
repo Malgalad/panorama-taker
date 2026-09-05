@@ -71,8 +71,11 @@ function Assert-NativeOnlyArchive {
     if ($executables.Count -ne 1 -or $executables[0].Name -ne "PanoramaCaptureStitcher.exe") {
         throw "Native-only archive must contain exactly PanoramaCaptureStitcher.exe"
     }
-    if ($libraries.Count -ne 1 -or $libraries[0].Name -ne "pano_gpu.dll") {
-        throw "Native-only archive must contain exactly pano_gpu.dll"
+    if ($libraries.Count -ne 2 -or
+        @($libraries | Where-Object { $_.Name -notin @("pano_gpu.dll", "pano_oxipng.dll") }).Count -ne 0 -or
+        @($libraries | Where-Object { $_.Name -eq "pano_gpu.dll" }).Count -ne 1 -or
+        @($libraries | Where-Object { $_.Name -eq "pano_oxipng.dll" }).Count -ne 1) {
+        throw "Native-only archive must contain exactly pano_gpu.dll and pano_oxipng.dll"
     }
 
     if (Test-NativeOnlyExecutableText -Path $executables[0].FullName -Needle "--native-ui") {

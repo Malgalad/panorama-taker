@@ -60,6 +60,70 @@ bool fail_exr(const exr_result_t result, const char *operation,
 #ifdef _WIN32
 using Microsoft::WRL::ComPtr;
 
+struct OxiApi {
+  void *(*create)(unsigned, unsigned) = nullptr;
+  unsigned char *(*pixels)(void *) = nullptr;
+  bool (*encode)(void *) = nullptr;
+  const unsigned char *(*output)(const void *, std::size_t *) = nullptr;
+  void (*destroy)(void *) = nullptr;
+};
+
+template <class T>
+bool oxi_symbol(HMODULE module, const char *name, T &target) {
+  const FARPROC symbol = GetProcAddress(module, name);
+  static_assert(sizeof(target) == sizeof(symbol));
+  std::memcpy(&target, &symbol, sizeof(target));
+  return symbol != nullptr;
+}
+
+const OxiApi &oxi_api() {
+  static const OxiApi api = [] {
+    OxiApi loaded;
+    std::array<wchar_t, 32768> path{};
+    const DWORD length = GetModuleFileNameW(nullptr, path.data(),
+                                            static_cast<DWORD>(path.size()));
+    if (length == 0 || length >= path.size())
+      return loaded;
+    const auto library =
+        fs::path(path.data()).parent_path() / L"pano_oxipng.dll";
+    // Absolute path and restricted dependency search: never load from the cwd.
+    const HMODULE module = LoadLibraryExW(library.c_str(), nullptr,
+                                          LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
+                                              LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (module == nullptr)
+      return loaded;
+    unsigned (*abi)() = nullptr;
+    if (!oxi_symbol(module, "pano_oxi_abi", abi) || abi() != 1U ||
+        !oxi_symbol(module, "pano_oxi_create", loaded.create) ||
+        !oxi_symbol(module, "pano_oxi_pixels", loaded.pixels) ||
+        !oxi_symbol(module, "pano_oxi_encode", loaded.encode) ||
+        !oxi_symbol(module, "pano_oxi_output", loaded.output) ||
+        !oxi_symbol(module, "pano_oxi_destroy", loaded.destroy)) {
+      FreeLibrary(module);
+      return OxiApi{};
+    }
+    // Handles may outlive a render; retain this module until process shutdown.
+    return loaded;
+  }();
+  return api;
+}
+
+void png_status(const ImageWriterOptions &options,
+                const PngEncoderStatus status) {
+  if (options.png_status != nullptr)
+    *options.png_status = status;
+}
+
+bool oxi_memory(const ImageWriterOptions &options, const bool buffered) {
+  HostMemoryStatus memory;
+  const bool queried =
+      options.memory_query != nullptr
+          ? options.memory_query(options.memory_query_data, memory)
+          : query_host_memory(memory);
+  return queried && fast_png_memory_admitted(options.width, options.height,
+                                             memory, buffered);
+}
+
 bool utf8_to_wide(const std::string &text, std::wstring &wide) {
   if (text.empty()) return false;
   const int count = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
@@ -116,6 +180,14 @@ public:
   void close(const bool keep) noexcept {
     if (exr_context != nullptr) exr_finish(&exr_context);
 #ifdef _WIN32
+    if (oxi_file != INVALID_HANDLE_VALUE) {
+      CloseHandle(oxi_file);
+      oxi_file = INVALID_HANDLE_VALUE;
+    }
+    if (oxi != nullptr) {
+      oxi_api().destroy(oxi);
+      oxi = nullptr;
+    }
     frame.Reset();
     encoder.Reset();
     stream.Reset();
@@ -140,6 +212,8 @@ public:
   unsigned exr_pending_rows = 0;
   std::vector<float> exr_pending;
 #ifdef _WIN32
+  void *oxi = nullptr;
+  HANDLE oxi_file = INVALID_HANDLE_VALUE;
   bool uninitialize_com = false;
   ComPtr<IWICImagingFactory> factory;
   ComPtr<IWICStream> stream;
@@ -249,6 +323,40 @@ bool create_image_writer(const ImageWriterOptions &options,
     return fail(CodecErrorCategory::invalid_request,
                 "image writer path already exists or cannot be inspected",
                 category, error);
+#ifdef _WIN32
+  png_status(options, PngEncoderStatus::wic);
+  if (options.fast_png && options.container == ImageContainer::png &&
+      options.channels == 3U) {
+    try {
+      if (!oxi_memory(options, false)) {
+        png_status(options, PngEncoderStatus::low_memory);
+      } else if (oxi_api().create == nullptr) {
+        png_status(options, PngEncoderStatus::unavailable);
+      } else {
+        auto created = std::make_unique<ImageWriter>(options);
+        created->oxi = oxi_api().create(options.width, options.height);
+        if (created->oxi == nullptr) {
+          png_status(options, PngEncoderStatus::allocation);
+        } else {
+          created->oxi_file =
+              CreateFileW(fs::u8path(options.path).c_str(), GENERIC_WRITE, 0,
+                          nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+          if (created->oxi_file == INVALID_HANDLE_VALUE)
+            return fail(CodecErrorCategory::io, "cannot create OxiPNG output",
+                        category, error);
+          created->owns_path = true;
+          png_status(options, PngEncoderStatus::oxipng);
+          *writer = created.release();
+          category = CodecErrorCategory::none;
+          error.clear();
+          return true;
+        }
+      }
+    } catch (const std::bad_alloc &) {
+      png_status(options, PngEncoderStatus::allocation);
+    }
+  }
+#endif
   if (is_exr) {
     try {
       auto created = std::make_unique<ImageWriter>(options);
@@ -424,6 +532,26 @@ bool write_image_rows(ImageWriter *const writer, const void *const rows,
   if (cancelled(cancellation))
     return fail(CodecErrorCategory::cancelled, "image encode cancelled",
                 category, error);
+#ifdef _WIN32
+  if (writer->oxi != nullptr) {
+    auto *destination =
+        oxi_api().pixels(writer->oxi) +
+        static_cast<std::size_t>(writer->rows_written) * packed_stride;
+    const auto *input = static_cast<const unsigned char *>(rows);
+    for (unsigned row = 0; row < row_count; ++row) {
+      if (cancelled(cancellation))
+        return fail(CodecErrorCategory::cancelled, "image encode cancelled",
+                    category, error);
+      std::memcpy(destination + row * packed_stride,
+                  input + row * row_stride_bytes,
+                  static_cast<std::size_t>(packed_stride));
+    }
+    writer->rows_written += row_count;
+    category = CodecErrorCategory::none;
+    error.clear();
+    return true;
+  }
+#endif
   if (writer->options.container == ImageContainer::exr) {
     try {
       const auto *input = static_cast<const std::uint8_t *>(rows);
@@ -525,6 +653,85 @@ bool finish_image_writer(ImageWriter **const writer,
     return fail(CodecErrorCategory::cancelled, "image encode cancelled",
                 category, error);
   }
+#ifdef _WIN32
+  if (active->oxi != nullptr) {
+    if (!oxi_memory(active->options, true)) {
+      CloseHandle(active->oxi_file);
+      active->oxi_file = INVALID_HANDLE_VALUE;
+      std::error_code removal_error;
+      fs::remove(fs::u8path(active->options.path), removal_error);
+      if (removal_error) {
+        abort_image_writer(writer);
+        return fail(CodecErrorCategory::io, "cannot restart PNG with WIC",
+                    category, error);
+      }
+      active->owns_path = false;
+      ImageWriterOptions fallback_options = active->options;
+      fallback_options.fast_png = false;
+      ImageWriter *fallback = nullptr;
+      bool ok =
+          create_image_writer(fallback_options, &fallback, category, error);
+      png_status(active->options, PngEncoderStatus::low_memory);
+      const auto *pixels = oxi_api().pixels(active->oxi);
+      const std::size_t stride =
+          static_cast<std::size_t>(active->options.width) * 3U;
+      for (unsigned row = 0; ok && row < active->options.height;) {
+        const unsigned count = std::min(64U, active->options.height - row);
+        ok = write_image_rows(fallback, pixels + row * stride, count, stride,
+                              cancellation, category, error);
+        row += count;
+      }
+      if (ok)
+        ok = finish_image_writer(&fallback, cancellation, category, error);
+      abort_image_writer(&fallback);
+      abort_image_writer(writer);
+      return ok;
+    }
+    bool ok = oxi_api().encode(active->oxi);
+    if (!ok) {
+      abort_image_writer(writer);
+      return fail(CodecErrorCategory::codec_failure,
+                  "OxiPNG compression failed", category, error);
+    }
+    std::size_t length = 0;
+    const auto *bytes = oxi_api().output(active->oxi, &length);
+    for (std::size_t offset = 0; offset < length;) {
+      if (cancelled(cancellation)) {
+        abort_image_writer(writer);
+        return fail(CodecErrorCategory::cancelled, "image encode cancelled",
+                    category, error);
+      }
+      const DWORD count = static_cast<DWORD>(
+          std::min<std::size_t>(1024U * 1024U, length - offset));
+      DWORD written = 0;
+      if (!WriteFile(active->oxi_file, bytes + offset, count, &written,
+                     nullptr) ||
+          written != count) {
+        abort_image_writer(writer);
+        return fail(CodecErrorCategory::io, "cannot write OxiPNG output",
+                    category, error);
+      }
+      offset += written;
+    }
+    if (cancelled(cancellation)) {
+      abort_image_writer(writer);
+      return fail(CodecErrorCategory::cancelled, "image encode cancelled",
+                  category, error);
+    }
+    if (!CloseHandle(active->oxi_file)) {
+      abort_image_writer(writer);
+      return fail(CodecErrorCategory::io, "cannot close OxiPNG output",
+                  category, error);
+    }
+    active->oxi_file = INVALID_HANDLE_VALUE;
+    active->close(true);
+    delete active;
+    *writer = nullptr;
+    category = CodecErrorCategory::none;
+    error.clear();
+    return true;
+  }
+#endif
   if (active->options.container == ImageContainer::exr) {
     if (active->exr_pending_rows != 0U &&
         !flush_exr_chunk(*active, category, error)) {

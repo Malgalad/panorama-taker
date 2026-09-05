@@ -171,6 +171,7 @@ $stitcherStage = Join-Path $buildRoot "PanoramaCapture-Stitcher-$version-win-x64
 New-Item -ItemType Directory -Force -Path $stitcherStage | Out-Null
 Copy-Item $nativeGui (Join-Path $stitcherStage "PanoramaCaptureStitcher.exe")
 Copy-Item $nativeDll (Join-Path $stitcherStage "pano_gpu.dll")
+Copy-Item (Join-Path $nativeBuild "Release\pano_oxipng.dll") (Join-Path $stitcherStage "pano_oxipng.dll")
 Copy-Item (Join-Path $projectRoot "stitcher\native\third_party\licenses") `
     (Join-Path $stitcherStage "licenses") -Recurse
 Copy-Item (Join-Path $projectRoot "README.md") (Join-Path $stitcherStage "README.md")

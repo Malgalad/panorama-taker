@@ -88,6 +88,7 @@ struct NativeRenderProgress {
   unsigned calls = 0;
   unsigned completed = 0;
   unsigned total = 0;
+  unsigned indeterminate_calls = 0;
   std::vector<unsigned> values;
   std::vector<std::string> phases;
 };
@@ -100,7 +101,10 @@ struct NativeRenderProgress {
   ++progress.calls;
   progress.completed = completed;
   progress.total = total;
-  progress.values.push_back(completed);
+  if (total == 0U)
+    ++progress.indeterminate_calls;
+  else
+    progress.values.push_back(completed);
   progress.phases.emplace_back(phase == nullptr ? "" : phase);
 }
 
@@ -648,6 +652,118 @@ void test_exr_codec_contracts() {
       !pano::app::inspect_image(truncated.u8string(), info, category, error));
   EXPECT(category == pano::app::CodecErrorCategory::malformed ||
          category == pano::app::CodecErrorCategory::io);
+}
+
+void test_fast_png_contracts() {
+  constexpr std::uint64_t gib = 1024ULL * 1024U * 1024U;
+  EXPECT(!pano::app::default_fast_png(0));
+  EXPECT(!pano::app::default_fast_png(16U * gib));
+  EXPECT(pano::app::default_fast_png(16U * gib + 1U));
+  pano::app::HostMemoryStatus high{32U * gib, 24U * gib, 24U * gib};
+  EXPECT(pano::app::fast_png_memory_admitted(17552, 8776, high));
+  EXPECT(!pano::app::fast_png_memory_admitted(0, 1, high));
+  EXPECT(!pano::app::fast_png_memory_admitted(
+      std::numeric_limits<unsigned>::max(),
+      std::numeric_limits<unsigned>::max(), high));
+  EXPECT(!pano::app::fast_png_memory_admitted(17552, 8776,
+                                              {32U * gib, gib, 24U * gib}));
+  EXPECT(!pano::app::fast_png_memory_admitted(17552, 8776,
+                                              {32U * gib, 24U * gib, gib}));
+  EXPECT(!pano::app::fast_png_memory_admitted(3, 2, {}));
+
+  TemporaryDirectory temporary;
+  std::string error;
+  pano::app::ApplicationSettings settings;
+  const auto settings_path = (temporary.path() / "first.json").u8string();
+  EXPECT(pano::app::load_application_settings(settings_path, settings, error,
+                                              32U * gib));
+  EXPECT(settings.fast_png && fs::exists(fs::u8path(settings_path)));
+  EXPECT(pano::app::load_application_settings(settings_path, settings, error,
+                                              8U * gib));
+  EXPECT(settings.fast_png);
+  settings.fast_png = false;
+  EXPECT(pano::app::save_application_settings(settings_path, settings, error));
+  EXPECT(pano::app::load_application_settings(settings_path, settings, error,
+                                              32U * gib));
+  EXPECT(!settings.fast_png);
+  write_text(fs::u8path(settings_path), "{}");
+  EXPECT(pano::app::load_application_settings(settings_path, settings, error,
+                                              32U * gib));
+  EXPECT(!settings.fast_png);
+  pano::app::RenderOptions parsed;
+  EXPECT(pano::app::parse_render_options({"render", "session.json", "--output",
+                                          "out.png", "--format", "png",
+                                          "--fast-png"},
+                                         parsed, error));
+  EXPECT(parsed.fast_png);
+#ifdef _WIN32
+  const std::array<std::uint8_t, 24> padded{0,  64, 255, 10,  20,  30, 255, 128,
+                                            1,  0,  0,   0,   3,   2,  1,   17,
+                                            34, 51, 250, 251, 252, 0,  0,   0};
+  const std::array<std::uint8_t, 18> expected{
+      0, 64, 255, 10, 20, 30, 255, 128, 1, 3, 2, 1, 17, 34, 51, 250, 251, 252};
+  struct MemorySequence {
+    unsigned calls = 0;
+    unsigned low_after = 2;
+  };
+  for (unsigned low_after : {0U, 1U, 2U}) {
+    MemorySequence sequence{0, low_after};
+    pano::app::PngEncoderStatus status{};
+    pano::app::ImageWriterOptions options;
+    options.path =
+        (temporary.path() /
+         fs::u8path(u8"быстрый-" + std::to_string(low_after) + ".png"))
+            .u8string();
+    options.width = 3;
+    options.height = 2;
+    options.fast_png = true;
+    options.png_status = &status;
+    options.memory_query_data = &sequence;
+    options.memory_query = [](void *data, pano::app::HostMemoryStatus &memory) {
+      auto &sequence = *static_cast<MemorySequence *>(data);
+      const bool high_memory = sequence.calls++ < sequence.low_after;
+      memory = {32U * gib, high_memory ? 24U * gib : 0U, 24U * gib};
+      return true;
+    };
+    pano::app::ImageWriter *writer = nullptr;
+    pano::app::CodecErrorCategory category{};
+    EXPECT(pano::app::create_image_writer(options, &writer, category, error));
+    EXPECT(status == (low_after == 0 ? pano::app::PngEncoderStatus::low_memory
+                                     : pano::app::PngEncoderStatus::oxipng));
+    EXPECT(!pano::app::write_image_rows(writer, padded.data(), 2, 8, {},
+                                        category, error));
+    EXPECT(pano::app::write_image_rows(writer, padded.data(), 2, 12, {},
+                                       category, error));
+    EXPECT(pano::app::finish_image_writer(&writer, {}, category, error));
+    EXPECT(writer == nullptr);
+    EXPECT(status == (low_after < 2 ? pano::app::PngEncoderStatus::low_memory
+                                    : pano::app::PngEncoderStatus::oxipng));
+    pano::app::ImageInfo info;
+    EXPECT(pano::app::inspect_image(options.path, info, category, error));
+    EXPECT(info.width == 3 && info.height == 2 && info.channels == 3);
+    std::array<std::uint8_t, 18> decoded{};
+    EXPECT(pano::app::decode_image(options.path, info, decoded.data(), 9,
+                                   decoded.size(), {}, category, error));
+    EXPECT(decoded == expected);
+    EXPECT(!pano::app::create_image_writer(options, &writer, category, error));
+    options.path += ".cancel.png";
+    sequence = {0, 2};
+    EXPECT(pano::app::create_image_writer(options, &writer, category, error));
+    EXPECT(pano::app::write_image_rows(writer, padded.data(), 2, 12, {},
+                                       category, error));
+    const pano::app::CancellationCheck cancel{[](void *) { return true; },
+                                              nullptr};
+    EXPECT(!pano::app::finish_image_writer(&writer, cancel, category, error));
+    EXPECT(writer == nullptr && !fs::exists(fs::u8path(options.path)));
+    sequence = {0, 2};
+    EXPECT(pano::app::create_image_writer(options, &writer, category, error));
+    EXPECT(pano::app::write_image_rows(writer, padded.data(), 1, 12, {},
+                                       category, error));
+    EXPECT(!pano::app::finish_image_writer(&writer, {}, category, error));
+    pano::app::abort_image_writer(&writer);
+    EXPECT(!fs::exists(fs::u8path(options.path)));
+  }
+#endif
 }
 
 void test_sdr_writer_contracts() {
@@ -2035,6 +2151,7 @@ void test_gui_request_and_validation_state() {
   request.gpu = false;
   request.gpu_strict = true;
   request.final_exposure_ev = -0.8;
+  request.fast_png = true;
   pano::app::RenderOptions options;
   std::string error;
   EXPECT(pano::app::snapshot_gui_render_request(request, options, error));
@@ -2046,6 +2163,7 @@ void test_gui_request_and_validation_state() {
          std::abs(options.resolution - 0.75) < 1.0e-12);
   EXPECT(options.blend == "feather" && options.thumbnail && options.coverage);
   EXPECT(!options.gpu && !options.gpu_strict);
+  EXPECT(options.fast_png);
   EXPECT(!options.allow_incomplete && options.auto_contrast);
   EXPECT(std::abs(options.final_exposure_ev + 0.8) < 1.0e-12);
   request.final_exposure_ev = 2.1;
@@ -3367,6 +3485,39 @@ void test_cpu_native_session() {
          std::vector<std::string>({feather.outputs.panorama.final_path}));
 #ifdef _WIN32
   auto jpeg = feather;
+  auto fast = feather;
+  EXPECT(progress.indeterminate_calls == 0U);
+  progress = {};
+  fast.fast_png = true;
+  fast.outputs.panorama.final_path =
+      (temporary.path() / "cpu-fast.png").u8string();
+  EXPECT(
+      pano::app::update_cpu_native_preview_render_plan(preview, fast, error));
+  EXPECT(pano::app::render_cpu_native_session(preview, render_options, result,
+                                              error));
+  EXPECT(result.png_encoder != "PNG: WIC");
+  if (result.png_encoder == "PNG: OxiPNG (higher RAM)") {
+    EXPECT(progress.indeterminate_calls == 1U);
+    EXPECT(std::find(progress.phases.begin(), progress.phases.end(),
+                     "Encoding PNG") != progress.phases.end());
+  }
+  EXPECT(progress.total == 100U && progress.completed == 100U &&
+         std::is_sorted(progress.values.begin(), progress.values.end()));
+  std::array<std::uint8_t, 96> wic_pixels{}, fast_pixels{};
+  pano::app::ImageInfo png_info;
+  pano::app::CodecErrorCategory png_category{};
+  EXPECT(pano::app::inspect_image(feather.outputs.panorama.final_path, png_info,
+                                  png_category, error));
+  EXPECT(pano::app::decode_image(feather.outputs.panorama.final_path, png_info,
+                                 wic_pixels.data(), 24, wic_pixels.size(), {},
+                                 png_category, error));
+  EXPECT(pano::app::inspect_image(fast.outputs.panorama.final_path, png_info,
+                                  png_category, error));
+  EXPECT(pano::app::decode_image(fast.outputs.panorama.final_path, png_info,
+                                 fast_pixels.data(), 24, fast_pixels.size(), {},
+                                 png_category, error));
+  EXPECT(wic_pixels == fast_pixels);
+  jpeg.fast_png = true;
   jpeg.outputs.panorama.final_path =
       (temporary.path() / "cpu-feather.jpg").u8string();
   jpeg.jpeg_quality = 87U;
@@ -3380,6 +3531,7 @@ void test_cpu_native_session() {
                                   jpeg_category, error));
   EXPECT(jpeg_info.container == pano::app::ImageContainer::jpeg &&
          jpeg_info.width == 8U && jpeg_info.height == 4U);
+  EXPECT(result.png_encoder.empty());
 #endif
   pano::app::NativeRenderOptions cancelled = render_options;
   pano_gpu_cancellation_token *render_token = nullptr;
@@ -3442,6 +3594,7 @@ int main() {
   test_gui_preview_crop_state();
   test_gui_exposure_state();
   test_application_settings_history_and_deletion();
+  test_fast_png_contracts();
   test_cpu_native_session();
   test_sdr_d3d12_upload();
   test_source_decode_planning();

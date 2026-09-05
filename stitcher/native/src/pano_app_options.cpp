@@ -215,6 +215,8 @@ bool parse_render_options(const std::vector<std::string> &arguments,
       options.allow_incomplete = true;
     } else if (argument == "--auto-exposure") {
       options.automatic_exposure = true;
+    } else if (argument == "--fast-png") {
+      options.fast_png = true;
     } else if (argument == "--no-auto-contrast") {
       options.auto_contrast = false;
     } else {

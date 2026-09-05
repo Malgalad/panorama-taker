@@ -33,7 +33,9 @@ void write_help(std::ostream &output) {
          "  --exposure-target INDEX       manual exposure reference\n"
          "  --exposure-source INDEX       repeatable manual exposure source\n"
          "  --final-exposure EV           final SDR exposure (-2 to +2)\n"
-         "  --no-auto-contrast             disable final SDR auto contrast\n";
+         "  --no-auto-contrast             disable final SDR auto contrast\n"
+         "  --fast-png                     optional higher-RAM lossless PNG; "
+         "WIC fallback\n";
 }
 } // namespace
 

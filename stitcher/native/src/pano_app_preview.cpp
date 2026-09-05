@@ -1823,6 +1823,9 @@ bool render_native_session(NativePreview *const preview,
     const ImageContainer container =
         output_container(preview->plan.outputs.panorama.final_path);
     ImageWriterOptions panorama_options;
+    PngEncoderStatus png_encoder = PngEncoderStatus::wic;
+    panorama_options.fast_png = preview->plan.fast_png;
+    panorama_options.png_status = &png_encoder;
     panorama_options.path = output_stage_path(panorama_stage);
     panorama_options.container = container;
     panorama_options.width = width;
@@ -1838,6 +1841,8 @@ bool render_native_session(NativePreview *const preview,
     if (!create_image_writer(panorama_options, &panorama_writer, category,
                              error))
       return false;
+    if (container == ImageContainer::png)
+      render_progress(options, 5U, 100U, png_encoder_message(png_encoder));
     if (coverage_stage != nullptr) {
       ImageWriterOptions coverage_options;
       coverage_options.path = output_stage_path(coverage_stage);
@@ -1867,6 +1872,8 @@ bool render_native_session(NativePreview *const preview,
       RenderTimer timer(options.timings, &NativeRenderTimings::finish_ms);
       return finish_image_writer(writer, options.cancellation, category, error);
     };
+    if (png_encoder == PngEncoderStatus::oxipng)
+      render_progress(options, 0U, 0U, "Encoding PNG");
     if (!finish(&panorama_writer) ||
         (coverage_writer != nullptr &&
          !finish(&coverage_writer)))
@@ -1874,6 +1881,8 @@ bool render_native_session(NativePreview *const preview,
 
     if (thumbnail_stage != nullptr) {
       ImageWriterOptions thumbnail_options = panorama_options;
+      thumbnail_options.fast_png = false;
+      thumbnail_options.png_status = nullptr;
       thumbnail_options.path = output_stage_path(thumbnail_stage);
       thumbnail_options.width = preview->source.width;
       thumbnail_options.height = preview->source.height;
@@ -1920,6 +1929,8 @@ bool render_native_session(NativePreview *const preview,
     if (!publish_output_stages(stages, {}, category, error))
       return false;
     NativeRenderResult completed;
+    if (container == ImageContainer::png)
+      completed.png_encoder = png_encoder_message(png_encoder);
     completed.width = width;
     completed.height = height;
     completed.published_paths.reserve(stages.size());

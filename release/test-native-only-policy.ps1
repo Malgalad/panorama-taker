@@ -24,6 +24,10 @@ function New-CleanArchiveFixture {
         (Join-Path $root "pano_gpu.dll"),
         [Text.Encoding]::ASCII.GetBytes("native-d3d12-backend")
     )
+    [IO.File]::WriteAllBytes(
+        (Join-Path $root "pano_oxipng.dll"),
+        [Text.Encoding]::ASCII.GetBytes("optional-oxipng-encoder")
+    )
     Set-Content -LiteralPath (Join-Path $root "README.md") -Value "Native stitcher"
     Set-Content -LiteralPath (Join-Path $root "licenses\NOTICE.txt") -Value "Notices"
     return $root

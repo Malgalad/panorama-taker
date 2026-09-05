@@ -70,6 +70,7 @@ enum class WebViewCommandKind {
   render_with_thumbnail,
   set_modal_value,
   set_modal_toggle,
+  set_modal_fast_png,
   submit_modal,
   dismiss_modal,
   content_size,
@@ -126,6 +127,7 @@ webview_command_domain(const WebViewCommandKind kind) noexcept {
   case WebViewCommandKind::open_options:
   case WebViewCommandKind::set_modal_value:
   case WebViewCommandKind::set_modal_toggle:
+  case WebViewCommandKind::set_modal_fast_png:
   case WebViewCommandKind::submit_modal:
   case WebViewCommandKind::dismiss_modal:
     return WebViewCommandDomain::modal;
