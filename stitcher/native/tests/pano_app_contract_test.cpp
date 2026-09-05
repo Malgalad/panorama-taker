@@ -2325,6 +2325,326 @@ void test_gui_exposure_state() {
          state.warning.empty());
 }
 
+void test_source_decode_planning() {
+  constexpr std::uint64_t mib = 1024U * 1024U;
+  const std::uint64_t frame = 3840U * 2160U * 6U;
+  EXPECT(pano::app::source_decode_worker_count(frame, 30, 0, 1024, 32) == 4U);
+  EXPECT(pano::app::source_decode_worker_count(frame, 30, 0, 1024, 2) == 2U);
+  EXPECT(pano::app::source_decode_worker_count(frame, 30, 1, 1024, 32) == 1U);
+  EXPECT(pano::app::source_decode_worker_count(frame, 2, 4, 1024, 32) == 2U);
+  EXPECT(pano::app::source_decode_worker_count(frame, 30, 4, 256, 32) == 1U);
+  EXPECT(pano::app::source_decode_worker_count(frame, 30, 4, 1, 32) == 1U);
+  EXPECT(pano::app::source_decode_worker_count(frame, 30, 0, 1024, 0) == 1U);
+  EXPECT(pano::app::source_decode_worker_count(
+             std::numeric_limits<std::uint64_t>::max(), 30, 4, 8192, 32) == 1U);
+  for (unsigned budget = 256; budget <= 8192; budget += 256) {
+    const auto count =
+        pano::app::source_decode_worker_count(frame, 30, 4, budget, 32);
+    EXPECT(count >= 1U && count <= 4U);
+    if (count > 1U)
+      EXPECT(128U * mib + 2U * frame + count * (2U * frame + 32U * mib) <=
+             std::min(budget, 768U) * mib);
+  }
+}
+
+#ifdef _WIN32
+std::vector<std::uint8_t>
+read_preview_bytes(pano::app::NativePreview *preview) {
+  pano::app::NativePreviewDiagnostics dimensions;
+  std::string error;
+  EXPECT(pano::app::query_native_preview(preview, dimensions, error));
+  const auto pixels = static_cast<std::size_t>(dimensions.preview_width) *
+                      dimensions.preview_height * 3U;
+  const auto overview = static_cast<std::size_t>(dimensions.overview_width) *
+                        dimensions.overview_height * 3U;
+  const auto masks = static_cast<std::size_t>(dimensions.mask_width) *
+                     dimensions.mask_height * dimensions.frame_count;
+  std::vector<std::uint8_t> bytes(pixels + overview + masks);
+  std::array<char, 512> detail{};
+  EXPECT(pano_gpu_test_read_preview_retained(
+             pano::app::native_preview_handle(preview), bytes.data(), pixels,
+             bytes.data() + pixels, overview, bytes.data() + pixels + overview,
+             masks, detail.data(),
+             static_cast<uint32_t>(detail.size())) == PANO_GPU_SUCCESS);
+  return bytes;
+}
+
+void test_render_overlap(pano::app::NativePreview *preview,
+                         pano::app::RenderPlan plan, const char *extension) {
+  TemporaryDirectory directory;
+  plan.output_width = 514U;
+  plan.outputs.panorama.final_path =
+      (directory.path() / (std::string("render.") + extension)).u8string();
+  plan.outputs.coverage = pano::app::OutputTarget{};
+  plan.outputs.coverage->final_path =
+      (directory.path() / "coverage.png").u8string();
+  std::string error;
+  std::vector<std::uint8_t> expected, expected_coverage;
+  for (unsigned mode : {0U, 1U, 2U}) {
+    plan.workers = mode == 0U ? 1U : 0U;
+    plan.memory_mib = mode == 1U ? 128U : 1024U;
+    EXPECT(pano::app::update_native_preview_render_plan(preview, plan, error));
+    pano::app::NativeRenderOptions options;
+    pano::app::NativeRenderTimings timings;
+    options.timings = &timings;
+    pano::app::NativeRenderResult result;
+    EXPECT(pano::app::render_native_session(preview, options, result, error));
+    EXPECT(timings.encoded_bands > 1U && timings.total_ms > 0.0);
+    EXPECT(timings.overlapped_bands ==
+           (mode == 2U ? timings.encoded_bands - 1U : 0U));
+    const auto pixels =
+        read_bytes(fs::u8path(plan.outputs.panorama.final_path));
+    const auto coverage =
+        read_bytes(fs::u8path(plan.outputs.coverage->final_path));
+    if (mode == 0U) {
+      expected = pixels;
+      expected_coverage = coverage;
+    } else {
+      EXPECT(pixels == expected && coverage == expected_coverage);
+    }
+  }
+  struct Cancellation {
+    std::thread::id caller = std::this_thread::get_id();
+    std::atomic<bool> wrong_thread{false};
+    bool requested = false;
+  } cancellation;
+  pano::app::NativeRenderOptions options;
+  options.cancellation = {[](void *data) {
+                            auto &state = *static_cast<Cancellation *>(data);
+                            if (std::this_thread::get_id() != state.caller) {
+                              state.wrong_thread.store(true);
+                              return true;
+                            }
+                            return state.requested;
+                          },
+                          &cancellation};
+  options.progress_user_data = &cancellation;
+  options.progress = [](void *data, unsigned, unsigned, const char *phase) {
+    if (std::string(phase) == "render")
+      static_cast<Cancellation *>(data)->requested = true;
+  };
+  pano::app::NativeRenderResult result;
+  EXPECT(!pano::app::render_native_session(preview, options, result, error));
+  EXPECT(error.find("cancel") != std::string::npos);
+  EXPECT(!cancellation.wrong_thread.load());
+  EXPECT(read_bytes(fs::u8path(plan.outputs.panorama.final_path)) == expected);
+  EXPECT(read_bytes(fs::u8path(plan.outputs.coverage->final_path)) ==
+         expected_coverage);
+  EXPECT(std::distance(fs::directory_iterator(directory.path()),
+                       fs::directory_iterator{}) == 2);
+}
+
+void test_preview_contrast_reuse(pano_gpu_device *device) {
+  for (const char *fixture :
+       {"rgb8-srgb.jpg", "rgb8-srgb.png", "rgb16-rec2020-pq.png",
+        "rgb32-rec2020-linear.exr"}) {
+    for (const char *blend : {"hard", "feather"}) {
+      for (const bool contrast : {false, true}) {
+        for (const bool incomplete : {false, true}) {
+          pano::app::RenderPlan plan;
+          plan.session.capture_mode = "full_sphere";
+          plan.session.horizontal_fov_deg = 90.0;
+          plan.session.vertical_fov_deg = 90.0;
+          plan.session.completed = true;
+          plan.blend = blend;
+          plan.auto_contrast = contrast;
+          plan.allow_incomplete = incomplete;
+          plan.final_exposure_ev = 0.75;
+          for (unsigned face = 0; face < (incomplete ? 4U : 6U); ++face) {
+            pano::app::FrameSummary frame;
+            frame.filename = (codec_fixtures() / fixture).u8string();
+            frame.status = "captured";
+            frame.yaw_deg = face < 4U ? face * 90.0 : 0.0;
+            frame.pitch_deg = face == 4U ? 90.0 : face == 5U ? -90.0 : 0.0;
+            plan.session.frames.push_back(frame);
+          }
+          std::vector<std::uint8_t> resident;
+          std::size_t resident_steps = 0U;
+          for (const unsigned budget : {128U, 8U}) {
+            plan.gpu_memory_mib = budget;
+            pano::app::NativePreviewOptions options;
+            options.viewport_width = 128U;
+            NativeRenderProgress progress;
+            options.progress = record_native_render_progress;
+            options.progress_user_data = &progress;
+            pano::app::NativePreview *preview = nullptr;
+            std::string error;
+            const bool created = pano::app::create_native_preview(
+                device, plan, options, &preview, error);
+            if (!created)
+              std::cerr << "contrast reuse: " << error << '\n';
+            EXPECT(created);
+            if (preview == nullptr)
+              continue;
+            auto bytes = read_preview_bytes(preview);
+            if (budget == 128U) {
+              resident = std::move(bytes);
+              resident_steps = progress.values.size();
+            } else {
+              EXPECT(progress.values.size() > resident_steps);
+              EXPECT(bytes == resident);
+            }
+            EXPECT(
+                std::is_sorted(progress.values.begin(), progress.values.end()));
+            if (budget == 8U && incomplete)
+              test_render_overlap(
+                  preview, plan,
+                  std::string(fixture).find(".exr") != std::string::npos ? "exr"
+                  : std::string(fixture).find(".jpg") != std::string::npos
+                      ? "jpg"
+                      : "png");
+            pano::app::destroy_native_preview(&preview);
+            if (contrast && incomplete) {
+              bool cancel = false;
+              options.cancellation = {
+                  [](void *data) { return *static_cast<bool *>(data); },
+                  &cancel};
+              options.progress_user_data = &cancel;
+              options.progress = [](void *data, unsigned completed, unsigned,
+                                    const char *) {
+                if (completed >
+                    pano::app::native_preview_compose_progress_begin)
+                  *static_cast<bool *>(data) = true;
+              };
+              EXPECT(!pano::app::create_native_preview(device, plan, options,
+                                                       &preview, error));
+              EXPECT(preview == nullptr &&
+                     error.find("cancel") != std::string::npos);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+void test_parallel_upload(pano_gpu_device *device, const std::uint64_t luid) {
+  std::array<char, 512> detail{};
+  std::string error;
+  pano::app::CodecErrorCategory category{};
+  for (const char *fixture :
+       {"rgb8-srgb.jpg", "rgb8-srgb.png", "rgb16-rec2020-pq.png",
+        "rgb32-rec2020-linear.exr"}) {
+    const auto path = (codec_fixtures() / fixture).u8string();
+    pano::app::ImageInfo info;
+    EXPECT(pano::app::inspect_image(path, info, category, error));
+    const unsigned bytes = info.encoding.sample_type == "uint8"    ? 1U
+                           : info.encoding.sample_type == "uint16" ? 2U
+                                                                   : 4U;
+    const auto stride = info.width * 3U * bytes;
+    std::vector<std::uint8_t> expected(static_cast<std::size_t>(stride) *
+                                       info.height);
+    EXPECT(pano::app::decode_image(path, info, expected.data(), stride,
+                                   expected.size(), {}, category, error));
+    TemporaryDirectory generated;
+    std::vector<std::string> valid_paths(5U, path);
+    std::vector<std::vector<std::uint8_t>> expected_frames(5U, expected);
+    if (std::string(fixture) == "rgb8-srgb.png") {
+      for (unsigned frame = 0; frame < 5U; ++frame) {
+        std::fill(expected_frames[frame].begin(), expected_frames[frame].end(),
+                  static_cast<std::uint8_t>(frame * 43U));
+        valid_paths[frame] =
+            (generated.path() / (std::to_string(frame) + ".png")).u8string();
+        pano::app::ImageWriterOptions writer_options;
+        writer_options.path = valid_paths[frame];
+        writer_options.container = pano::app::ImageContainer::png;
+        writer_options.width = info.width;
+        writer_options.height = info.height;
+        pano::app::ImageWriter *writer = nullptr;
+        EXPECT(pano::app::create_image_writer(writer_options, &writer, category,
+                                              error));
+        EXPECT(pano::app::write_image_rows(
+            writer, expected_frames[frame].data(), info.height, stride, {},
+            category, error));
+        EXPECT(pano::app::finish_image_writer(&writer, {}, category, error));
+      }
+    }
+    for (const unsigned workers : {1U, 2U, 4U}) {
+      for (const unsigned fault : {0U, 1U, 2U, 3U, 4U}) {
+        pano_gpu_session_create_options options{};
+        options.size = sizeof(options);
+        options.abi_version = PANO_GPU_ABI_VERSION;
+        options.device_luid = luid;
+        options.frame_count = 5U;
+        options.source_width = info.width;
+        options.source_height = info.height;
+        options.source_sample_type = bytes == 1U   ? PANO_GPU_SAMPLE_UINT8
+                                     : bytes == 2U ? PANO_GPU_SAMPLE_UINT16
+                                                   : PANO_GPU_SAMPLE_FLOAT32;
+        options.transfer_function = bytes == 1U   ? PANO_GPU_TRANSFER_SRGB
+                                    : bytes == 2U ? PANO_GPU_TRANSFER_PQ
+                                                  : PANO_GPU_TRANSFER_LINEAR;
+        options.source_row_stride_bytes = stride;
+        pano_gpu_session *session = nullptr;
+        EXPECT(pano_gpu_session_create(
+                   device, &options, &session, detail.data(),
+                   static_cast<uint32_t>(detail.size())) == PANO_GPU_SUCCESS);
+        if (session == nullptr)
+          continue;
+        auto paths = valid_paths;
+        if (fault == 1U)
+          paths[2] = (codec_fixtures() / "missing-image.png").u8string();
+        if (fault == 2U)
+          paths[2] = (codec_fixtures() /
+                      (bytes == 1U ? "rgb16-rec2020-pq.png" : "rgb8-srgb.png"))
+                         .u8string();
+        struct Cancel {
+          std::thread::id caller = std::this_thread::get_id();
+          std::atomic<bool> wrong_thread{false};
+          bool requested = false;
+          unsigned at;
+        } cancel{{std::this_thread::get_id()},
+                 {false},
+                 false,
+                 fault == 4U ? 83U : 1U};
+        const pano::app::CancellationCheck check{
+            [](void *data) {
+              auto &state = *static_cast<Cancel *>(data);
+              if (std::this_thread::get_id() != state.caller) {
+                state.wrong_thread.store(true);
+                return true;
+              }
+              return state.requested;
+            },
+            &cancel};
+        pano::app::SourceLoadDiagnostics load;
+        const bool loaded = pano::app::decode_and_upload_images(
+            session, paths, info, check, nullptr, category, error,
+            fault < 3U ? nullptr : +[](void *data, unsigned completed, unsigned, const char *) {
+              auto &state = *static_cast<Cancel *>(data);
+              if (completed >= state.at) state.requested = true;
+            }, &cancel, 0U, 100U, &load, workers);
+        EXPECT(loaded == (fault == 0U));
+        EXPECT(!cancel.wrong_thread.load());
+        EXPECT(load.decoder_count == workers &&
+               load.host_buffer_bytes == workers * expected.size());
+        if (workers == 1U)
+          EXPECT(load.total_ms >= load.allocation_ms + load.inspect_ms +
+                                     load.decode_ms + load.upload_ms +
+                                     load.finish_ms);
+        if (fault == 1U)
+          EXPECT(category == pano::app::CodecErrorCategory::io);
+        if (fault == 2U)
+          EXPECT(category == pano::app::CodecErrorCategory::invalid_request);
+        if (fault >= 3U)
+          EXPECT(category == pano::app::CodecErrorCategory::cancelled);
+        if (loaded) {
+          std::vector<std::uint8_t> actual(expected.size());
+          for (unsigned frame = 0; frame < 5U; ++frame) {
+            EXPECT(pano_gpu_test_read_session_frame(
+                       session, frame, actual.data(), actual.size(),
+                       detail.data(), static_cast<uint32_t>(detail.size())) ==
+                   PANO_GPU_SUCCESS);
+            EXPECT(actual == expected_frames[frame]);
+          }
+        }
+        pano_gpu_session_destroy(&session);
+      }
+    }
+  }
+}
+#endif
+
 void test_sdr_d3d12_upload() {
 #ifdef _WIN32
   std::array<char, 512> gpu_error{};
@@ -2350,6 +2670,9 @@ void test_sdr_d3d12_upload() {
   if (device_result != PANO_GPU_SUCCESS)
     return;
 
+  test_parallel_upload(device, adapter.luid);
+  test_preview_contrast_reuse(device);
+
   pano::app::ImageInfo info;
   pano::app::CodecErrorCategory category{};
   std::string error;
@@ -2374,8 +2697,17 @@ void test_sdr_d3d12_upload() {
     const std::vector<std::string> paths{
         (codec_fixtures() / "rgb8-srgb.png").u8string(),
         (codec_fixtures() / "rgb8-srgb.png").u8string()};
-    EXPECT(pano::app::decode_and_upload_images(session, paths, info, {},
-                                               nullptr, category, error));
+    pano::app::SourceLoadDiagnostics load;
+    EXPECT(pano::app::decode_and_upload_images(
+        session, paths, info, {}, nullptr, category, error, nullptr, nullptr,
+        0U, 100U, &load, 1U));
+    EXPECT(load.decoder_count == 1U && load.host_buffer_bytes == 18U);
+    EXPECT(load.allocation_ms >= 0.0 && load.inspect_ms >= 0.0 &&
+           load.decode_ms >= 0.0 && load.upload_ms >= 0.0 &&
+           load.finish_ms >= 0.0 && load.total_ms > 0.0);
+    EXPECT(load.total_ms >= load.allocation_ms + load.inspect_ms +
+                                load.decode_ms + load.upload_ms +
+                                load.finish_ms);
     EXPECT(category == pano::app::CodecErrorCategory::none);
     pano_gpu_session_diagnostics diagnostics{};
     diagnostics.size = sizeof(diagnostics);
@@ -3112,5 +3444,6 @@ int main() {
   test_application_settings_history_and_deletion();
   test_cpu_native_session();
   test_sdr_d3d12_upload();
+  test_source_decode_planning();
   return failures == 0 ? 0 : 1;
 }

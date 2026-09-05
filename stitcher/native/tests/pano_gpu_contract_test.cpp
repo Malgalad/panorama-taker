@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <chrono>
 #include <cmath>
@@ -9,6 +10,7 @@
 #include <cstdio>
 #include <limits>
 #include <numeric>
+#include <thread>
 #include <vector>
 
 #if defined(_WIN32)
@@ -1250,15 +1252,43 @@ int main(const int argc, char **const argv)
     EXPECT(std::all_of(
         band_srgb8.begin(), band_srgb8.end(), [](const uint8_t value) { return value == 0xA5; }));
     pano_gpu_cancellation_token_destroy(&download_token);
-    EXPECT(pano_gpu_output_download_srgb8(
-               histogram_output, &download_request, nullptr, error.data(),
-               static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    for (const bool signal_failure : {false, true})
+    {
+        band_srgb8.fill(0xA5);
+        EXPECT(pano_gpu_test_set_queue_blocked(device, 1) == PANO_GPU_SUCCESS);
+        if (signal_failure)
+            pano_gpu_test_fail_next_pending_fence_signal();
+        else
+            pano_gpu_test_fail_next_pending_fence_wait();
+        std::atomic<bool> download_returned{false};
+        pano_gpu_result pending_download_result = PANO_GPU_SUCCESS;
+        std::thread pending_download([&] {
+            pending_download_result = pano_gpu_output_download_srgb8(histogram_output, &download_request, nullptr,
+                                                                     error.data(), static_cast<uint32_t>(error.size()));
+            download_returned.store(true, std::memory_order_release);
+        });
+        const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (pano_gpu_test_failed_fence_wait_is_draining() == 0 &&
+               !download_returned.load(std::memory_order_acquire) && std::chrono::steady_clock::now() < drain_deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const bool observed_drain = pano_gpu_test_failed_fence_wait_is_draining() != 0;
+        const bool returned_early = download_returned.load(std::memory_order_acquire);
+        const auto unblock_result = pano_gpu_test_set_queue_blocked(device, 0);
+        pending_download.join();
+        EXPECT(observed_drain && !returned_early);
+        EXPECT(unblock_result == PANO_GPU_SUCCESS);
+        EXPECT(pending_download_result == PANO_GPU_UNAVAILABLE);
+        if (!signal_failure)
+            EXPECT(std::string(error.data()).find("output download timed out") != std::string::npos);
+        EXPECT(std::all_of(band_srgb8.begin(), band_srgb8.end(), [](const uint8_t value) { return value == 0xA5; }));
+        EXPECT(pano_gpu_output_download_srgb8(histogram_output, &download_request, nullptr, error.data(),
+                                              static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
+    }
     for (size_t index = 0; index < converted_linear_srgb.size(); ++index)
     {
         const float positive = std::max(converted_linear_srgb[index], 0.0F);
-        const float encoded = positive <= 0.0031308F
-            ? positive * 12.92F
-            : 1.055F * std::pow(positive, 1.0F / 2.4F) - 0.055F;
+        const float encoded =
+            positive <= 0.0031308F ? positive * 12.92F : 1.055F * std::pow(positive, 1.0F / 2.4F) - 0.055F;
         const int expected = static_cast<int>(
             std::nearbyint(std::clamp(encoded, 0.0F, 1.0F) * 255.0F));
         EXPECT(std::abs(static_cast<int>(band_srgb8[index]) - expected) <= 1);
@@ -1287,9 +1317,9 @@ int main(const int argc, char **const argv)
                histogram_output, &transfer_diagnostics, error.data(),
                static_cast<uint32_t>(error.size())) == PANO_GPU_SUCCESS);
     EXPECT(transfer_diagnostics.readback_bytes == 64 * 1024);
-    EXPECT(transfer_diagnostics.download_count == 3);
+    EXPECT(transfer_diagnostics.download_count == 4);
     EXPECT(transfer_diagnostics.downloaded_bytes ==
-           sizeof(band_srgb8) + sizeof(band_float_output) + sizeof(band_downloaded_coverage));
+           2 * sizeof(band_srgb8) + sizeof(band_float_output) + sizeof(band_downloaded_coverage));
     band_histogram_color[0] = std::numeric_limits<float>::quiet_NaN();
     band_histogram_color[1] = std::numeric_limits<float>::infinity();
     band_histogram_color[2] = -std::numeric_limits<float>::infinity();
@@ -2260,6 +2290,12 @@ int main(const int argc, char **const argv)
                                         projected_y >= -0.5F && projected_y <= 3.5F));
             const float expected_edge_distance = std::min(std::min(x, y), std::min(3.0F - x, 3.0F - y));
             EXPECT(std::fabs(uint8_candidate_edge_distances[pixel] - expected_edge_distance) < 1.0e-5F);
+            if (uint8_candidate_validity[pixel] == 0U)
+            {
+                for (uint32_t channel = 0; channel < 3; ++channel)
+                    EXPECT(uint8_candidates[3 * pixel + channel] == 0.0F);
+                continue;
+            }
             for (uint32_t channel = 0; channel < 3; ++channel)
             {
                 const auto source_value = [&](const uint32_t source_x, const uint32_t source_y) {
@@ -2365,6 +2401,12 @@ int main(const int argc, char **const argv)
                                         projected_y >= -0.5F && projected_y <= 3.5F));
             const float expected_edge_distance = std::min(std::min(x, y), std::min(3.0F - x, 3.0F - y));
             EXPECT(std::fabs(uint16_candidate_edge_distances[pixel] - expected_edge_distance) < 1.0e-5F);
+            if (uint16_candidate_validity[pixel] == 0U)
+            {
+                for (uint32_t channel = 0; channel < 3; ++channel)
+                    EXPECT(uint16_candidates[3 * pixel + channel] == 0.0F);
+                continue;
+            }
             for (uint32_t channel = 0; channel < 3; ++channel)
             {
                 const auto source_value = [&](const uint32_t source_x, const uint32_t source_y) {
@@ -2452,6 +2494,12 @@ int main(const int argc, char **const argv)
                                         projected_y >= -0.5F && projected_y <= 3.5F));
             const float expected_edge_distance = std::min(std::min(x, y), std::min(3.0F - x, 3.0F - y));
             EXPECT(std::fabs(float32_candidate_edge_distances[pixel] - expected_edge_distance) < 1.0e-5F);
+            if (float32_candidate_validity[pixel] == 0U)
+            {
+                for (uint32_t channel = 0; channel < 3; ++channel)
+                    EXPECT(float32_candidates[3 * pixel + channel] == 0.0F);
+                continue;
+            }
             for (uint32_t channel = 0; channel < 3; ++channel)
             {
                 const auto source_value = [&](const uint32_t source_x, const uint32_t source_y) {

@@ -3,8 +3,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -14,10 +17,84 @@
 #include <vector>
 
 #define NOMINMAX
+#include <dxgi1_4.h>
+#include <psapi.h>
 #include <windows.h>
+#include <wrl/client.h>
 
 namespace {
 using Clock = std::chrono::steady_clock;
+
+class PreviewResources {
+public:
+  bool start(const std::uint64_t adapter_luid) {
+    Microsoft::WRL::ComPtr<IDXGIFactory4> factory;
+    LUID luid{};
+    static_assert(sizeof(luid) == sizeof(adapter_luid));
+    std::memcpy(&luid, &adapter_luid, sizeof(luid));
+    if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory))) ||
+        FAILED(factory->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter_))))
+      return false;
+    thread_ = std::thread([this] {
+      do {
+        PROCESS_MEMORY_COUNTERS_EX memory{};
+        memory.cb = sizeof(memory);
+        DXGI_QUERY_VIDEO_MEMORY_INFO local{}, shared{};
+        if (!GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&memory),
+                sizeof(memory)) ||
+            FAILED(adapter_->QueryVideoMemoryInfo(
+                0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) ||
+            FAILED(adapter_->QueryVideoMemoryInfo(
+                0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared))) {
+          valid_ = false;
+          return;
+        }
+        working_ = std::max(working_, memory.WorkingSetSize);
+        private_ = std::max(private_, memory.PrivateUsage);
+        local_ = std::max(local_, local.CurrentUsage);
+        shared_ = std::max(shared_, shared.CurrentUsage);
+        ++samples_;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      } while (!stop_.load(std::memory_order_relaxed));
+    });
+    return true;
+  }
+  void stop() {
+    stop_.store(true, std::memory_order_relaxed);
+    if (thread_.joinable())
+      thread_.join();
+  }
+  bool report(const char *label = "preview_resources") {
+    stop();
+    std::cout << label << " samples=" << samples_
+              << " working_bytes=" << working_ << " private_bytes=" << private_
+              << " local_bytes=" << local_ << " nonlocal_bytes=" << shared_
+              << '\n';
+    return valid_ && samples_ != 0U;
+  }
+  ~PreviewResources() { stop(); }
+
+private:
+  Microsoft::WRL::ComPtr<IDXGIAdapter3> adapter_;
+  std::atomic<bool> stop_{false};
+  std::thread thread_;
+  bool valid_ = true;
+  unsigned samples_ = 0;
+  SIZE_T working_ = 0, private_ = 0;
+  UINT64 local_ = 0, shared_ = 0;
+};
+
+void preview_progress(void *user, unsigned completed, unsigned,
+                      const char *phase) {
+  const auto elapsed =
+      std::chrono::duration<double, std::milli>(
+          Clock::now() - *static_cast<const Clock::time_point *>(user))
+          .count();
+  std::cout << "preview_progress ms=" << elapsed << " completed=" << completed
+            << " phase=" << phase << '\n';
+}
 
 std::string utf8(const wchar_t *const value) {
   const int size = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value, -1,
@@ -99,8 +176,10 @@ void print_help() {
   std::cout
       << "Usage: pano_app_headless_probe render SESSION --output PATH [render "
          "options]\n"
-         "       [--probe-preview-width PIXELS] [--probe-hold-ms MILLISECONDS]\n"
-         "       [--probe-exposure-target POSE]\n";
+         "       [--probe-preview-width PIXELS] [--probe-hold-ms "
+         "MILLISECONDS]\n"
+         "       [--probe-exposure-target POSE] [--probe-preview-only]\n"
+         "       [--probe-preview-dump PATH]\n";
 }
 } // namespace
 
@@ -123,6 +202,24 @@ int wmain(const int argc, wchar_t **const argv) {
   unsigned preview_width = 2U;
   unsigned hold_ms = 1U;
   unsigned exposure_target = 1U;
+  const auto preview_only_option =
+      std::find(arguments.begin(), arguments.end(), "--probe-preview-only");
+  const bool preview_only = preview_only_option != arguments.end();
+  if (preview_only)
+    arguments.erase(preview_only_option);
+  std::string preview_dump;
+  const auto dump_option =
+      std::find(arguments.begin(), arguments.end(), "--probe-preview-dump");
+  if (dump_option != arguments.end()) {
+    if (dump_option + 1 == arguments.end())
+      return 1;
+    preview_dump = *(dump_option + 1);
+    arguments.erase(dump_option, dump_option + 2);
+    if (std::filesystem::exists(std::filesystem::u8path(preview_dump))) {
+      std::cerr << "error: preview dump already exists\n";
+      return 1;
+    }
+  }
   std::string error;
   if (!take_probe_option(arguments, "--probe-preview-width", 4096U,
                          preview_width, error) ||
@@ -193,15 +290,40 @@ int wmain(const int argc, wchar_t **const argv) {
             << " usable_bytes=" << device_diagnostics.usable_local_bytes
             << '\n';
 
-  const auto started = Clock::now();
+  PreviewResources resources;
+  if (!resources.start(device_diagnostics.adapter.luid)) {
+    std::cerr << "error: cannot start preview resource sampling\n";
+    return 2;
+  }
+  auto started = Clock::now();
   pano::app::NativePreviewOptions preview_options;
+  pano::app::SourceLoadDiagnostics load;
+  preview_options.source_load_diagnostics = &load;
   preview_options.viewport_width = preview_width;
+  preview_options.progress = preview_progress;
+  preview_options.progress_user_data = &started;
   if (!pano::app::create_native_preview(device, plan, preview_options, &preview,
                                         error)) {
     std::cerr << "error: " << error << '\n';
     return 3;
   }
   const auto preview_ready = Clock::now();
+  std::cout << "source_load allocation_ms=" << load.allocation_ms
+            << " inspect_ms=" << load.inspect_ms
+            << " decode_ms=" << load.decode_ms
+            << " upload_ms=" << load.upload_ms
+            << " finish_ms=" << load.finish_ms << " total_ms=" << load.total_ms
+            << " decoders=" << load.decoder_count
+            << " host_buffer_bytes=" << load.host_buffer_bytes << '\n';
+  if (!resources.report()) {
+    std::cerr << "error: preview resource sampling failed\n";
+    return 3;
+  }
+  std::cout << "preview_time ms="
+            << std::chrono::duration<double, std::milli>(preview_ready -
+                                                         started)
+                   .count()
+            << '\n';
   pano::app::NativePreviewDiagnostics preview_diagnostics;
   pano_gpu_preview_diagnostics retained{};
   retained.size = sizeof(retained);
@@ -219,6 +341,46 @@ int wmain(const int argc, wchar_t **const argv) {
             << " height=" << preview_diagnostics.preview_height
             << " retained_bytes=" << retained.retained_bytes
             << " hold_ms=" << hold_ms << '\n';
+  if (!preview_dump.empty()) {
+    std::vector<std::uint8_t> pixels(
+        static_cast<std::size_t>(preview_diagnostics.preview_width) *
+        preview_diagnostics.preview_height * 3U);
+    std::vector<std::uint8_t> overview(
+        static_cast<std::size_t>(preview_diagnostics.overview_width) *
+        preview_diagnostics.overview_height * 3U);
+    std::vector<std::uint8_t> masks(
+        static_cast<std::size_t>(preview_diagnostics.mask_width) *
+        preview_diagnostics.mask_height * preview_diagnostics.frame_count);
+    if (pano_gpu_test_read_preview_retained(
+            pano::app::native_preview_handle(preview), pixels.data(),
+            pixels.size(), overview.data(), overview.size(), masks.data(),
+            masks.size(), gpu_error.data(),
+            static_cast<std::uint32_t>(gpu_error.size())) != PANO_GPU_SUCCESS) {
+      std::cerr << "error: " << gpu_error.data() << '\n';
+      return 3;
+    }
+    std::ofstream dump(std::filesystem::u8path(preview_dump), std::ios::binary);
+    for (const auto *bytes : {&pixels, &overview, &masks})
+      dump.write(reinterpret_cast<const char *>(bytes->data()),
+                 static_cast<std::streamsize>(bytes->size()));
+    dump.close();
+    if (!dump)
+      return 3;
+  }
+  if (preview_only) {
+    pano::app::destroy_native_preview(&preview);
+    pano_gpu_device_destroy(&device);
+    pano_gpu_diagnostics after{};
+    after.size = sizeof(after);
+    after.abi_version = PANO_GPU_ABI_VERSION;
+    return pano_gpu_query_diagnostics(
+               &after, gpu_error.data(),
+               static_cast<std::uint32_t>(gpu_error.size())) ==
+                       PANO_GPU_SUCCESS &&
+                   same_live_counts(before, after)
+               ? 0
+               : 4;
+  }
   write_phase("preview_idle");
   std::this_thread::sleep_for(std::chrono::milliseconds(hold_ms));
   write_phase("exposure");
@@ -249,6 +411,11 @@ int wmain(const int argc, wchar_t **const argv) {
   write_phase("render");
 
   pano::app::NativeRenderOptions native_options;
+  pano::app::NativeRenderTimings render_timings;
+  native_options.timings = &render_timings;
+  PreviewResources render_resources;
+  if (!render_resources.start(device_diagnostics.adapter.luid))
+    return 3;
   native_options.progress = progress;
   pano::app::NativeRenderResult result;
   if (!pano::app::render_native_session(preview, native_options, result,
@@ -257,6 +424,19 @@ int wmain(const int argc, wchar_t **const argv) {
     return 3;
   }
   const auto rendered = Clock::now();
+  if (!render_resources.report("render_resources"))
+    return 3;
+  std::cout << "render_timings bands=" << render_timings.encoded_bands
+            << " overlapped_bands=" << render_timings.overlapped_bands
+            << " setup_ms=" << render_timings.setup_ms
+            << " composite_ms=" << render_timings.composite_ms
+            << " contrast_ms=" << render_timings.contrast_ms
+            << " convert_ms=" << render_timings.convert_ms
+            << " readback_ms=" << render_timings.readback_ms
+            << " encode_ms=" << render_timings.encode_ms
+            << " finish_ms=" << render_timings.finish_ms
+            << " publish_ms=" << render_timings.publish_ms
+            << " total_ms=" << render_timings.total_ms << '\n';
   write_phase("teardown");
   pano::app::destroy_native_preview(&preview);
   pano_gpu_device_destroy(&device);

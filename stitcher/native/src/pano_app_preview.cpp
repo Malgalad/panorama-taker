@@ -3,9 +3,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <future>
 #include <limits>
 #include <memory>
 #include <new>
@@ -15,6 +18,31 @@
 namespace pano::app {
 namespace {
 constexpr std::uint64_t alignment = 65536U;
+
+class RenderTimer {
+public:
+  RenderTimer(NativeRenderTimings *timings, double NativeRenderTimings::*field)
+      : timings_(timings), field_(field) {}
+  ~RenderTimer() { mark(field_); }
+  void pause() {
+    mark(field_);
+    timings_ = nullptr;
+  }
+  void mark(double NativeRenderTimings::*field) {
+    const auto now = std::chrono::steady_clock::now();
+    if (timings_ != nullptr)
+      timings_->*field_ +=
+          std::chrono::duration<double, std::milli>(now - start_).count();
+    start_ = now;
+    field_ = field;
+  }
+
+private:
+  NativeRenderTimings *timings_;
+  double NativeRenderTimings::*field_;
+  std::chrono::steady_clock::time_point start_ =
+      std::chrono::steady_clock::now();
+};
 
 bool checked_multiply(const std::uint64_t left, const std::uint64_t right,
                       std::uint64_t &result) {
@@ -288,7 +316,8 @@ bool create_native_preview(pano_gpu_device *const device,
             owner->session, paths, source, options.cancellation,
             options.gpu_cancellation, category, error, options.progress,
             options.progress_user_data, native_preview_load_progress_begin,
-            native_preview_compose_progress_begin))
+            native_preview_compose_progress_begin,
+            options.source_load_diagnostics, plan.workers, plan.memory_mib))
       return false;
 
     std::vector<std::uint8_t> pixels;
@@ -629,6 +658,7 @@ bool compose_preview(pano_gpu_session *session, const RenderPlan &plan,
   const bool histogram_required = plan.auto_contrast || !plan.allow_incomplete;
   const unsigned band_count =
       std::max(1U, (height + workspace_rows - 1U) / workspace_rows);
+  const bool reuse_composite = plan.auto_contrast && band_count == 1U;
   const unsigned total_steps = band_count * (plan.auto_contrast ? 2U : 1U);
   unsigned completed_steps = 0U;
   const auto report_composition = [&]() {
@@ -650,6 +680,10 @@ bool compose_preview(pano_gpu_session *session, const RenderPlan &plan,
     return false;
   if (plan.auto_contrast) {
     for (unsigned row = 0; row < height; row += workspace_rows) {
+      if (cancelled(progress_options)) {
+        error = "native preview composition cancelled";
+        return false;
+      }
       const unsigned rows = std::min(workspace_rows, height - row);
       for (auto &frame : frames) {
         frame.row_start = row;
@@ -712,12 +746,16 @@ bool compose_preview(pano_gpu_session *session, const RenderPlan &plan,
   }
   pixels.resize(static_cast<std::size_t>(pixel_bytes));
   for (unsigned row = 0; row < height; row += workspace_rows) {
+    if (cancelled(progress_options)) {
+      error = "native preview composition cancelled";
+      return false;
+    }
     const unsigned rows = std::min(workspace_rows, height - row);
     for (auto &frame : frames) {
       frame.row_start = row;
       frame.row_count = rows;
     }
-    if (!compose())
+    if (!reuse_composite && !compose())
       return false;
     if (histogram_required && !plan.auto_contrast) {
       if (!gpu_ok(pano_gpu_output_accumulate_auto_contrast_histogram_srgb(
@@ -727,17 +765,21 @@ bool compose_preview(pano_gpu_session *session, const RenderPlan &plan,
         return false;
     }
     if (pq) {
-      if (!gpu_ok(pano_gpu_output_tone_map_rec2020(
-                      output,
-                      static_cast<float>(source.encoding.reference_white_nits),
-                      gpu_error.data(),
-                      static_cast<std::uint32_t>(gpu_error.size())),
-                  gpu_error, "cannot tone-map D3D12 preview", error) ||
-          !gpu_ok(pano_gpu_output_convert_tone_mapped_rec2020_to_linear_srgb(
-                      output, gpu_error.data(),
-                      static_cast<std::uint32_t>(gpu_error.size())),
-                  gpu_error, "cannot convert D3D12 preview primaries", error) ||
-          !gpu_ok(pano_gpu_output_apply_auto_contrast_converted_srgb(
+      // A single-band histogram leaves both the composite and PQ conversion
+      // intact.
+      if (!reuse_composite &&
+          (!gpu_ok(pano_gpu_output_tone_map_rec2020(
+                       output,
+                       static_cast<float>(source.encoding.reference_white_nits),
+                       gpu_error.data(),
+                       static_cast<std::uint32_t>(gpu_error.size())),
+                   gpu_error, "cannot tone-map D3D12 preview", error) ||
+           !gpu_ok(pano_gpu_output_convert_tone_mapped_rec2020_to_linear_srgb(
+                       output, gpu_error.data(),
+                       static_cast<std::uint32_t>(gpu_error.size())),
+                   gpu_error, "cannot convert D3D12 preview primaries", error)))
+        return false;
+      if (!gpu_ok(pano_gpu_output_apply_auto_contrast_converted_srgb(
                       output, plan.auto_contrast ? 1U : 0U, gpu_error.data(),
                       static_cast<std::uint32_t>(gpu_error.size())),
                   gpu_error, "cannot apply D3D12 preview contrast", error))
@@ -1228,6 +1270,7 @@ bool stream_gpu_output(NativePreview &preview, ImageWriter *writer,
                        const float output_vertical_fov,
                        const pano_gpu_memory_plan &memory,
                        const NativeRenderOptions &options, std::string &error) {
+  RenderTimer timer(options.timings, &NativeRenderTimings::setup_ms);
   std::array<char, 512> gpu_error{};
   pano_gpu_output *output = nullptr;
   struct OutputCleanup {
@@ -1302,7 +1345,7 @@ bool stream_gpu_output(NativePreview &preview, ImageWriter *writer,
   inputs.mark_incomplete = preview.plan.allow_incomplete ? 1U : 0U;
   inputs.global_gains = output_gains->data();
   inputs.global_gain_bytes = output_gains->size() * sizeof(float);
-  const auto compose = [&]() {
+  const auto compose = [&](std::string &compose_error) {
     const auto result = preview.plan.blend == "hard"
                             ? pano_gpu_output_compose_hard_with_inputs(
                                   output, &ordered, &inputs, gpu_error.data(),
@@ -1311,9 +1354,10 @@ bool stream_gpu_output(NativePreview &preview, ImageWriter *writer,
                                   output, &ordered, &inputs, gpu_error.data(),
                                   static_cast<std::uint32_t>(gpu_error.size()));
     return gpu_ok(result, gpu_error, "cannot compose native render band",
-                  error);
+                  compose_error);
   };
   const bool auto_contrast = sdr && preview.plan.auto_contrast;
+  timer.mark(&NativeRenderTimings::contrast_ms);
   if (auto_contrast &&
       !gpu_ok(pano_gpu_output_prepare_auto_contrast_histogram(
                   output, gpu_error.data(),
@@ -1335,8 +1379,10 @@ bool stream_gpu_output(NativePreview &preview, ImageWriter *writer,
         frame.row_start = row;
         frame.row_count = rows;
       }
-      if (!compose())
+      timer.mark(&NativeRenderTimings::composite_ms);
+      if (!compose(error))
         return false;
+      timer.mark(&NativeRenderTimings::contrast_ms);
       if (pq) {
         if (!gpu_ok(pano_gpu_output_tone_map_rec2020(
                         output,
@@ -1382,6 +1428,7 @@ bool stream_gpu_output(NativePreview &preview, ImageWriter *writer,
     }
   }
   const std::uint64_t sample_bytes = sdr ? 1U : sizeof(float);
+  timer.mark(&NativeRenderTimings::setup_ms);
   std::uint64_t band_bytes = 0;
   if (!checked_multiply(band_rows, width, band_bytes) ||
       !checked_multiply(band_bytes, 3U * sample_bytes, band_bytes) ||
@@ -1389,15 +1436,36 @@ bool stream_gpu_output(NativePreview &preview, ImageWriter *writer,
     error = "native render band buffer overflows";
     return false;
   }
-  std::vector<std::uint8_t> pixels(static_cast<std::size_t>(band_bytes));
-  std::vector<std::uint8_t> coverage(
+  struct Band {
+    std::vector<std::uint8_t> pixels;
+    std::vector<std::uint8_t> coverage;
+    NativeRenderTimings timings;
+    std::string error;
+  };
+  const std::uint64_t coverage_bytes =
       coverage_writer == nullptr && preview.plan.allow_incomplete
           ? 0U
-          : static_cast<std::size_t>(band_rows) * width);
-  CodecErrorCategory category{};
-  for (unsigned row = 0; row < height; row += band_rows) {
-    if (cancelled(options)) {
-      error = "native render cancelled";
+          : static_cast<std::uint64_t>(band_rows) * width;
+  constexpr std::uint64_t mib = 1024U * 1024U;
+  const bool overlap =
+      band_rows < height && preview.plan.workers != 1U &&
+      band_bytes <= 128U * mib &&
+      4U * band_bytes + 2U * coverage_bytes + 128U * mib <=
+          std::min<std::uint64_t>(preview.plan.memory_mib, 768U) * mib;
+  std::array<Band, 2> bands;
+  for (unsigned index = 0; index < (overlap ? 2U : 1U); ++index) {
+    bands[index].pixels.resize(static_cast<std::size_t>(band_bytes));
+    bands[index].coverage.resize(static_cast<std::size_t>(coverage_bytes));
+  }
+  timer.pause();
+  std::atomic<bool> stop{false};
+  const auto produce = [&](Band &band, const unsigned row) {
+    band.timings = {};
+    band.error.clear();
+    RenderTimer produce_timer(&band.timings,
+                              &NativeRenderTimings::composite_ms);
+    if (stop.load(std::memory_order_relaxed)) {
+      band.error = "native render cancelled";
       return false;
     }
     const unsigned rows = std::min(band_rows, height - row);
@@ -1405,8 +1473,10 @@ bool stream_gpu_output(NativePreview &preview, ImageWriter *writer,
       frame.row_start = row;
       frame.row_count = rows;
     }
-    if (!compose())
+    produce_timer.mark(&NativeRenderTimings::composite_ms);
+    if (!compose(band.error))
       return false;
+    produce_timer.mark(&NativeRenderTimings::convert_ms);
     if (sdr) {
       if (pq) {
         if (!gpu_ok(pano_gpu_output_tone_map_rec2020(
@@ -1415,33 +1485,35 @@ bool stream_gpu_output(NativePreview &preview, ImageWriter *writer,
                             preview.source.encoding.reference_white_nits),
                         gpu_error.data(),
                         static_cast<std::uint32_t>(gpu_error.size())),
-                    gpu_error, "cannot tone-map native render", error) ||
+                    gpu_error, "cannot tone-map native render", band.error) ||
             !gpu_ok(pano_gpu_output_convert_tone_mapped_rec2020_to_linear_srgb(
                         output, gpu_error.data(),
                         static_cast<std::uint32_t>(gpu_error.size())),
                     gpu_error, "cannot convert native render primaries",
-                    error) ||
+                    band.error) ||
             !gpu_ok(pano_gpu_output_apply_auto_contrast_converted_srgb(
                         output, auto_contrast ? 1U : 0U, gpu_error.data(),
                         static_cast<std::uint32_t>(gpu_error.size())),
-                    gpu_error, "cannot apply native render contrast", error))
+                    gpu_error, "cannot apply native render contrast",
+                    band.error))
           return false;
       } else if (!gpu_ok(pano_gpu_output_apply_auto_contrast_srgb(
                              output, auto_contrast ? 1U : 0U, gpu_error.data(),
                              static_cast<std::uint32_t>(gpu_error.size())),
                          gpu_error, "cannot apply native render contrast",
-                         error)) {
+                         band.error)) {
         return false;
       }
       if (!gpu_ok(pano_gpu_output_quantize_normalized_srgb8(
                       output, gpu_error.data(),
                       static_cast<std::uint32_t>(gpu_error.size())),
-                  gpu_error, "cannot quantize native render", error))
+                  gpu_error, "cannot quantize native render", band.error))
         return false;
     } else if (!gpu_ok(pano_gpu_output_copy_linear_float(
                            output, gpu_error.data(),
                            static_cast<std::uint32_t>(gpu_error.size())),
-                       gpu_error, "cannot copy native float render", error)) {
+                       gpu_error, "cannot copy native float render",
+                       band.error)) {
       return false;
     }
     pano_gpu_output_download_request download{};
@@ -1450,9 +1522,10 @@ bool stream_gpu_output(NativePreview &preview, ImageWriter *writer,
     download.output_width = width;
     download.row_start = row;
     download.row_count = rows;
-    download.data = pixels.data();
+    download.data = band.pixels.data();
     download.data_bytes =
         static_cast<std::uint64_t>(rows) * width * 3U * sample_bytes;
+    produce_timer.mark(&NativeRenderTimings::readback_ms);
     const auto download_result =
         sdr ? pano_gpu_output_download_srgb8(
                   output, &download, options.gpu_cancellation, gpu_error.data(),
@@ -1461,35 +1534,96 @@ bool stream_gpu_output(NativePreview &preview, ImageWriter *writer,
                   output, &download, options.gpu_cancellation, gpu_error.data(),
                   static_cast<std::uint32_t>(gpu_error.size()));
     if (!gpu_ok(download_result, gpu_error,
-                "cannot download native render band", error) ||
-        !write_image_rows(writer, pixels.data(), rows,
-                          static_cast<std::uint64_t>(width) * 3U * sample_bytes,
-                          options.cancellation, category, error))
+                "cannot download native render band", band.error))
       return false;
-    if (!coverage.empty()) {
-      download.data = coverage.data();
+    if (!band.coverage.empty()) {
+      produce_timer.mark(&NativeRenderTimings::readback_ms);
+      download.data = band.coverage.data();
       download.data_bytes = static_cast<std::uint64_t>(rows) * width;
       if (!gpu_ok(pano_gpu_output_download_coverage(
                       output, &download, options.gpu_cancellation,
                       gpu_error.data(),
                       static_cast<std::uint32_t>(gpu_error.size())),
-                  gpu_error, "cannot download native render coverage", error) ||
+                  gpu_error, "cannot download native render coverage",
+                  band.error) ||
           (!preview.plan.allow_incomplete &&
-           std::find(coverage.begin(),
-                     coverage.begin() + static_cast<std::size_t>(rows) * width,
+           std::find(band.coverage.begin(),
+                     band.coverage.begin() +
+                         static_cast<std::size_t>(rows) * width,
                      std::uint8_t{0}) !=
-               coverage.begin() + static_cast<std::size_t>(rows) * width)) {
-        if (error.empty())
-          error = "capture does not cover every output pixel";
+               band.coverage.begin() +
+                   static_cast<std::size_t>(rows) * width)) {
+        if (band.error.empty())
+          band.error = "capture does not cover every output pixel";
         return false;
       }
-      if (coverage_writer != nullptr &&
-          !write_image_rows(coverage_writer, coverage.data(), rows, width,
-                            options.cancellation, category, error))
+    }
+    return true;
+  };
+  std::future<bool> pending;
+  struct Drain {
+    std::atomic<bool> &stop;
+    std::future<bool> &pending;
+    ~Drain() {
+      stop.store(true, std::memory_order_relaxed);
+      if (pending.valid())
+        pending.wait();
+    }
+  } drain{stop, pending};
+  const auto launch = [&](const unsigned row, Band &band) {
+    pending = std::async(std::launch::async, [&, row, target = &band] {
+      return produce(*target, row);
+    });
+  };
+  if (overlap)
+    launch(0U, bands[0]);
+  CodecErrorCategory category{};
+  for (unsigned row = 0, index = 0; row < height; row += band_rows, ++index) {
+    if (cancelled(options)) {
+      error = "native render cancelled";
+      return false;
+    }
+    auto &band = bands[overlap ? index % 2U : 0U];
+    if (pending.valid()) {
+      while (pending.wait_for(std::chrono::milliseconds(10)) !=
+             std::future_status::ready)
+        if (cancelled(options)) {
+          error = "native render cancelled";
+          return false;
+        }
+    }
+    const bool produced = pending.valid() ? pending.get() : produce(band, row);
+    if (options.timings != nullptr) {
+      options.timings->composite_ms += band.timings.composite_ms;
+      options.timings->convert_ms += band.timings.convert_ms;
+      options.timings->readback_ms += band.timings.readback_ms;
+    }
+    if (!produced) {
+      error = band.error;
+      return false;
+    }
+    const unsigned rows = std::min(band_rows, height - row);
+    if (overlap && row + rows < height) {
+      launch(row + rows, bands[(index + 1U) % 2U]);
+      if (options.timings != nullptr)
+        ++options.timings->overlapped_bands;
+    }
+    {
+      RenderTimer encode_timer(options.timings,
+                               &NativeRenderTimings::encode_ms);
+      if (!write_image_rows(writer, band.pixels.data(), rows,
+                            static_cast<std::uint64_t>(width) * 3U *
+                                sample_bytes,
+                            options.cancellation, category, error) ||
+          (coverage_writer != nullptr &&
+           !write_image_rows(coverage_writer, band.coverage.data(), rows, width,
+                             options.cancellation, category, error)))
         return false;
     }
     render_progress(options, (auto_contrast ? height : 0U) + row + rows,
                     total_progress, rectilinear ? "thumbnail" : "render");
+    if (options.timings != nullptr)
+      ++options.timings->encoded_bands;
   }
   return true;
 }
@@ -1631,6 +1765,9 @@ bool query_native_maximum_render_width(const NativePreview *const preview,
 bool render_native_session(NativePreview *const preview,
                            const NativeRenderOptions &options,
                            NativeRenderResult &result, std::string &error) {
+  if (options.timings != nullptr)
+    *options.timings = {};
+  RenderTimer total_timer(options.timings, &NativeRenderTimings::total_ms);
   if (preview == nullptr || preview->session == nullptr ||
       preview->device == nullptr) {
     error = "native render session is not available";
@@ -1726,11 +1863,13 @@ bool render_native_session(NativePreview *const preview,
                            height, false, 0.0F, memory, panorama_render_options,
                            error))
       return false;
-    if (!finish_image_writer(&panorama_writer, options.cancellation, category,
-                             error) ||
+    const auto finish = [&](ImageWriter **writer) {
+      RenderTimer timer(options.timings, &NativeRenderTimings::finish_ms);
+      return finish_image_writer(writer, options.cancellation, category, error);
+    };
+    if (!finish(&panorama_writer) ||
         (coverage_writer != nullptr &&
-         !finish_image_writer(&coverage_writer, options.cancellation, category,
-                              error)))
+         !finish(&coverage_writer)))
       return false;
 
     if (thumbnail_stage != nullptr) {
@@ -1763,8 +1902,7 @@ bool render_native_session(NativePreview *const preview,
                              preview->source.width, preview->source.height,
                              true, vertical_fov, thumbnail_memory,
                              thumbnail_render_options, error) ||
-          !finish_image_writer(&thumbnail_writer, options.cancellation,
-                               category, error))
+          !finish(&thumbnail_writer))
         return false;
     }
     if (cancelled(options)) {
@@ -1778,6 +1916,7 @@ bool render_native_session(NativePreview *const preview,
       stages.push_back(thumbnail_stage);
     stages.push_back(panorama_stage);
     render_progress(options, 95U, 100U, "Publishing output");
+    RenderTimer publication_timer(options.timings, &NativeRenderTimings::publish_ms);
     if (!publish_output_stages(stages, {}, category, error))
       return false;
     NativeRenderResult completed;

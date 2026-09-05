@@ -75,6 +75,13 @@ void generate_uint16_candidate(uint3 thread_id : SV_DispatchThreadID)
     const float2 coordinate = clamp(projected, float2(0.0f, 0.0f), source_camera.xy - 1.0f);
     candidate_edge_distance[index] = min(
         min(coordinate.x, coordinate.y), min(source_camera.x - 1.0f - coordinate.x, source_camera.y - 1.0f - coordinate.y));
+    [branch]
+    if (!valid)
+    {
+        // Feather accumulation reads RGB even when the candidate weight is zero.
+        candidate_rgb[index] = float3(0.0f, 0.0f, 0.0f);
+        return;
+    }
     const uint2 lower = uint2(floor(coordinate));
     const uint2 upper = min(lower + 1u, uint2(source_width - 1u, source_height - 1u));
     const float2 fraction = frac(coordinate);

@@ -1151,6 +1151,11 @@ PANO_GPU_API void pano_gpu_test_fail_next_download_submission(void) PANO_GPU_NOE
 PANO_GPU_API void pano_gpu_test_fail_next_download_fence_wait(void) PANO_GPU_NOEXCEPT;
 PANO_GPU_API void pano_gpu_test_fail_next_download_map(void) PANO_GPU_NOEXCEPT;
 PANO_GPU_API void pano_gpu_test_fail_next_fence_wait(void) PANO_GPU_NOEXCEPT;
+PANO_GPU_API void pano_gpu_test_fail_next_pending_fence_wait(void) PANO_GPU_NOEXCEPT;
+PANO_GPU_API void pano_gpu_test_fail_next_pending_fence_signal(void) PANO_GPU_NOEXCEPT;
+PANO_GPU_API int32_t pano_gpu_test_failed_fence_wait_is_draining(void) PANO_GPU_NOEXCEPT;
+PANO_GPU_API pano_gpu_result pano_gpu_test_set_queue_blocked(
+    pano_gpu_device *device, int32_t blocked) PANO_GPU_NOEXCEPT;
 PANO_GPU_API pano_gpu_result pano_gpu_test_convert_linear_srgb(
     const pano_gpu_session *session,
     const float *linear_rgb,

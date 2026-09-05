@@ -529,12 +529,24 @@ constexpr unsigned native_preview_overview_progress_end = 90U;
 constexpr unsigned native_preview_masks_progress_end = 94U;
 constexpr unsigned native_preview_retain_progress_end = 95U;
 
+struct SourceLoadDiagnostics {
+  double allocation_ms = 0.0;
+  double inspect_ms = 0.0;
+  double decode_ms = 0.0;
+  double upload_ms = 0.0;
+  double finish_ms = 0.0;
+  double total_ms = 0.0;
+  unsigned decoder_count = 1U;
+  std::uint64_t host_buffer_bytes = 0U;
+};
+
 struct NativePreviewOptions {
   unsigned viewport_width = 0;
   CancellationCheck cancellation;
   const pano_gpu_cancellation_token *gpu_cancellation = nullptr;
   NativeProgressCallback progress = nullptr;
   void *progress_user_data = nullptr;
+  SourceLoadDiagnostics *source_load_diagnostics = nullptr;
 };
 
 struct NativePreviewDiagnostics {
@@ -556,11 +568,26 @@ struct NativeExposureResult {
 
 using NativeRenderProgressCallback = NativeProgressCallback;
 
+struct NativeRenderTimings {
+  unsigned encoded_bands = 0;
+  unsigned overlapped_bands = 0;
+  double setup_ms = 0.0;
+  double composite_ms = 0.0;
+  double contrast_ms = 0.0;
+  double convert_ms = 0.0;
+  double readback_ms = 0.0;
+  double encode_ms = 0.0;
+  double finish_ms = 0.0;
+  double publish_ms = 0.0;
+  double total_ms = 0.0;
+};
+
 struct NativeRenderOptions {
   CancellationCheck cancellation;
   const pano_gpu_cancellation_token *gpu_cancellation = nullptr;
   NativeRenderProgressCallback progress = nullptr;
   void *progress_user_data = nullptr;
+  NativeRenderTimings *timings = nullptr;
 };
 
 struct NativeRenderResult {
@@ -610,6 +637,11 @@ bool decode_image(const std::string &path, const ImageInfo &info, void *output,
                   std::uint64_t row_stride_bytes, std::uint64_t output_bytes,
                   const CancellationCheck &cancellation,
                   CodecErrorCategory &category, std::string &error);
+unsigned source_decode_worker_count(std::uint64_t frame_bytes,
+                                    std::size_t frame_count,
+                                    unsigned requested_workers,
+                                    unsigned memory_mib,
+                                    unsigned hardware_threads);
 bool decode_and_upload_images(
     pano_gpu_session *session, const std::vector<std::string> &paths,
     const ImageInfo &expected_info, const CancellationCheck &cancellation,
@@ -617,7 +649,8 @@ bool decode_and_upload_images(
     CodecErrorCategory &category, std::string &error,
     NativeProgressCallback progress = nullptr,
     void *progress_user_data = nullptr, unsigned progress_begin = 0U,
-    unsigned progress_end = 100U);
+    unsigned progress_end = 100U, SourceLoadDiagnostics *diagnostics = nullptr,
+    unsigned workers = 0U, unsigned memory_mib = 1024U);
 bool create_image_writer(const ImageWriterOptions &options,
                          ImageWriter **writer, CodecErrorCategory &category,
                          std::string &error);

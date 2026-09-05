@@ -606,7 +606,7 @@ if(BUILD_TESTING)
         pano_app_contract_test PRIVATE pano_app_core pano_app_codecs)
     target_compile_features(pano_app_contract_test PRIVATE cxx_std_17)
     target_compile_definitions(pano_app_contract_test
-        PRIVATE PANO_APP_FIXTURE_DIR="${PANO_APP_FIXTURE_DIR}"
+        PRIVATE PANO_GPU_TEST_HOOKS PANO_APP_FIXTURE_DIR="${PANO_APP_FIXTURE_DIR}"
                 PANO_CODEC_FIXTURE_DIR="${PANO_CODEC_FIXTURE_DIR}")
     if(MSVC)
         target_compile_options(pano_app_contract_test PRIVATE /W4 /WX /permissive-)
@@ -634,7 +634,8 @@ if(BUILD_TESTING)
             NAME pano_app_webview_contract
             COMMAND pano_app_webview_contract_test)
         add_executable(pano_app_headless_probe tests/pano_app_headless_probe.cpp)
-        target_link_libraries(pano_app_headless_probe PRIVATE pano_app_core)
+        target_link_libraries(pano_app_headless_probe PRIVATE pano_app_core dxgi psapi)
+        target_compile_definitions(pano_app_headless_probe PRIVATE PANO_GPU_TEST_HOOKS)
         target_compile_features(pano_app_headless_probe PRIVATE cxx_std_17)
         target_compile_options(pano_app_headless_probe PRIVATE /W4 /WX /permissive-)
         target_link_options(pano_app_headless_probe PRIVATE /Brepro)

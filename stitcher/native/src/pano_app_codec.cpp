@@ -5,14 +5,18 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <limits>
 #include <new>
 #include <string>
+#include <thread>
 #include <utility>
 
 #ifdef _WIN32
@@ -717,13 +721,55 @@ bool decode_image(const std::string &path, const ImageInfo &info, void *output,
 #endif
 }
 
+unsigned source_decode_worker_count(const std::uint64_t frame_bytes,
+                                    const std::size_t frame_count,
+                                    const unsigned requested_workers,
+                                    const unsigned memory_mib,
+                                    const unsigned hardware_threads) {
+  constexpr std::uint64_t mib = 1024U * 1024U;
+  const auto budget = std::min<std::uint64_t>(memory_mib, 768U) * mib;
+  // Reserve host overhead, two upload slots, and decoder scratch per host
+  // frame. Insufficient headroom preserves the existing one-frame path.
+  if (frame_bytes == 0U || budget <= 128U * mib ||
+      frame_bytes > (budget - 128U * mib) / 2U)
+    return 1U;
+  const auto available = budget - 128U * mib - 2U * frame_bytes;
+  const auto per_decoder = 2U * frame_bytes + 32U * mib;
+  return static_cast<unsigned>(std::max<std::uint64_t>(
+      1U, std::min({std::uint64_t{4U}, static_cast<std::uint64_t>(frame_count),
+                    static_cast<std::uint64_t>(
+                        requested_workers == 0U ? std::max(1U, hardware_threads)
+                                                : requested_workers),
+                    available / per_decoder})));
+}
+
 bool decode_and_upload_images(
     pano_gpu_session *const session, const std::vector<std::string> &paths,
     const ImageInfo &expected_info, const CancellationCheck &cancellation,
     const pano_gpu_cancellation_token *const gpu_cancellation,
     CodecErrorCategory &category, std::string &error,
     const NativeProgressCallback progress, void *const progress_user_data,
-    const unsigned progress_begin, const unsigned progress_end) {
+    const unsigned progress_begin, const unsigned progress_end,
+    SourceLoadDiagnostics *const diagnostics, const unsigned workers,
+    const unsigned memory_mib) {
+  using Clock = std::chrono::steady_clock;
+  const auto elapsed_ms = [](const Clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(Clock::now() - start)
+        .count();
+  };
+  SourceLoadDiagnostics measured;
+  struct Measurement {
+    SourceLoadDiagnostics &measured;
+    SourceLoadDiagnostics *destination;
+    Clock::time_point start = Clock::now();
+    ~Measurement() {
+      measured.total_ms =
+          std::chrono::duration<double, std::milli>(Clock::now() - start)
+              .count();
+      if (destination != nullptr)
+        *destination = measured;
+    }
+  } measurement{measured, diagnostics};
   if (session == nullptr || paths.empty() || expected_info.width == 0U ||
       expected_info.height == 0U || expected_info.channels != 3U ||
       (expected_info.encoding.sample_type != "uint8" &&
@@ -781,7 +827,22 @@ bool decode_and_upload_images(
       progress(progress_user_data, value, 100U, "Loading source images");
     };
     report_progress(0U);
-    std::vector<std::uint8_t> pixels(static_cast<std::size_t>(frame_bytes));
+    const auto allocation_started = Clock::now();
+    measured.decoder_count = source_decode_worker_count(
+        frame_bytes, paths.size(), workers, memory_mib,
+        std::thread::hardware_concurrency());
+    struct DecodeSlot {
+      std::vector<std::uint8_t> pixels;
+      std::future<bool> pending;
+      CodecErrorCategory category{};
+      std::string error;
+      double inspect_ms = 0.0;
+      double decode_ms = 0.0;
+    };
+    std::array<DecodeSlot, 4> slots;
+    for (unsigned slot = 0; slot < measured.decoder_count; ++slot)
+      slots[slot].pixels.resize(static_cast<std::size_t>(frame_bytes));
+    measured.host_buffer_bytes = frame_bytes * measured.decoder_count;
     std::array<char, 512> gpu_error{};
     pano_gpu_result result = pano_gpu_session_allocate_source(
         session, gpu_error.data(),
@@ -799,13 +860,31 @@ bool decode_and_upload_images(
     if (result != PANO_GPU_SUCCESS)
       return fail_gpu(result, gpu_error);
 
-    for (std::size_t index = 0; index < paths.size(); ++index) {
-      if (index > std::numeric_limits<std::uint32_t>::max())
-        return fail(CodecErrorCategory::invalid_request,
-                    "too many source images", category, error);
+    measured.allocation_ms = elapsed_ms(allocation_started);
+    struct DecodeCancellation {
+      std::atomic<bool> stop{false};
+      const pano_gpu_cancellation_token *gpu;
+    } decode_cancellation{{false}, gpu_cancellation};
+    const CancellationCheck worker_cancellation{
+        [](void *data) {
+          const auto &state = *static_cast<const DecodeCancellation *>(data);
+          return state.stop.load(std::memory_order_relaxed) ||
+                 (state.gpu != nullptr &&
+                  pano_gpu_cancellation_token_is_cancelled(state.gpu) != 0);
+        },
+        &decode_cancellation};
+    const auto decode = [&](const std::size_t index, DecodeSlot &slot,
+                            const CancellationCheck &check) {
+      slot.inspect_ms = 0.0;
+      slot.decode_ms = 0.0;
       ImageInfo actual_info;
-      if (!inspect_image(paths[index], actual_info, category, error))
+      const auto inspect_started = Clock::now();
+      if (cancelled(check))
+        return fail(CodecErrorCategory::cancelled, "image decode cancelled",
+                    slot.category, slot.error);
+      if (!inspect_image(paths[index], actual_info, slot.category, slot.error))
         return false;
+      slot.inspect_ms = elapsed_ms(inspect_started);
       if (actual_info.width != expected_info.width ||
           actual_info.height != expected_info.height ||
           actual_info.channels != expected_info.channels ||
@@ -819,10 +898,60 @@ bool decode_and_upload_images(
               expected_info.encoding.reference_white_nits)
         return fail(CodecErrorCategory::invalid_request,
                     "source image metadata does not match the session",
+                    slot.category, slot.error);
+      const auto decode_started = Clock::now();
+      const bool succeeded = decode_image(
+          paths[index], actual_info, slot.pixels.data(), row_stride,
+          frame_bytes, check, slot.category, slot.error);
+      slot.decode_ms = elapsed_ms(decode_started);
+      return succeeded;
+    };
+    struct DrainDecoders {
+      DecodeCancellation &cancellation;
+      std::array<DecodeSlot, 4> &slots;
+      ~DrainDecoders() {
+        cancellation.stop.store(true, std::memory_order_relaxed);
+        for (auto &slot : slots)
+          if (slot.pending.valid())
+            slot.pending.wait();
+      }
+    } drain{decode_cancellation, slots};
+    const auto launch = [&](const std::size_t index, DecodeSlot &slot) {
+      slot.pending = std::async(std::launch::async, [&, index, target = &slot] {
+        return decode(index, *target, worker_cancellation);
+      });
+    };
+    if (measured.decoder_count > 1U)
+      for (unsigned slot = 0; slot < measured.decoder_count; ++slot)
+        launch(slot, slots[slot]);
+    for (std::size_t index = 0; index < paths.size(); ++index) {
+      if (index > std::numeric_limits<std::uint32_t>::max())
+        return fail(CodecErrorCategory::invalid_request,
+                    "too many source images", category, error);
+      auto &slot = slots[index % measured.decoder_count];
+      const auto load_cancelled = [&] {
+        return cancelled(cancellation) || cancelled(worker_cancellation);
+      };
+      if (load_cancelled())
+        return fail(CodecErrorCategory::cancelled, "image upload cancelled",
                     category, error);
-      if (!decode_image(paths[index], actual_info, pixels.data(), row_stride,
-                        frame_bytes, cancellation, category, error))
-        return false;
+      if (slot.pending.valid()) {
+        while (slot.pending.wait_for(std::chrono::milliseconds(10)) !=
+               std::future_status::ready)
+          if (load_cancelled())
+            return fail(CodecErrorCategory::cancelled, "image upload cancelled",
+                        category, error);
+      }
+      const bool succeeded = slot.pending.valid()
+                                 ? slot.pending.get()
+                                 : decode(index, slot, cancellation);
+      measured.inspect_ms += slot.inspect_ms;
+      measured.decode_ms += slot.decode_ms;
+      if (!succeeded)
+        return fail(slot.category, slot.error, category, error);
+      if (load_cancelled())
+        return fail(CodecErrorCategory::cancelled, "image upload cancelled",
+                    category, error);
       pano_gpu_source_upload upload{};
       upload.size = sizeof(upload);
       upload.abi_version = PANO_GPU_ABI_VERSION;
@@ -832,20 +961,33 @@ bool decode_and_upload_images(
               ? PANO_GPU_SAMPLE_FLOAT32
               : (is_uint16 ? PANO_GPU_SAMPLE_UINT16 : PANO_GPU_SAMPLE_UINT8);
       upload.source_row_stride_bytes = static_cast<std::uint32_t>(row_stride);
-      upload.data = pixels.data();
+      upload.data = slot.pixels.data();
       upload.data_bytes = frame_bytes;
       gpu_error.fill('\0');
+      const auto upload_started = Clock::now();
       result = pano_gpu_session_upload_frame_cancellable(
           session, &upload, gpu_cancellation, gpu_error.data(),
           static_cast<std::uint32_t>(gpu_error.size()));
+      measured.upload_ms += elapsed_ms(upload_started);
       if (result != PANO_GPU_SUCCESS)
         return fail_gpu(result, gpu_error);
       report_progress(index + 1U);
+      if (load_cancelled())
+        return fail(CodecErrorCategory::cancelled, "image upload cancelled",
+                    category, error);
+      if (measured.decoder_count > 1U &&
+          index + measured.decoder_count < paths.size())
+        launch(index + measured.decoder_count, slot);
     }
+    if (cancelled(cancellation) || cancelled(worker_cancellation))
+      return fail(CodecErrorCategory::cancelled, "image upload cancelled",
+                  category, error);
     gpu_error.fill('\0');
+    const auto finish_started = Clock::now();
     result = pano_gpu_session_finish_uploads_cancellable(
         session, gpu_cancellation, gpu_error.data(),
         static_cast<std::uint32_t>(gpu_error.size()));
+    measured.finish_ms = elapsed_ms(finish_started);
     if (result != PANO_GPU_SUCCESS)
       return fail_gpu(result, gpu_error);
     report_progress(paths.size() + 1U);

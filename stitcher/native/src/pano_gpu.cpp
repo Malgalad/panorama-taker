@@ -93,6 +93,9 @@ std::atomic<bool> fail_next_preview_surface_device_removed {false};
 #endif
 #if defined(PANO_GPU_TEST_HOOKS)
 std::atomic<bool> fail_next_fence_wait {false};
+std::atomic<bool> fail_next_pending_fence_wait {false};
+std::atomic<bool> fail_next_pending_fence_signal {false};
+std::atomic<bool> failed_fence_wait_draining {false};
 #endif
 bool drain_session_uploads_for_release(pano_gpu_session *session) noexcept;
 } // namespace
@@ -106,10 +109,21 @@ struct pano_gpu_device_core
 {
     pano_gpu_adapter_info adapter_info {};
 #if defined(_WIN32)
+    struct CompositePipelines
+    {
+        Microsoft::WRL::ComPtr<ID3D12RootSignature> roots[6];
+        Microsoft::WRL::ComPtr<ID3D12PipelineState> states[6];
+        bool ready {false};
+    };
+    std::mutex composite_pipeline_mutex;
+    std::array<CompositePipelines, 6> composite_pipelines;
     Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
     Microsoft::WRL::ComPtr<ID3D12Device> d3d_device;
     Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
     Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+#if defined(PANO_GPU_TEST_HOOKS)
+    Microsoft::WRL::ComPtr<ID3D12Fence> test_queue_gate;
+#endif
     Microsoft::WRL::ComPtr<ID3D12InfoQueue1> info_queue;
     DWORD info_queue_callback_cookie {0};
     bool info_queue_callback_registered {false};
@@ -272,6 +286,15 @@ struct pano_gpu_output
     uint64_t downloaded_bytes {0};
     bool count_registered {false};
 #if defined(_WIN32)
+    struct CompositeWorkspace
+    {
+        uint64_t pixels {0};
+        bool feather {false};
+        bool local {false};
+        std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 10> buffers;
+        std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 2> zeros;
+        Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> descriptors;
+    } composite_workspace;
     Microsoft::WRL::ComPtr<ID3D12Resource> linear;
     Microsoft::WRL::ComPtr<ID3D12Resource> coverage;
     Microsoft::WRL::ComPtr<ID3D12Resource> histogram;
@@ -667,9 +690,49 @@ void write_device_error(
         dump_dred(device, operation);
 }
 
-pano_gpu_result wait_for_fence(
-    pano_gpu_device_core *const device_core, const uint64_t fence_value, char *const error_buffer,
-    const uint32_t error_buffer_size, const char *const operation)
+void drain_failed_fence_wait(pano_gpu_device_core *const device_core, const uint64_t fence_value)
+{
+    // A timeout is not GPU completion. Keep the caller's resources and allocator
+    // alive until completion or device removal, even if event registration failed.
+#if defined(PANO_GPU_TEST_HOOKS)
+    failed_fence_wait_draining.store(true, std::memory_order_release);
+#endif
+    while (device_core->fence->GetCompletedValue() < fence_value &&
+           SUCCEEDED(device_core->d3d_device->GetDeviceRemovedReason()))
+        Sleep(1);
+#if defined(PANO_GPU_TEST_HOOKS)
+    failed_fence_wait_draining.store(false, std::memory_order_release);
+#endif
+}
+
+HRESULT signal_fence(pano_gpu_device_core *const device_core, const uint64_t fence_value)
+{
+#if defined(PANO_GPU_TEST_HOOKS)
+    const bool injected_failure = fail_next_pending_fence_signal.exchange(false, std::memory_order_relaxed);
+#else
+    const bool injected_failure = false;
+#endif
+    const HRESULT result =
+        injected_failure ? E_FAIL : device_core->queue->Signal(device_core->fence.Get(), fence_value);
+    if (FAILED(result))
+    {
+        // Submission may already be executing. A failed signal does not make
+        // releasing its objects safe, and the unsignaled value cannot be waited on.
+        while (SUCCEEDED(device_core->d3d_device->GetDeviceRemovedReason()))
+        {
+            if (SUCCEEDED(device_core->queue->Signal(device_core->fence.Get(), fence_value)))
+            {
+                drain_failed_fence_wait(device_core, fence_value);
+                break;
+            }
+            Sleep(1);
+        }
+    }
+    return result;
+}
+
+pano_gpu_result wait_for_fence(pano_gpu_device_core *const device_core, const uint64_t fence_value,
+                               char *const error_buffer, const uint32_t error_buffer_size, const char *const operation)
 {
     const ULONGLONG wait_started = GetTickCount64();
     uint64_t completed_value = device_core->fence->GetCompletedValue();
@@ -691,14 +754,19 @@ pano_gpu_result wait_for_fence(
         {
             debug_log("fence wait cannot create event win32-error=%lu", GetLastError());
             write_error(error_buffer, error_buffer_size, operation);
+            drain_failed_fence_wait(device_core, fence_value);
             return PANO_GPU_UNAVAILABLE;
         }
         const HRESULT event_result =
             device_core->fence->SetEventOnCompletion(fence_value, event_handle);
+        DWORD timeout_ms = 10000;
+#if defined(PANO_GPU_TEST_HOOKS)
+        if (fail_next_pending_fence_wait.exchange(false, std::memory_order_relaxed))
+            timeout_ms = 0;
+#endif
         const DWORD wait_status = SUCCEEDED(event_result)
-            ? WaitForSingleObject(event_handle, 10000)
+            ? WaitForSingleObject(event_handle, timeout_ms)
             : WAIT_FAILED;
-        CloseHandle(event_handle);
         if (FAILED(event_result) || wait_status != WAIT_OBJECT_0)
         {
             const HRESULT removal_reason = device_core->d3d_device->GetDeviceRemovedReason();
@@ -718,8 +786,11 @@ pano_gpu_result wait_for_fence(
                     device_core->d3d_device.Get());
             else
                 write_error(error_buffer, error_buffer_size, operation);
+            drain_failed_fence_wait(device_core, fence_value);
+            CloseHandle(event_handle);
             return PANO_GPU_UNAVAILABLE;
         }
+        CloseHandle(event_handle);
     }
     completed_value = device_core->fence->GetCompletedValue();
     if (completed_value == std::numeric_limits<uint64_t>::max())
@@ -929,6 +1000,36 @@ bool select_admitted_adapter(
         write_error(error_buffer, error_buffer_size, "cannot create DXGI factory");
         return false;
     }
+#if defined(PANO_GPU_TEST_HOOKS)
+    char requested_vendor[16] {};
+    const DWORD vendor_length = GetEnvironmentVariableA(
+        "PANO_GPU_TEST_ADAPTER_VENDOR", requested_vendor, static_cast<DWORD>(sizeof(requested_vendor)));
+    if (vendor_length != 0)
+    {
+        if (vendor_length >= sizeof(requested_vendor))
+        {
+            write_error(error_buffer, error_buffer_size, "invalid test adapter vendor");
+            return false;
+        }
+        char *end = nullptr;
+        const unsigned long vendor = std::strtoul(requested_vendor, &end, 16);
+        if (end == requested_vendor || *end != '\0' || vendor == 0 || vendor > 0xffffUL)
+        {
+            write_error(error_buffer, error_buffer_size, "invalid test adapter vendor");
+            return false;
+        }
+        for (UINT index = 0; factory->EnumAdapters1(index, selected->ReleaseAndGetAddressOf()) == S_OK; ++index)
+        {
+            DXGI_ADAPTER_DESC1 description {};
+            if (SUCCEEDED(selected->Get()->GetDesc1(&description)) && description.VendorId == vendor &&
+                (description.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) == 0 && admit_adapter(selected->Get(), adapter))
+                return true;
+        }
+        selected->Reset();
+        write_error(error_buffer, error_buffer_size, "requested test adapter is unavailable or unsupported");
+        return false;
+    }
+#endif
     if (options->allow_warp != 0)
     {
         ComPtr<IDXGIFactory4> factory4;
@@ -1272,25 +1373,14 @@ pano_gpu_result pano_gpu_device_dispatch_self_test(
     ID3D12CommandList *lists[] = {list.Get()};
     queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value = handle->core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(queue->Signal(handle->core->fence.Get(), fence_value)))
+    if (FAILED(signal_fence(handle->core.get(), fence_value)))
     {
         write_error(error_buffer, error_buffer_size, "cannot signal D3D12 self-test fence");
         return PANO_GPU_UNAVAILABLE;
     }
-    HANDLE event_handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (event_handle == nullptr)
-    {
-        write_error(error_buffer, error_buffer_size, "cannot create D3D12 self-test fence event");
+    if (wait_for_fence(handle->core.get(), fence_value, error_buffer, error_buffer_size,
+                       "D3D12 self-test fence timed out") != PANO_GPU_SUCCESS)
         return PANO_GPU_UNAVAILABLE;
-    }
-    const HRESULT wait_result = handle->core->fence->SetEventOnCompletion(fence_value, event_handle);
-    const DWORD wait_status = SUCCEEDED(wait_result) ? WaitForSingleObject(event_handle, 10000) : WAIT_FAILED;
-    CloseHandle(event_handle);
-    if (wait_status != WAIT_OBJECT_0)
-    {
-        write_error(error_buffer, error_buffer_size, "D3D12 self-test fence timed out");
-        return PANO_GPU_UNAVAILABLE;
-    }
     const D3D12_RANGE read_range {0, static_cast<SIZE_T>(buffer_bytes)};
     if (FAILED(readback->Map(0, &read_range, &mapped)))
     {
@@ -2445,8 +2535,7 @@ static pano_gpu_result dispatch_reference_exposure_pair_ratios(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(
-            session->device_core->fence.Get(), fence_value)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) ||
         wait_for_fence(
             session->device_core.get(), fence_value, error_buffer, error_buffer_size,
             "resident reference exposure-pair dispatch timed out") != PANO_GPU_SUCCESS)
@@ -2980,7 +3069,7 @@ pano_gpu_result pano_gpu_session_dispatch_exposure_pair_projection_samples(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) ||
         wait_for_fence(
             session->device_core.get(), fence_value, error_buffer, error_buffer_size,
             "resident D3D12 exposure-pair dispatch timed out") != PANO_GPU_SUCCESS)
@@ -3129,7 +3218,7 @@ pano_gpu_result pano_gpu_session_dispatch_exposure_pair_classification(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) ||
         wait_for_fence(
             session->device_core.get(), fence_value, error_buffer, error_buffer_size,
             "resident exposure classification timed out") != PANO_GPU_SUCCESS)
@@ -3418,7 +3507,7 @@ pano_gpu_result upload_frame_impl(
 #endif
     const HRESULT signal_result = inject_signal_failure
         ? E_FAIL
-        : session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value);
+        : signal_fence(session->device_core.get(), fence_value);
     if (FAILED(signal_result))
     {
         session->upload_submission_untracked = true;
@@ -3557,7 +3646,7 @@ pano_gpu_result finish_uploads_impl(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)))
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)))
     {
         write_error(error_buffer, error_buffer_size, "cannot signal D3D12 source-ready transition fence");
         return PANO_GPU_UNAVAILABLE;
@@ -3845,8 +3934,7 @@ pano_gpu_result pano_gpu_output_prepare_auto_contrast_histogram(
     output->session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence =
         output->session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(output->session->device_core->queue->Signal(
-            output->session->device_core->fence.Get(), fence)) ||
+    if (FAILED(signal_fence(output->session->device_core.get(), fence)) ||
         wait_for_fence(
             output->session->device_core.get(), fence, error_buffer, error_buffer_size,
             "output histogram clear timed out") != PANO_GPU_SUCCESS)
@@ -4009,8 +4097,7 @@ static pano_gpu_result accumulate_auto_contrast_histogram_srgb_impl(
     output->session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence =
         output->session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(output->session->device_core->queue->Signal(
-            output->session->device_core->fence.Get(), fence)) ||
+    if (FAILED(signal_fence(output->session->device_core.get(), fence)) ||
         wait_for_fence(
             output->session->device_core.get(), fence, error_buffer, error_buffer_size,
             "output histogram accumulation timed out") != PANO_GPU_SUCCESS)
@@ -4164,8 +4251,7 @@ pano_gpu_result pano_gpu_output_select_auto_contrast_levels(
     output->session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence =
         output->session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(output->session->device_core->queue->Signal(
-            output->session->device_core->fence.Get(), fence)) ||
+    if (FAILED(signal_fence(output->session->device_core.get(), fence)) ||
         wait_for_fence(
             output->session->device_core.get(), fence, error_buffer, error_buffer_size,
             "auto-contrast level selection timed out") != PANO_GPU_SUCCESS)
@@ -4326,8 +4412,7 @@ static pano_gpu_result apply_auto_contrast_srgb_impl(
     output->session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence =
         output->session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(output->session->device_core->queue->Signal(
-            output->session->device_core->fence.Get(), fence)) ||
+    if (FAILED(signal_fence(output->session->device_core.get(), fence)) ||
         wait_for_fence(
             output->session->device_core.get(), fence, error_buffer, error_buffer_size,
             "auto-contrast application timed out") != PANO_GPU_SUCCESS)
@@ -4477,8 +4562,7 @@ pano_gpu_result pano_gpu_output_tone_map_rec2020(
     output->session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence =
         output->session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(output->session->device_core->queue->Signal(
-            output->session->device_core->fence.Get(), fence)) ||
+    if (FAILED(signal_fence(output->session->device_core.get(), fence)) ||
         wait_for_fence(
             output->session->device_core.get(), fence, error_buffer, error_buffer_size,
             "Rec.2020 tone mapping timed out") != PANO_GPU_SUCCESS)
@@ -4610,8 +4694,7 @@ pano_gpu_result pano_gpu_output_convert_tone_mapped_rec2020_to_linear_srgb(
     output->session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence =
         output->session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(output->session->device_core->queue->Signal(
-            output->session->device_core->fence.Get(), fence)) ||
+    if (FAILED(signal_fence(output->session->device_core.get(), fence)) ||
         wait_for_fence(
             output->session->device_core.get(), fence, error_buffer, error_buffer_size,
             "Rec.2020 matrix conversion timed out") != PANO_GPU_SUCCESS)
@@ -4682,8 +4765,7 @@ pano_gpu_result pano_gpu_output_copy_linear_float(
     output->session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence =
         output->session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(output->session->device_core->queue->Signal(
-            output->session->device_core->fence.Get(), fence)) ||
+    if (FAILED(signal_fence(output->session->device_core.get(), fence)) ||
         wait_for_fence(
             output->session->device_core.get(), fence, error_buffer, error_buffer_size,
             "float-output copy timed out") != PANO_GPU_SUCCESS)
@@ -4790,8 +4872,7 @@ static pano_gpu_result download_output_impl(
     output->session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence =
         output->session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(output->session->device_core->queue->Signal(
-            output->session->device_core->fence.Get(), fence)) ||
+    if (FAILED(signal_fence(output->session->device_core.get(), fence)) ||
         wait_for_fence(
             output->session->device_core.get(), fence, error_buffer, error_buffer_size,
             "output download timed out") != PANO_GPU_SUCCESS)
@@ -4996,8 +5077,7 @@ pano_gpu_result pano_gpu_output_quantize_normalized_srgb8(
     output->session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence =
         output->session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(output->session->device_core->queue->Signal(
-            output->session->device_core->fence.Get(), fence)) ||
+    if (FAILED(signal_fence(output->session->device_core.get(), fence)) ||
         wait_for_fence(
             output->session->device_core.get(), fence, error_buffer, error_buffer_size,
             "normalized-sRGB quantization timed out") != PANO_GPU_SUCCESS)
@@ -5108,7 +5188,7 @@ pano_gpu_result pano_gpu_test_read_output_band(
     ID3D12CommandList *lists[] = {list.Get()};
     output->session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence = output->session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(output->session->device_core->queue->Signal(output->session->device_core->fence.Get(), fence)))
+    if (FAILED(signal_fence(output->session->device_core.get(), fence)))
     {
         write_error(error_buffer, error_buffer_size, "cannot signal D3D12 output-band readback fence");
         return PANO_GPU_UNAVAILABLE;
@@ -5324,22 +5404,14 @@ pano_gpu_result pano_gpu_session_upload_rotations(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)))
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)))
     {
         write_error(error_buffer, error_buffer_size, "cannot signal D3D12 rotation upload fence");
         return PANO_GPU_UNAVAILABLE;
     }
-    HANDLE event_handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (event_handle == nullptr ||
-        FAILED(session->device_core->fence->SetEventOnCompletion(fence_value, event_handle)) ||
-        WaitForSingleObject(event_handle, 10000) != WAIT_OBJECT_0)
-    {
-        if (event_handle != nullptr)
-            CloseHandle(event_handle);
-        write_error(error_buffer, error_buffer_size, "D3D12 rotation upload fence timed out");
+    if (wait_for_fence(session->device_core.get(), fence_value, error_buffer, error_buffer_size,
+                       "D3D12 rotation upload fence timed out") != PANO_GPU_SUCCESS)
         return PANO_GPU_UNAVAILABLE;
-    }
-    CloseHandle(event_handle);
     session->rotations_uploaded = true;
     return PANO_GPU_SUCCESS;
 #endif
@@ -5473,22 +5545,14 @@ pano_gpu_result pano_gpu_session_upload_encoding_metadata(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)))
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)))
     {
         write_error(error_buffer, error_buffer_size, "cannot signal D3D12 encoding metadata upload fence");
         return PANO_GPU_UNAVAILABLE;
     }
-    HANDLE event_handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (event_handle == nullptr ||
-        FAILED(session->device_core->fence->SetEventOnCompletion(fence_value, event_handle)) ||
-        WaitForSingleObject(event_handle, 10000) != WAIT_OBJECT_0)
-    {
-        if (event_handle != nullptr)
-            CloseHandle(event_handle);
-        write_error(error_buffer, error_buffer_size, "D3D12 encoding metadata upload fence timed out");
+    if (wait_for_fence(session->device_core.get(), fence_value, error_buffer, error_buffer_size,
+                       "D3D12 encoding metadata upload fence timed out") != PANO_GPU_SUCCESS)
         return PANO_GPU_UNAVAILABLE;
-    }
-    CloseHandle(event_handle);
     session->encoding_metadata_uploaded = true;
     return PANO_GPU_SUCCESS;
 #endif
@@ -5579,8 +5643,7 @@ static pano_gpu_result wait_surface_idle(
 {
     const uint64_t fence =
         surface->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(surface->device_core->queue->Signal(
-            surface->device_core->fence.Get(), fence)))
+    if (FAILED(signal_fence(surface->device_core.get(), fence)))
     {
         write_error(error_buffer, error_buffer_size, "cannot signal preview surface fence");
         return PANO_GPU_UNAVAILABLE;
@@ -6376,7 +6439,7 @@ pano_gpu_result pano_gpu_preview_create(
         session->device_core->queue->ExecuteCommandLists(1, lists);
         const uint64_t fence =
             session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence)) ||
+        if (FAILED(signal_fence(session->device_core.get(), fence)) ||
             wait_for_fence(
                 session->device_core.get(), fence, error_buffer, error_buffer_size,
                 "retained preview upload timed out") != PANO_GPU_SUCCESS)
@@ -6579,8 +6642,7 @@ pano_gpu_result pano_gpu_preview_render_base(
     preview->session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence =
         preview->session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(preview->session->device_core->queue->Signal(
-            preview->session->device_core->fence.Get(), fence)) ||
+    if (FAILED(signal_fence(preview->session->device_core.get(), fence)) ||
         wait_for_fence(
             preview->session->device_core.get(), fence, error_buffer, error_buffer_size,
             "preview viewport render timed out") != PANO_GPU_SUCCESS)
@@ -6810,8 +6872,7 @@ static pano_gpu_result render_preview_overlay_impl(
     preview->session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence =
         preview->session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(preview->session->device_core->queue->Signal(
-            preview->session->device_core->fence.Get(), fence)) ||
+    if (FAILED(signal_fence(preview->session->device_core.get(), fence)) ||
         wait_for_fence(
             preview->session->device_core.get(), fence, error_buffer, error_buffer_size,
             "preview overlay render timed out") != PANO_GPU_SUCCESS)
@@ -7070,6 +7131,53 @@ void pano_gpu_test_fail_next_fence_wait(void) noexcept
     fail_next_fence_wait.store(true, std::memory_order_relaxed);
 }
 
+void pano_gpu_test_fail_next_pending_fence_wait(void) noexcept
+{
+    fail_next_pending_fence_wait.store(true, std::memory_order_relaxed);
+}
+
+void pano_gpu_test_fail_next_pending_fence_signal(void) noexcept
+{
+    fail_next_pending_fence_signal.store(true, std::memory_order_relaxed);
+}
+
+int32_t pano_gpu_test_failed_fence_wait_is_draining(void) noexcept
+{
+    return failed_fence_wait_draining.load(std::memory_order_acquire) ? 1 : 0;
+}
+
+pano_gpu_result pano_gpu_test_set_queue_blocked(pano_gpu_device *const device, const int32_t blocked) noexcept
+{
+    if (device == nullptr || !device->core || (blocked != 0 && blocked != 1))
+        return PANO_GPU_INVALID_ARGUMENT;
+#if !defined(_WIN32)
+    return PANO_GPU_UNAVAILABLE;
+#else
+    auto &core = *device->core;
+    if (blocked != 0)
+    {
+        if (core.test_queue_gate && core.test_queue_gate->GetCompletedValue() != 1)
+            return PANO_GPU_INVALID_ARGUMENT;
+        if (FAILED(core.d3d_device->CreateFence(
+                0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(core.test_queue_gate.ReleaseAndGetAddressOf()))))
+            return PANO_GPU_UNAVAILABLE;
+        if (FAILED(core.queue->Wait(core.test_queue_gate.Get(), 1)))
+        {
+            core.test_queue_gate.Reset();
+            return PANO_GPU_UNAVAILABLE;
+        }
+        return PANO_GPU_SUCCESS;
+    }
+    if (!core.test_queue_gate)
+        return PANO_GPU_INVALID_ARGUMENT;
+    if (FAILED(core.test_queue_gate->Signal(1)))
+        return PANO_GPU_UNAVAILABLE;
+    // Keep the gate alive until the device is destroyed; the GPU wait may not
+    // have consumed the CPU signal yet.
+    return PANO_GPU_SUCCESS;
+#endif
+}
+
 pano_gpu_result pano_gpu_test_convert_linear_srgb(
     const pano_gpu_session *const session, const float *const linear_rgb,
     const uint32_t pixel_count, float *const normalized_srgb, char *const error_buffer,
@@ -7203,7 +7311,7 @@ pano_gpu_result pano_gpu_test_convert_linear_srgb(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence)) ||
         wait_for_fence(
             session->device_core.get(), fence, error_buffer, error_buffer_size,
             "linear-sRGB conversion timed out") != PANO_GPU_SUCCESS)
@@ -7380,7 +7488,7 @@ pano_gpu_result pano_gpu_test_build_linear_srgb_histogram(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence)) ||
         wait_for_fence(
             session->device_core.get(), fence, error_buffer, error_buffer_size,
             "linear-sRGB histogram timed out") != PANO_GPU_SUCCESS)
@@ -7459,8 +7567,7 @@ pano_gpu_result pano_gpu_test_upload_output_histogram_band(
     output->session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence =
         output->session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(output->session->device_core->queue->Signal(
-            output->session->device_core->fence.Get(), fence)) ||
+    if (FAILED(signal_fence(output->session->device_core.get(), fence)) ||
         wait_for_fence(
             output->session->device_core.get(), fence, error_buffer, error_buffer_size,
             "output histogram band upload timed out") != PANO_GPU_SUCCESS)
@@ -7519,8 +7626,7 @@ pano_gpu_result pano_gpu_test_read_output_histogram(
     output->session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence =
         output->session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(output->session->device_core->queue->Signal(
-            output->session->device_core->fence.Get(), fence)) ||
+    if (FAILED(signal_fence(output->session->device_core.get(), fence)) ||
         wait_for_fence(
             output->session->device_core.get(), fence, error_buffer, error_buffer_size,
             "output histogram readback timed out") != PANO_GPU_SUCCESS)
@@ -7584,8 +7690,7 @@ pano_gpu_result pano_gpu_test_read_output_normalized_srgb(
     output->session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence =
         output->session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(output->session->device_core->queue->Signal(
-            output->session->device_core->fence.Get(), fence)) ||
+    if (FAILED(signal_fence(output->session->device_core.get(), fence)) ||
         wait_for_fence(
             output->session->device_core.get(), fence, error_buffer, error_buffer_size,
             "normalized-sRGB readback timed out") != PANO_GPU_SUCCESS)
@@ -7647,8 +7752,7 @@ pano_gpu_result pano_gpu_test_read_output_srgb8(
     output->session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence =
         output->session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(output->session->device_core->queue->Signal(
-            output->session->device_core->fence.Get(), fence)) ||
+    if (FAILED(signal_fence(output->session->device_core.get(), fence)) ||
         wait_for_fence(
             output->session->device_core.get(), fence, error_buffer, error_buffer_size,
             "sRGB8 readback timed out") != PANO_GPU_SUCCESS)
@@ -7715,8 +7819,7 @@ pano_gpu_result pano_gpu_test_read_output_tone_mapped_rec2020(
     output->session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence =
         output->session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(output->session->device_core->queue->Signal(
-            output->session->device_core->fence.Get(), fence)) ||
+    if (FAILED(signal_fence(output->session->device_core.get(), fence)) ||
         wait_for_fence(
             output->session->device_core.get(), fence, error_buffer, error_buffer_size,
             "tone-mapped Rec.2020 readback timed out") != PANO_GPU_SUCCESS)
@@ -7780,8 +7883,7 @@ pano_gpu_result pano_gpu_test_read_output_linear_srgb(
     output->session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence =
         output->session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(output->session->device_core->queue->Signal(
-            output->session->device_core->fence.Get(), fence)) ||
+    if (FAILED(signal_fence(output->session->device_core.get(), fence)) ||
         wait_for_fence(
             output->session->device_core.get(), fence, error_buffer, error_buffer_size,
             "linear-sRGB readback timed out") != PANO_GPU_SUCCESS)
@@ -7843,8 +7945,7 @@ pano_gpu_result pano_gpu_test_read_output_float(
     output->session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence =
         output->session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(output->session->device_core->queue->Signal(
-            output->session->device_core->fence.Get(), fence)) ||
+    if (FAILED(signal_fence(output->session->device_core.get(), fence)) ||
         wait_for_fence(
             output->session->device_core.get(), fence, error_buffer, error_buffer_size,
             "float-output readback timed out") != PANO_GPU_SUCCESS)
@@ -7925,8 +8026,7 @@ pano_gpu_result pano_gpu_test_read_preview_retained(
     preview->session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence =
         preview->session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(preview->session->device_core->queue->Signal(
-            preview->session->device_core->fence.Get(), fence)) ||
+    if (FAILED(signal_fence(preview->session->device_core.get(), fence)) ||
         wait_for_fence(
             preview->session->device_core.get(), fence, error_buffer, error_buffer_size,
             "retained preview readback timed out") != PANO_GPU_SUCCESS)
@@ -8337,7 +8437,7 @@ pano_gpu_result pano_gpu_test_dispatch_rays(
     ID3D12CommandList *lists[] = {list.Get()};
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value = session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)))
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)))
     {
         write_error(error_buffer, error_buffer_size, "cannot signal D3D12 ray fence");
         return PANO_GPU_UNAVAILABLE;
@@ -8748,6 +8848,18 @@ static pano_gpu_result dispatch_typed_hard_composite(
         : (expected_sample_type == PANO_GPU_SAMPLE_UINT16 ? sizeof(uint16_t) : sizeof(uint8_t));
     const uint32_t pixels = static_cast<uint32_t>(layout.pixel_count);
     const uint64_t valid_bytes = ((layout.pixel_count + 31) / 32) * sizeof(uint32_t);
+    pano_gpu_output::CompositeWorkspace temporary_workspace;
+    auto &workspace = output != nullptr ? output->composite_workspace : temporary_workspace;
+    if (workspace.pixels < layout.pixel_count || workspace.feather != feather_mode ||
+        workspace.local != (local_fields != nullptr))
+    {
+        workspace = {};
+        workspace.pixels = layout.pixel_count;
+        workspace.feather = feather_mode;
+        workspace.local = local_fields != nullptr;
+    }
+    size_t buffer_index = 0;
+    size_t zero_index = 0;
     const auto desc = [](const uint64_t bytes, const D3D12_RESOURCE_FLAGS flags) {
         D3D12_RESOURCE_DESC value {};
         value.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER; value.Width = bytes; value.Height = 1;
@@ -8756,9 +8868,17 @@ static pano_gpu_result dispatch_typed_hard_composite(
     };
     D3D12_HEAP_PROPERTIES default_heap {}; default_heap.Type = D3D12_HEAP_TYPE_DEFAULT;
     const auto make_default = [&](const uint64_t bytes, Microsoft::WRL::ComPtr<ID3D12Resource> *out) {
+        auto &cached = workspace.buffers[buffer_index++];
+        if (cached && cached->GetDesc().Width >= bytes)
+        {
+            *out = cached;
+            return true;
+        }
         const D3D12_RESOURCE_DESC resource_desc = desc(bytes, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
-        return SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &resource_desc,
+        const bool created = SUCCEEDED(device->CreateCommittedResource(&default_heap, D3D12_HEAP_FLAG_NONE, &resource_desc,
             D3D12_RESOURCE_STATE_UNORDERED_ACCESS, nullptr, IID_PPV_ARGS(out->ReleaseAndGetAddressOf())));
+        if (created) cached = *out;
+        return created;
     };
     using resource_array = std::unique_ptr<Microsoft::WRL::ComPtr<ID3D12Resource>[]>;
     Microsoft::WRL::ComPtr<ID3D12Resource> candidate_rgb, adjusted_rgb, validity, edge, feather_weight;
@@ -8780,11 +8900,19 @@ static pano_gpu_result dispatch_typed_hard_composite(
     { write_error(error_buffer, error_buffer_size, "cannot create D3D12 hard-composite accumulators"); return PANO_GPU_UNAVAILABLE; }
     D3D12_HEAP_PROPERTIES upload_heap {}; upload_heap.Type = D3D12_HEAP_TYPE_UPLOAD;
     const auto make_zero_upload = [&](const uint64_t bytes, Microsoft::WRL::ComPtr<ID3D12Resource> *out) {
+        auto &cached = workspace.zeros[zero_index++];
+        if (cached && cached->GetDesc().Width >= bytes)
+        {
+            *out = cached;
+            return true;
+        }
         const D3D12_RESOURCE_DESC resource_desc = desc(bytes, D3D12_RESOURCE_FLAG_NONE);
         if (FAILED(device->CreateCommittedResource(&upload_heap, D3D12_HEAP_FLAG_NONE, &resource_desc,
                 D3D12_RESOURCE_STATE_GENERIC_READ, nullptr, IID_PPV_ARGS(out->ReleaseAndGetAddressOf())))) return false;
         void *mapped = nullptr; if (FAILED((*out)->Map(0, nullptr, &mapped))) return false;
-        std::memset(mapped, 0, static_cast<size_t>(bytes)); (*out)->Unmap(0, nullptr); return true;
+        std::memset(mapped, 0, static_cast<size_t>(bytes)); (*out)->Unmap(0, nullptr);
+        cached = *out;
+        return true;
     };
     Microsoft::WRL::ComPtr<ID3D12Resource> zero_rgb, zero_weight;
     if (!make_zero_upload(layout.selected_rgb_bytes, &zero_rgb) || !make_zero_upload(layout.selected_weight_bytes, &zero_weight))
@@ -8816,72 +8944,176 @@ static pano_gpu_result dispatch_typed_hard_composite(
             local_field_resources[index]->Unmap(0, nullptr);
         }
     }
-    D3D12_DESCRIPTOR_RANGE candidate_ranges[2] {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0, 1}};
-    D3D12_ROOT_PARAMETER candidate_params[2] {}; candidate_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    candidate_params[0].Constants = {0, 0, 36}; candidate_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; candidate_params[1].DescriptorTable = {2, candidate_ranges};
-    D3D12_ROOT_SIGNATURE_DESC candidate_root_desc {2, candidate_params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
-    D3D12_DESCRIPTOR_RANGE local_ranges[2] {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 2}};
-    D3D12_ROOT_PARAMETER local_params[2] {}; local_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    local_params[0].Constants = {0, 0, 8}; local_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; local_params[1].DescriptorTable = {2, local_ranges};
-    D3D12_ROOT_SIGNATURE_DESC local_root_desc {2, local_params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
-    D3D12_DESCRIPTOR_RANGE select_ranges[2] {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0, 5}};
-    D3D12_ROOT_PARAMETER select_params[2] {}; select_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    select_params[0].Constants = {0, 0, 1}; select_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; select_params[1].DescriptorTable = {2, select_ranges};
-    D3D12_ROOT_SIGNATURE_DESC select_root_desc {2, select_params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
-    D3D12_DESCRIPTOR_RANGE feather_weight_ranges[2] {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 2}};
-    D3D12_ROOT_PARAMETER feather_weight_params[2] {}; feather_weight_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    feather_weight_params[0].Constants = {0, 0, 3}; feather_weight_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; feather_weight_params[1].DescriptorTable = {2, feather_weight_ranges};
-    D3D12_ROOT_SIGNATURE_DESC feather_weight_root_desc {2, feather_weight_params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
-    D3D12_DESCRIPTOR_RANGE feather_accumulate_ranges[2] {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 4}};
-    D3D12_ROOT_PARAMETER feather_accumulate_params[2] {}; feather_accumulate_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    feather_accumulate_params[0].Constants = {0, 0, 1}; feather_accumulate_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; feather_accumulate_params[1].DescriptorTable = {2, feather_accumulate_ranges};
-    D3D12_ROOT_SIGNATURE_DESC feather_accumulate_root_desc {2, feather_accumulate_params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
-    D3D12_DESCRIPTOR_RANGE feather_normalize_ranges[2] {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0}, {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 2}};
-    D3D12_ROOT_PARAMETER feather_normalize_params[2] {}; feather_normalize_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-    feather_normalize_params[0].Constants = {0, 0, 1}; feather_normalize_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE; feather_normalize_params[1].DescriptorTable = {2, feather_normalize_ranges};
-    D3D12_ROOT_SIGNATURE_DESC feather_normalize_root_desc {2, feather_normalize_params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
-    Microsoft::WRL::ComPtr<ID3DBlob> candidate_blob, local_blob, select_blob, errors;
-    if (FAILED(D3D12SerializeRootSignature(&candidate_root_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &candidate_blob, &errors)) ||
-        FAILED(D3D12SerializeRootSignature(&local_root_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &local_blob, &errors)) ||
-        FAILED(D3D12SerializeRootSignature(&select_root_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &select_blob, &errors)))
-    { write_error(error_buffer, error_buffer_size, "cannot serialize D3D12 two-frame uint8 root signatures"); return PANO_GPU_UNAVAILABLE; }
-    Microsoft::WRL::ComPtr<ID3D12RootSignature> candidate_root, local_root, select_root;
-    if (FAILED(device->CreateRootSignature(0, candidate_blob->GetBufferPointer(), candidate_blob->GetBufferSize(), IID_PPV_ARGS(&candidate_root))) ||
-        FAILED(device->CreateRootSignature(0, local_blob->GetBufferPointer(), local_blob->GetBufferSize(), IID_PPV_ARGS(&local_root))) ||
-        FAILED(device->CreateRootSignature(0, select_blob->GetBufferPointer(), select_blob->GetBufferSize(), IID_PPV_ARGS(&select_root))))
-    { write_error(error_buffer, error_buffer_size, "cannot create D3D12 two-frame uint8 root signatures"); return PANO_GPU_UNAVAILABLE; }
-    Microsoft::WRL::ComPtr<ID3D12RootSignature> feather_weight_root, feather_accumulate_root, feather_normalize_root;
-    if (feather_mode)
+    std::unique_lock<std::mutex> pipeline_lock(session->device_core->composite_pipeline_mutex);
+    auto &cached_pipelines = session->device_core->composite_pipelines[
+        (expected_sample_type == PANO_GPU_SAMPLE_UINT8 ? 0U :
+         expected_sample_type == PANO_GPU_SAMPLE_UINT16 ? 2U : 4U) + (feather_mode ? 1U : 0U)];
+    auto pipelines = cached_pipelines;
+    auto &candidate_root = pipelines.roots[0];
+    auto &local_root = pipelines.roots[1];
+    auto &select_root = pipelines.roots[2];
+    auto &feather_weight_root = pipelines.roots[3];
+    auto &feather_accumulate_root = pipelines.roots[4];
+    auto &feather_normalize_root = pipelines.roots[5];
+    auto &candidate_pso = pipelines.states[0];
+    auto &local_pso = pipelines.states[1];
+    auto &select_pso = pipelines.states[2];
+    auto &feather_weight_pso = pipelines.states[3];
+    auto &feather_accumulate_pso = pipelines.states[4];
+    auto &feather_normalize_pso = pipelines.states[5];
+    if (!pipelines.ready)
     {
-        Microsoft::WRL::ComPtr<ID3DBlob> weight_blob, accumulate_blob, normalize_blob;
-        if (FAILED(D3D12SerializeRootSignature(&feather_weight_root_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &weight_blob, &errors)) ||
-            FAILED(D3D12SerializeRootSignature(&feather_accumulate_root_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &accumulate_blob, &errors)) ||
-            FAILED(D3D12SerializeRootSignature(&feather_normalize_root_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &normalize_blob, &errors)) ||
-            FAILED(device->CreateRootSignature(0, weight_blob->GetBufferPointer(), weight_blob->GetBufferSize(), IID_PPV_ARGS(&feather_weight_root))) ||
-            FAILED(device->CreateRootSignature(0, accumulate_blob->GetBufferPointer(), accumulate_blob->GetBufferSize(), IID_PPV_ARGS(&feather_accumulate_root))) ||
-            FAILED(device->CreateRootSignature(0, normalize_blob->GetBufferPointer(), normalize_blob->GetBufferSize(), IID_PPV_ARGS(&feather_normalize_root))))
-        { write_error(error_buffer, error_buffer_size, "cannot create D3D12 feather-composite root signatures"); return PANO_GPU_UNAVAILABLE; }
+        D3D12_DESCRIPTOR_RANGE candidate_ranges[2]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 1, 0, 0, 0},
+                                                   {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0, 1}};
+        D3D12_ROOT_PARAMETER candidate_params[2]{};
+        candidate_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        candidate_params[0].Constants = {0, 0, 36};
+        candidate_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        candidate_params[1].DescriptorTable = {2, candidate_ranges};
+        D3D12_ROOT_SIGNATURE_DESC candidate_root_desc{2, candidate_params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        D3D12_DESCRIPTOR_RANGE local_ranges[2]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0},
+                                               {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 2}};
+        D3D12_ROOT_PARAMETER local_params[2]{};
+        local_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        local_params[0].Constants = {0, 0, 8};
+        local_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        local_params[1].DescriptorTable = {2, local_ranges};
+        D3D12_ROOT_SIGNATURE_DESC local_root_desc{2, local_params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        D3D12_DESCRIPTOR_RANGE select_ranges[2]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 5, 0, 0, 0},
+                                                {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 3, 0, 0, 5}};
+        D3D12_ROOT_PARAMETER select_params[2]{};
+        select_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        select_params[0].Constants = {0, 0, 1};
+        select_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        select_params[1].DescriptorTable = {2, select_ranges};
+        D3D12_ROOT_SIGNATURE_DESC select_root_desc{2, select_params, 0, nullptr, D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        D3D12_DESCRIPTOR_RANGE feather_weight_ranges[2]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0},
+                                                        {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 1, 0, 0, 2}};
+        D3D12_ROOT_PARAMETER feather_weight_params[2]{};
+        feather_weight_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        feather_weight_params[0].Constants = {0, 0, 3};
+        feather_weight_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        feather_weight_params[1].DescriptorTable = {2, feather_weight_ranges};
+        D3D12_ROOT_SIGNATURE_DESC feather_weight_root_desc{2, feather_weight_params, 0, nullptr,
+                                                           D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        D3D12_DESCRIPTOR_RANGE feather_accumulate_ranges[2]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 4, 0, 0, 0},
+                                                            {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 4}};
+        D3D12_ROOT_PARAMETER feather_accumulate_params[2]{};
+        feather_accumulate_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        feather_accumulate_params[0].Constants = {0, 0, 1};
+        feather_accumulate_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        feather_accumulate_params[1].DescriptorTable = {2, feather_accumulate_ranges};
+        D3D12_ROOT_SIGNATURE_DESC feather_accumulate_root_desc{2, feather_accumulate_params, 0, nullptr,
+                                                               D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        D3D12_DESCRIPTOR_RANGE feather_normalize_ranges[2]{{D3D12_DESCRIPTOR_RANGE_TYPE_SRV, 2, 0, 0, 0},
+                                                           {D3D12_DESCRIPTOR_RANGE_TYPE_UAV, 2, 0, 0, 2}};
+        D3D12_ROOT_PARAMETER feather_normalize_params[2]{};
+        feather_normalize_params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+        feather_normalize_params[0].Constants = {0, 0, 1};
+        feather_normalize_params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+        feather_normalize_params[1].DescriptorTable = {2, feather_normalize_ranges};
+        D3D12_ROOT_SIGNATURE_DESC feather_normalize_root_desc{2, feather_normalize_params, 0, nullptr,
+                                                              D3D12_ROOT_SIGNATURE_FLAG_NONE};
+        Microsoft::WRL::ComPtr<ID3DBlob> candidate_blob, local_blob, select_blob, errors;
+        if (FAILED(D3D12SerializeRootSignature(&candidate_root_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &candidate_blob,
+                                               &errors)) ||
+            FAILED(
+                D3D12SerializeRootSignature(&local_root_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &local_blob, &errors)) ||
+            FAILED(
+                D3D12SerializeRootSignature(&select_root_desc, D3D_ROOT_SIGNATURE_VERSION_1_0, &select_blob, &errors)))
+        {
+            write_error(error_buffer, error_buffer_size, "cannot serialize D3D12 two-frame uint8 root signatures");
+            return PANO_GPU_UNAVAILABLE;
+        }
+        if (FAILED(device->CreateRootSignature(0, candidate_blob->GetBufferPointer(), candidate_blob->GetBufferSize(),
+                                               IID_PPV_ARGS(&candidate_root))) ||
+            FAILED(device->CreateRootSignature(0, local_blob->GetBufferPointer(), local_blob->GetBufferSize(),
+                                               IID_PPV_ARGS(&local_root))) ||
+            FAILED(device->CreateRootSignature(0, select_blob->GetBufferPointer(), select_blob->GetBufferSize(),
+                                               IID_PPV_ARGS(&select_root))))
+        {
+            write_error(error_buffer, error_buffer_size, "cannot create D3D12 two-frame uint8 root signatures");
+            return PANO_GPU_UNAVAILABLE;
+        }
+        if (feather_mode)
+        {
+            Microsoft::WRL::ComPtr<ID3DBlob> weight_blob, accumulate_blob, normalize_blob;
+            if (FAILED(D3D12SerializeRootSignature(&feather_weight_root_desc, D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                                   &weight_blob, &errors)) ||
+                FAILED(D3D12SerializeRootSignature(&feather_accumulate_root_desc, D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                                   &accumulate_blob, &errors)) ||
+                FAILED(D3D12SerializeRootSignature(&feather_normalize_root_desc, D3D_ROOT_SIGNATURE_VERSION_1_0,
+                                                   &normalize_blob, &errors)) ||
+                FAILED(device->CreateRootSignature(0, weight_blob->GetBufferPointer(), weight_blob->GetBufferSize(),
+                                                   IID_PPV_ARGS(&feather_weight_root))) ||
+                FAILED(device->CreateRootSignature(0, accumulate_blob->GetBufferPointer(),
+                                                   accumulate_blob->GetBufferSize(),
+                                                   IID_PPV_ARGS(&feather_accumulate_root))) ||
+                FAILED(device->CreateRootSignature(0, normalize_blob->GetBufferPointer(),
+                                                   normalize_blob->GetBufferSize(),
+                                                   IID_PPV_ARGS(&feather_normalize_root))))
+            {
+                write_error(error_buffer, error_buffer_size, "cannot create D3D12 feather-composite root signatures");
+                return PANO_GPU_UNAVAILABLE;
+            }
+        }
+        D3D12_COMPUTE_PIPELINE_STATE_DESC candidate_pso_desc{};
+        candidate_pso_desc.pRootSignature = candidate_root.Get();
+        candidate_pso_desc.CS =
+            expected_sample_type == PANO_GPU_SAMPLE_FLOAT32
+                ? D3D12_SHADER_BYTECODE{pano_gpu_float32_candidate_shader, sizeof(pano_gpu_float32_candidate_shader)}
+                : (expected_sample_type == PANO_GPU_SAMPLE_UINT16
+                       ? D3D12_SHADER_BYTECODE{pano_gpu_uint16_candidate_shader,
+                                               sizeof(pano_gpu_uint16_candidate_shader)}
+                       : D3D12_SHADER_BYTECODE{pano_gpu_uint8_candidate_shader,
+                                               sizeof(pano_gpu_uint8_candidate_shader)});
+        D3D12_COMPUTE_PIPELINE_STATE_DESC local_pso_desc{};
+        local_pso_desc.pRootSignature = local_root.Get();
+        local_pso_desc.CS = {pano_gpu_local_exposure_shader, sizeof(pano_gpu_local_exposure_shader)};
+        D3D12_COMPUTE_PIPELINE_STATE_DESC select_pso_desc{};
+        select_pso_desc.pRootSignature = select_root.Get();
+        select_pso_desc.CS = {pano_gpu_hard_selection_shader, sizeof(pano_gpu_hard_selection_shader)};
+        if (FAILED(device->CreateComputePipelineState(&candidate_pso_desc, IID_PPV_ARGS(&candidate_pso))) ||
+            FAILED(device->CreateComputePipelineState(&local_pso_desc, IID_PPV_ARGS(&local_pso))) ||
+            FAILED(device->CreateComputePipelineState(&select_pso_desc, IID_PPV_ARGS(&select_pso))))
+        {
+            write_error(error_buffer, error_buffer_size, "cannot create D3D12 two-frame uint8 pipelines");
+            return PANO_GPU_UNAVAILABLE;
+        }
+        if (feather_mode)
+        {
+            D3D12_COMPUTE_PIPELINE_STATE_DESC weight_desc{};
+            weight_desc.pRootSignature = feather_weight_root.Get();
+            weight_desc.CS = {pano_gpu_feather_weight_shader, sizeof(pano_gpu_feather_weight_shader)};
+            D3D12_COMPUTE_PIPELINE_STATE_DESC accumulate_desc{};
+            accumulate_desc.pRootSignature = feather_accumulate_root.Get();
+            accumulate_desc.CS = {pano_gpu_feather_accumulate_shader, sizeof(pano_gpu_feather_accumulate_shader)};
+            D3D12_COMPUTE_PIPELINE_STATE_DESC normalize_desc{};
+            normalize_desc.pRootSignature = feather_normalize_root.Get();
+            normalize_desc.CS = {pano_gpu_feather_normalize_output_shader,
+                                 sizeof(pano_gpu_feather_normalize_output_shader)};
+            if (FAILED(device->CreateComputePipelineState(&weight_desc, IID_PPV_ARGS(&feather_weight_pso))) ||
+                FAILED(device->CreateComputePipelineState(&accumulate_desc, IID_PPV_ARGS(&feather_accumulate_pso))) ||
+                FAILED(device->CreateComputePipelineState(&normalize_desc, IID_PPV_ARGS(&feather_normalize_pso))))
+            {
+                write_error(error_buffer, error_buffer_size, "cannot create D3D12 feather-composite pipelines");
+                return PANO_GPU_UNAVAILABLE;
+            }
+        }
+        pipelines.ready = true;
+        cached_pipelines = pipelines;
     }
-    D3D12_COMPUTE_PIPELINE_STATE_DESC candidate_pso_desc {}; candidate_pso_desc.pRootSignature = candidate_root.Get(); candidate_pso_desc.CS = expected_sample_type == PANO_GPU_SAMPLE_FLOAT32 ? D3D12_SHADER_BYTECODE {pano_gpu_float32_candidate_shader, sizeof(pano_gpu_float32_candidate_shader)} : (expected_sample_type == PANO_GPU_SAMPLE_UINT16 ? D3D12_SHADER_BYTECODE {pano_gpu_uint16_candidate_shader, sizeof(pano_gpu_uint16_candidate_shader)} : D3D12_SHADER_BYTECODE {pano_gpu_uint8_candidate_shader, sizeof(pano_gpu_uint8_candidate_shader)});
-    D3D12_COMPUTE_PIPELINE_STATE_DESC local_pso_desc {}; local_pso_desc.pRootSignature = local_root.Get(); local_pso_desc.CS = {pano_gpu_local_exposure_shader, sizeof(pano_gpu_local_exposure_shader)};
-    D3D12_COMPUTE_PIPELINE_STATE_DESC select_pso_desc {}; select_pso_desc.pRootSignature = select_root.Get(); select_pso_desc.CS = {pano_gpu_hard_selection_shader, sizeof(pano_gpu_hard_selection_shader)};
-    Microsoft::WRL::ComPtr<ID3D12PipelineState> candidate_pso, local_pso, select_pso;
-    if (FAILED(device->CreateComputePipelineState(&candidate_pso_desc, IID_PPV_ARGS(&candidate_pso))) || FAILED(device->CreateComputePipelineState(&local_pso_desc, IID_PPV_ARGS(&local_pso))) || FAILED(device->CreateComputePipelineState(&select_pso_desc, IID_PPV_ARGS(&select_pso))))
-    { write_error(error_buffer, error_buffer_size, "cannot create D3D12 two-frame uint8 pipelines"); return PANO_GPU_UNAVAILABLE; }
-    Microsoft::WRL::ComPtr<ID3D12PipelineState> feather_weight_pso, feather_accumulate_pso, feather_normalize_pso;
-    if (feather_mode)
-    {
-        D3D12_COMPUTE_PIPELINE_STATE_DESC weight_desc {}; weight_desc.pRootSignature = feather_weight_root.Get(); weight_desc.CS = {pano_gpu_feather_weight_shader, sizeof(pano_gpu_feather_weight_shader)};
-        D3D12_COMPUTE_PIPELINE_STATE_DESC accumulate_desc {}; accumulate_desc.pRootSignature = feather_accumulate_root.Get(); accumulate_desc.CS = {pano_gpu_feather_accumulate_shader, sizeof(pano_gpu_feather_accumulate_shader)};
-        D3D12_COMPUTE_PIPELINE_STATE_DESC normalize_desc {}; normalize_desc.pRootSignature = feather_normalize_root.Get(); normalize_desc.CS = {pano_gpu_feather_normalize_output_shader, sizeof(pano_gpu_feather_normalize_output_shader)};
-        if (FAILED(device->CreateComputePipelineState(&weight_desc, IID_PPV_ARGS(&feather_weight_pso))) ||
-            FAILED(device->CreateComputePipelineState(&accumulate_desc, IID_PPV_ARGS(&feather_accumulate_pso))) ||
-            FAILED(device->CreateComputePipelineState(&normalize_desc, IID_PPV_ARGS(&feather_normalize_pso))))
-        { write_error(error_buffer, error_buffer_size, "cannot create D3D12 feather-composite pipelines"); return PANO_GPU_UNAVAILABLE; }
-    }
+    pipeline_lock.unlock();
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc {}; heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; heap_desc.NumDescriptors = feather_mode ? expected_frame_count * (local_fields == nullptr ? 13 : 16) + 4 : expected_frame_count * (local_fields == nullptr ? 12 : 15); heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
     Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap; Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator; Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;
-    if (FAILED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap))) || FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
+    // Each composite waits for its fence before returning. Buffers decay to
+    // COMMON after execution; descriptors can then be rewritten for the next band.
+    if (workspace.descriptors && workspace.descriptors->GetDesc().NumDescriptors < heap_desc.NumDescriptors)
+        workspace.descriptors.Reset();
+    if (!workspace.descriptors && FAILED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&workspace.descriptors))))
+    { write_error(error_buffer, error_buffer_size, "cannot create D3D12 composite descriptors"); return PANO_GPU_UNAVAILABLE; }
+    heap = workspace.descriptors;
+    if (FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) ||
         FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), candidate_pso.Get(), IID_PPV_ARGS(&list))))
     { write_error(error_buffer, error_buffer_size, "cannot create D3D12 two-frame uint8 command resources"); return PANO_GPU_UNAVAILABLE; }
     if (debug_diagnostics_enabled())
@@ -9020,7 +9252,7 @@ static pano_gpu_result dispatch_typed_hard_composite(
         ID3D12Resource *output_resources[] = {output->linear.Get(), output->coverage.Get()}; D3D12_RESOURCE_BARRIER output_writable[2] {}; for (UINT i = 0; i < 2; ++i) { output_writable[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; output_writable[i].Transition = {output_resources[i], D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS}; } list->ResourceBarrier(2, output_writable);
         list->SetPipelineState(feather_normalize_pso.Get()); list->SetComputeRootSignature(feather_normalize_root.Get()); list->SetComputeRoot32BitConstants(0, 1, &pixels, 0); list->SetComputeRootDescriptorTable(1, gpu(feather_normalize_base)); list->Dispatch((pixels + 63) / 64, 1, 1);
         D3D12_RESOURCE_BARRIER output_ordering[2] {}; for (UINT i = 0; i < 2; ++i) { output_ordering[i].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; output_ordering[i].UAV.pResource = output_resources[i]; } list->ResourceBarrier(2, output_ordering); for (UINT i = 0; i < 2; ++i) std::swap(output_writable[i].Transition.StateBefore, output_writable[i].Transition.StateAfter); list->ResourceBarrier(2, output_writable);
-        if (FAILED(list->Close())) { write_error(error_buffer, error_buffer_size, "cannot close D3D12 output feather-composite command list"); return PANO_GPU_UNAVAILABLE; } ID3D12CommandList *feather_lists[] = {list.Get()}; session->device_core->queue->ExecuteCommandLists(1, feather_lists); const uint64_t feather_fence = session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1; if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), feather_fence))) { write_error(error_buffer, error_buffer_size, "cannot signal D3D12 output feather-composite fence"); return PANO_GPU_UNAVAILABLE; } return wait_for_fence(session->device_core.get(), feather_fence, error_buffer, error_buffer_size, "D3D12 output feather-composite fence timed out");
+        if (FAILED(list->Close())) { write_error(error_buffer, error_buffer_size, "cannot close D3D12 output feather-composite command list"); return PANO_GPU_UNAVAILABLE; } ID3D12CommandList *feather_lists[] = {list.Get()}; session->device_core->queue->ExecuteCommandLists(1, feather_lists); const uint64_t feather_fence = session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1; if (FAILED(signal_fence(session->device_core.get(), feather_fence))) { write_error(error_buffer, error_buffer_size, "cannot signal D3D12 output feather-composite fence"); return PANO_GPU_UNAVAILABLE; } return wait_for_fence(session->device_core.get(), feather_fence, error_buffer, error_buffer_size, "D3D12 output feather-composite fence timed out");
     }
     ID3D12Resource *final_resources[] = {accumulator_rgb[final_accumulator].Get(), accumulator_weight[final_accumulator].Get(), coverage_resource.Get()}; D3D12_RESOURCE_BARRIER final_ordering[3] {}; for (UINT i = 0; i < 3; ++i) { final_ordering[i].Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; final_ordering[i].UAV.pResource = final_resources[i]; } list->ResourceBarrier(3, final_ordering); D3D12_RESOURCE_BARRIER final_bars[3] {}; for (UINT i = 0; i < 3; ++i) { final_bars[i].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; final_bars[i].Transition.pResource = final_resources[i]; final_bars[i].Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; final_bars[i].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE; final_bars[i].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; } list->ResourceBarrier(3, final_bars);
     if (output != nullptr)
@@ -9036,7 +9268,7 @@ static pano_gpu_result dispatch_typed_hard_composite(
         ID3D12CommandList *output_lists[] = {list.Get()};
         session->device_core->queue->ExecuteCommandLists(1, output_lists);
         const uint64_t output_fence = session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), output_fence)))
+        if (FAILED(signal_fence(session->device_core.get(), output_fence)))
         {
             write_error(error_buffer, error_buffer_size, "cannot signal D3D12 output hard-composite fence");
             return PANO_GPU_UNAVAILABLE;
@@ -9049,7 +9281,7 @@ static pano_gpu_result dispatch_typed_hard_composite(
     list->CopyResource(rgb_readback.Get(), accumulator_rgb[final_accumulator].Get()); list->CopyResource(weight_readback.Get(), accumulator_weight[final_accumulator].Get()); list->CopyResource(coverage_readback.Get(), coverage_resource.Get());
     if (FAILED(list->Close())) { write_error(error_buffer, error_buffer_size, "cannot close D3D12 two-frame uint8 command list"); return PANO_GPU_UNAVAILABLE; }
     ID3D12CommandList *lists[] = {list.Get()}; session->device_core->queue->ExecuteCommandLists(1, lists); const uint64_t fence = session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence))) { write_error(error_buffer, error_buffer_size, "cannot signal D3D12 two-frame uint8 fence"); return PANO_GPU_UNAVAILABLE; }
+    if (FAILED(signal_fence(session->device_core.get(), fence))) { write_error(error_buffer, error_buffer_size, "cannot signal D3D12 two-frame uint8 fence"); return PANO_GPU_UNAVAILABLE; }
     if (wait_for_fence(session->device_core.get(), fence, error_buffer, error_buffer_size, "D3D12 two-frame uint8 fence timed out") != PANO_GPU_SUCCESS) return PANO_GPU_UNAVAILABLE;
     const auto copy = [&](ID3D12Resource *resource, uint64_t bytes, void *out) { D3D12_RANGE range {0, static_cast<SIZE_T>(bytes)}; void *mapped = nullptr; if (FAILED(resource->Map(0, &range, &mapped))) return false; std::memcpy(out, mapped, static_cast<size_t>(bytes)); resource->Unmap(0, nullptr); return true; };
     if (!copy(rgb_readback.Get(), layout.selected_rgb_bytes, selected_rgb) || !copy(weight_readback.Get(), layout.selected_weight_bytes, selected_weight) || !copy(coverage_readback.Get(), layout.coverage_bytes, coverage)) { write_error(error_buffer, error_buffer_size, "cannot map D3D12 two-frame uint8 readback"); return PANO_GPU_UNAVAILABLE; }
@@ -9178,7 +9410,7 @@ static pano_gpu_result mark_output_incomplete(
     if (FAILED(device->CreateDescriptorHeap(&heap_description, IID_PPV_ARGS(&heap))) || FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) || FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), pipeline.Get(), IID_PPV_ARGS(&list)))) { write_error(error_buffer, error_buffer_size, "cannot create incomplete-output dispatch resources"); return PANO_GPU_UNAVAILABLE; }
     const UINT increment = device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV); D3D12_CPU_DESCRIPTOR_HANDLE descriptor = heap->GetCPUDescriptorHandleForHeapStart(); D3D12_SHADER_RESOURCE_VIEW_DESC coverage_srv {}; coverage_srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER; coverage_srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; coverage_srv.Format = DXGI_FORMAT_R8_UINT; coverage_srv.Buffer.NumElements = pixel_count; device->CreateShaderResourceView(output->coverage.Get(), &coverage_srv, descriptor); descriptor.ptr += increment; D3D12_UNORDERED_ACCESS_VIEW_DESC linear_uav {}; linear_uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; linear_uav.Format = DXGI_FORMAT_UNKNOWN; linear_uav.Buffer.NumElements = pixel_count; linear_uav.Buffer.StructureByteStride = 3 * sizeof(float); device->CreateUnorderedAccessView(output->linear.Get(), nullptr, &linear_uav, descriptor);
     ID3D12Resource *resources[] = {output->coverage.Get(), output->linear.Get()}; const D3D12_RESOURCE_STATES readable_states[] = {D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, D3D12_RESOURCE_STATE_UNORDERED_ACCESS}; D3D12_RESOURCE_BARRIER transitions[2] {}; for (UINT index = 0; index < 2; ++index) { transitions[index].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; transitions[index].Transition = {resources[index], D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES, D3D12_RESOURCE_STATE_COPY_DEST, readable_states[index]}; } list->ResourceBarrier(2, transitions); ID3D12DescriptorHeap *heaps[] = {heap.Get()}; list->SetDescriptorHeaps(1, heaps); list->SetComputeRootSignature(root.Get()); list->SetComputeRoot32BitConstants(0, 1, &pixel_count, 0); list->SetComputeRootDescriptorTable(1, heap->GetGPUDescriptorHandleForHeapStart()); list->Dispatch((pixel_count + 63) / 64, 1, 1); D3D12_RESOURCE_BARRIER ordering {}; ordering.Type = D3D12_RESOURCE_BARRIER_TYPE_UAV; ordering.UAV.pResource = output->linear.Get(); list->ResourceBarrier(1, &ordering); for (UINT index = 0; index < 2; ++index) std::swap(transitions[index].Transition.StateBefore, transitions[index].Transition.StateAfter); list->ResourceBarrier(2, transitions);
-    if (FAILED(list->Close())) { write_error(error_buffer, error_buffer_size, "cannot close incomplete-output command list"); return PANO_GPU_UNAVAILABLE; } ID3D12CommandList *lists[] = {list.Get()}; output->session->device_core->queue->ExecuteCommandLists(1, lists); const uint64_t fence = output->session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1; if (FAILED(output->session->device_core->queue->Signal(output->session->device_core->fence.Get(), fence))) { write_error(error_buffer, error_buffer_size, "cannot signal incomplete-output fence"); return PANO_GPU_UNAVAILABLE; } return wait_for_fence(output->session->device_core.get(), fence, error_buffer, error_buffer_size, "incomplete-output fence timed out");
+    if (FAILED(list->Close())) { write_error(error_buffer, error_buffer_size, "cannot close incomplete-output command list"); return PANO_GPU_UNAVAILABLE; } ID3D12CommandList *lists[] = {list.Get()}; output->session->device_core->queue->ExecuteCommandLists(1, lists); const uint64_t fence = output->session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1; if (FAILED(signal_fence(output->session->device_core.get(), fence))) { write_error(error_buffer, error_buffer_size, "cannot signal incomplete-output fence"); return PANO_GPU_UNAVAILABLE; } return wait_for_fence(output->session->device_core.get(), fence, error_buffer, error_buffer_size, "incomplete-output fence timed out");
 #endif
 }
 
@@ -9771,7 +10003,7 @@ static pano_gpu_result dispatch_typed_exposure_proxies(
     ID3D12CommandList *lists[] = {list.Get()};
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value = session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) ||
         wait_for_fence(session->device_core.get(), fence_value, error_buffer, error_buffer_size,
                        "D3D12 uint8 exposure-proxy fence timed out") != PANO_GPU_SUCCESS)
         return PANO_GPU_UNAVAILABLE;
@@ -10051,7 +10283,7 @@ pano_gpu_result pano_gpu_test_dispatch_exposure_pair_projection(
     ID3D12CommandList *lists[] = {list.Get()};
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value = session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) ||
         wait_for_fence(session->device_core.get(), fence_value, error_buffer, error_buffer_size,
             "D3D12 exposure-pair fence timed out") != PANO_GPU_SUCCESS)
         return PANO_GPU_UNAVAILABLE;
@@ -10215,7 +10447,7 @@ pano_gpu_result pano_gpu_test_dispatch_exposure_pair_samples(
     if (FAILED(list->Close())) { write_error(error_buffer, error_buffer_size, "cannot close D3D12 exposure-pair sample command list"); return PANO_GPU_UNAVAILABLE; }
     ID3D12CommandList *lists[] = {list.Get()}; session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value = session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)) || wait_for_fence(session->device_core.get(), fence_value, error_buffer, error_buffer_size, "D3D12 exposure-pair sample fence timed out") != PANO_GPU_SUCCESS) return PANO_GPU_UNAVAILABLE;
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) || wait_for_fence(session->device_core.get(), fence_value, error_buffer, error_buffer_size, "D3D12 exposure-pair sample fence timed out") != PANO_GPU_SUCCESS) return PANO_GPU_UNAVAILABLE;
     const D3D12_RANGE range {0, static_cast<SIZE_T>(sample_rgb_bytes)}; void *first_mapped = nullptr; void *second_mapped = nullptr;
     if (FAILED(first_readback->Map(0, &range, &first_mapped)) || FAILED(second_readback->Map(0, &range, &second_mapped))) { if (second_mapped != nullptr) second_readback->Unmap(0, nullptr); if (first_mapped != nullptr) first_readback->Unmap(0, nullptr); write_error(error_buffer, error_buffer_size, "cannot map D3D12 exposure-pair samples"); return PANO_GPU_UNAVAILABLE; }
     const auto *const first = static_cast<const float *>(first_mapped); const auto *const second = static_cast<const float *>(second_mapped); auto *const output = static_cast<float *>(sampled_pairs);
@@ -10309,7 +10541,7 @@ pano_gpu_result pano_gpu_test_read_resident_exposure_pair_projection_samples(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) ||
         wait_for_fence(
             session->device_core.get(), fence_value, error_buffer, error_buffer_size,
             "resident D3D12 exposure-pair readback timed out") != PANO_GPU_SUCCESS)
@@ -10414,7 +10646,7 @@ pano_gpu_result pano_gpu_test_read_resident_exposure_pair_classification(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) ||
         wait_for_fence(
             session->device_core.get(), fence_value, error_buffer, error_buffer_size,
             "resident exposure classification readback timed out") != PANO_GPU_SUCCESS)
@@ -10491,7 +10723,7 @@ pano_gpu_result pano_gpu_test_classify_exposure_pair_samples(
     void *mapped=nullptr; if(FAILED(samples_resource->Map(0,nullptr,&mapped))) { write_error(error_buffer,error_buffer_size,"cannot map D3D12 exposure-pair samples"); return PANO_GPU_UNAVAILABLE; } std::memcpy(mapped,sampled_pairs,static_cast<size_t>(sampled_pair_bytes)); samples_resource->Unmap(0,nullptr); if(FAILED(overlap_resource->Map(0,nullptr,&mapped))) { write_error(error_buffer,error_buffer_size,"cannot map D3D12 exposure-pair overlap"); return PANO_GPU_UNAVAILABLE; } const auto *const geometric=static_cast<const uint8_t *>(geometric_overlap); auto *const overlap_words=static_cast<uint32_t *>(mapped); for(uint64_t index=0;index<layout.sample_count;++index) overlap_words[index]=geometric[index] != 0 ? 1U : 0U; overlap_resource->Unmap(0,nullptr);
     D3D12_DESCRIPTOR_HEAP_DESC heap_description {}; heap_description.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; heap_description.NumDescriptors=4; heap_description.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE; Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> descriptor_heap; Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator; Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list; if(FAILED(device->CreateDescriptorHeap(&heap_description,IID_PPV_ARGS(&descriptor_heap)))||FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)))||FAILED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),pipeline.Get(),IID_PPV_ARGS(&list)))) { write_error(error_buffer,error_buffer_size,"cannot create D3D12 exposure-pair classification dispatch"); return PANO_GPU_UNAVAILABLE; }
     const UINT increment=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV); auto descriptor=descriptor_heap->GetCPUDescriptorHandleForHeapStart(); D3D12_SHADER_RESOURCE_VIEW_DESC float_srv {}; float_srv.ViewDimension=D3D12_SRV_DIMENSION_BUFFER; float_srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; float_srv.Format=DXGI_FORMAT_R32_FLOAT; float_srv.Buffer.NumElements=static_cast<UINT>(sampled_pair_bytes/sizeof(float)); device->CreateShaderResourceView(samples_resource.Get(),&float_srv,descriptor); descriptor.ptr+=increment; D3D12_SHADER_RESOURCE_VIEW_DESC overlap_srv {}; overlap_srv.ViewDimension=D3D12_SRV_DIMENSION_BUFFER; overlap_srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; overlap_srv.Format=DXGI_FORMAT_R32_UINT; overlap_srv.Buffer.NumElements=static_cast<UINT>(layout.sample_count); device->CreateShaderResourceView(overlap_resource.Get(),&overlap_srv,descriptor); descriptor.ptr+=increment; D3D12_UNORDERED_ACCESS_VIEW_DESC luminance_uav {}; luminance_uav.ViewDimension=D3D12_UAV_DIMENSION_BUFFER; luminance_uav.Format=DXGI_FORMAT_UNKNOWN; luminance_uav.Buffer.NumElements=static_cast<UINT>(layout.sample_count); luminance_uav.Buffer.StructureByteStride=2*sizeof(float); device->CreateUnorderedAccessView(luminance_resource.Get(),nullptr,&luminance_uav,descriptor); descriptor.ptr+=increment; D3D12_UNORDERED_ACCESS_VIEW_DESC accepted_uav {}; accepted_uav.ViewDimension=D3D12_UAV_DIMENSION_BUFFER; accepted_uav.Format=DXGI_FORMAT_UNKNOWN; accepted_uav.Buffer.NumElements=static_cast<UINT>(layout.sample_count); accepted_uav.Buffer.StructureByteStride=sizeof(uint32_t); device->CreateUnorderedAccessView(accepted_resource.Get(),nullptr,&accepted_uav,descriptor);
-    const uint32_t constants[] {static_cast<uint32_t>(layout.sample_count), session->transfer_function}; ID3D12DescriptorHeap *heaps[]{descriptor_heap.Get()}; list->SetDescriptorHeaps(1,heaps); list->SetComputeRootSignature(root_signature.Get()); list->SetComputeRoot32BitConstants(0,2,constants,0); list->SetComputeRootDescriptorTable(1,descriptor_heap->GetGPUDescriptorHandleForHeapStart()); list->Dispatch(static_cast<UINT>((layout.sample_count+63)/64),1,1); D3D12_RESOURCE_BARRIER barriers[2] {}; for(uint32_t index=0;index<2;++index){barriers[index].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;barriers[index].Transition.pResource=index==0?luminance_resource.Get():accepted_resource.Get();barriers[index].Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;barriers[index].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;barriers[index].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;} list->ResourceBarrier(2,barriers); list->CopyResource(luminance_readback.Get(),luminance_resource.Get()); list->CopyResource(accepted_readback.Get(),accepted_resource.Get()); if(FAILED(list->Close())) { write_error(error_buffer,error_buffer_size,"cannot close D3D12 exposure-pair classification command list"); return PANO_GPU_UNAVAILABLE; } ID3D12CommandList *lists[]{list.Get()}; session->device_core->queue->ExecuteCommandLists(1,lists); const uint64_t fence_value=session->device_core->next_fence_value.fetch_add(1,std::memory_order_relaxed)+1; if(FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(),fence_value))||wait_for_fence(session->device_core.get(),fence_value,error_buffer,error_buffer_size,"D3D12 exposure-pair classification fence timed out")!=PANO_GPU_SUCCESS)return PANO_GPU_UNAVAILABLE;
+    const uint32_t constants[] {static_cast<uint32_t>(layout.sample_count), session->transfer_function}; ID3D12DescriptorHeap *heaps[]{descriptor_heap.Get()}; list->SetDescriptorHeaps(1,heaps); list->SetComputeRootSignature(root_signature.Get()); list->SetComputeRoot32BitConstants(0,2,constants,0); list->SetComputeRootDescriptorTable(1,descriptor_heap->GetGPUDescriptorHandleForHeapStart()); list->Dispatch(static_cast<UINT>((layout.sample_count+63)/64),1,1); D3D12_RESOURCE_BARRIER barriers[2] {}; for(uint32_t index=0;index<2;++index){barriers[index].Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;barriers[index].Transition.pResource=index==0?luminance_resource.Get():accepted_resource.Get();barriers[index].Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;barriers[index].Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;barriers[index].Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;} list->ResourceBarrier(2,barriers); list->CopyResource(luminance_readback.Get(),luminance_resource.Get()); list->CopyResource(accepted_readback.Get(),accepted_resource.Get()); if(FAILED(list->Close())) { write_error(error_buffer,error_buffer_size,"cannot close D3D12 exposure-pair classification command list"); return PANO_GPU_UNAVAILABLE; } ID3D12CommandList *lists[]{list.Get()}; session->device_core->queue->ExecuteCommandLists(1,lists); const uint64_t fence_value=session->device_core->next_fence_value.fetch_add(1,std::memory_order_relaxed)+1; if(FAILED(signal_fence(session->device_core.get(), fence_value))||wait_for_fence(session->device_core.get(),fence_value,error_buffer,error_buffer_size,"D3D12 exposure-pair classification fence timed out")!=PANO_GPU_SUCCESS)return PANO_GPU_UNAVAILABLE;
     const D3D12_RANGE luminance_range{0,static_cast<SIZE_T>(pair_luminance_bytes)},accepted_range{0,static_cast<SIZE_T>(overlap_word_bytes)}; void *mapped_luminance=nullptr,*mapped_accepted=nullptr; if(FAILED(luminance_readback->Map(0,&luminance_range,&mapped_luminance))||FAILED(accepted_readback->Map(0,&accepted_range,&mapped_accepted))){if(mapped_accepted!=nullptr)accepted_readback->Unmap(0,nullptr);if(mapped_luminance!=nullptr)luminance_readback->Unmap(0,nullptr);write_error(error_buffer,error_buffer_size,"cannot map D3D12 exposure-pair classification readback");return PANO_GPU_UNAVAILABLE;} std::memcpy(pair_luminance,mapped_luminance,static_cast<size_t>(pair_luminance_bytes)); const auto *const accepted_words=static_cast<const uint32_t *>(mapped_accepted);auto *const accepted_bytes_out=static_cast<uint8_t *>(accepted);for(uint64_t index=0;index<layout.sample_count;++index)accepted_bytes_out[index]=static_cast<uint8_t>(accepted_words[index]!=0);accepted_readback->Unmap(0,nullptr);luminance_readback->Unmap(0,nullptr);return PANO_GPU_SUCCESS;
 #endif
 }
@@ -10530,7 +10762,7 @@ pano_gpu_result pano_gpu_test_dispatch_exposure_pair_gradients(
     if(FAILED(device->CreateCommittedResource(&upload_heap,D3D12_HEAP_FLAG_NONE,&input_desc,D3D12_RESOURCE_STATE_GENERIC_READ,nullptr,IID_PPV_ARGS(&input)))||FAILED(device->CreateCommittedResource(&default_heap,D3D12_HEAP_FLAG_NONE,&output_desc,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,nullptr,IID_PPV_ARGS(&output)))||FAILED(device->CreateCommittedResource(&readback_heap,D3D12_HEAP_FLAG_NONE,&readback_desc,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&readback)))) { write_error(error_buffer,error_buffer_size,"cannot create D3D12 exposure-pair gradient resources"); return PANO_GPU_UNAVAILABLE; }
     void *mapped=nullptr; if(FAILED(input->Map(0,nullptr,&mapped))) { write_error(error_buffer,error_buffer_size,"cannot map D3D12 exposure-pair gradient input"); return PANO_GPU_UNAVAILABLE; } std::memcpy(mapped,pair_luminance,static_cast<size_t>(pair_luminance_bytes)); input->Unmap(0,nullptr);
     D3D12_DESCRIPTOR_HEAP_DESC heap_description {}; heap_description.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; heap_description.NumDescriptors=2; heap_description.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE; Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> descriptor_heap; Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator; Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list; if(FAILED(device->CreateDescriptorHeap(&heap_description,IID_PPV_ARGS(&descriptor_heap)))||FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)))||FAILED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),pipeline.Get(),IID_PPV_ARGS(&list)))) { write_error(error_buffer,error_buffer_size,"cannot create D3D12 exposure-pair gradient dispatch"); return PANO_GPU_UNAVAILABLE; }
-    const UINT increment=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV); auto descriptor=descriptor_heap->GetCPUDescriptorHandleForHeapStart(); D3D12_SHADER_RESOURCE_VIEW_DESC input_srv {}; input_srv.ViewDimension=D3D12_SRV_DIMENSION_BUFFER; input_srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; input_srv.Format=DXGI_FORMAT_UNKNOWN; input_srv.Buffer.NumElements=static_cast<UINT>(layout.sample_count); input_srv.Buffer.StructureByteStride=2*sizeof(float); device->CreateShaderResourceView(input.Get(),&input_srv,descriptor); descriptor.ptr+=increment; D3D12_UNORDERED_ACCESS_VIEW_DESC output_uav {}; output_uav.ViewDimension=D3D12_UAV_DIMENSION_BUFFER; output_uav.Format=DXGI_FORMAT_UNKNOWN; output_uav.Buffer.NumElements=static_cast<UINT>(layout.sample_count); output_uav.Buffer.StructureByteStride=2*sizeof(float); device->CreateUnorderedAccessView(output.Get(),nullptr,&output_uav,descriptor); const uint32_t constants[]{request->sample_width,request->sample_height}; ID3D12DescriptorHeap *heaps[]{descriptor_heap.Get()}; list->SetDescriptorHeaps(1,heaps); list->SetComputeRootSignature(root_signature.Get()); list->SetComputeRoot32BitConstants(0,2,constants,0); list->SetComputeRootDescriptorTable(1,descriptor_heap->GetGPUDescriptorHandleForHeapStart()); list->Dispatch(static_cast<UINT>((layout.sample_count+63)/64),1,1); D3D12_RESOURCE_BARRIER barrier {}; barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; barrier.Transition.pResource=output.Get(); barrier.Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS; barrier.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE; barrier.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; list->ResourceBarrier(1,&barrier); list->CopyResource(readback.Get(),output.Get()); if(FAILED(list->Close())) { write_error(error_buffer,error_buffer_size,"cannot close D3D12 exposure-pair gradient command list"); return PANO_GPU_UNAVAILABLE; } ID3D12CommandList *lists[]{list.Get()}; session->device_core->queue->ExecuteCommandLists(1,lists); const uint64_t fence_value=session->device_core->next_fence_value.fetch_add(1,std::memory_order_relaxed)+1; if(FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(),fence_value))||wait_for_fence(session->device_core.get(),fence_value,error_buffer,error_buffer_size,"D3D12 exposure-pair gradient fence timed out")!=PANO_GPU_SUCCESS)return PANO_GPU_UNAVAILABLE; const D3D12_RANGE range{0,static_cast<SIZE_T>(gradient_bytes)}; if(FAILED(readback->Map(0,&range,&mapped))) { write_error(error_buffer,error_buffer_size,"cannot map D3D12 exposure-pair gradient readback"); return PANO_GPU_UNAVAILABLE; } std::memcpy(gradients,mapped,static_cast<size_t>(gradient_bytes)); readback->Unmap(0,nullptr); return PANO_GPU_SUCCESS;
+    const UINT increment=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV); auto descriptor=descriptor_heap->GetCPUDescriptorHandleForHeapStart(); D3D12_SHADER_RESOURCE_VIEW_DESC input_srv {}; input_srv.ViewDimension=D3D12_SRV_DIMENSION_BUFFER; input_srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; input_srv.Format=DXGI_FORMAT_UNKNOWN; input_srv.Buffer.NumElements=static_cast<UINT>(layout.sample_count); input_srv.Buffer.StructureByteStride=2*sizeof(float); device->CreateShaderResourceView(input.Get(),&input_srv,descriptor); descriptor.ptr+=increment; D3D12_UNORDERED_ACCESS_VIEW_DESC output_uav {}; output_uav.ViewDimension=D3D12_UAV_DIMENSION_BUFFER; output_uav.Format=DXGI_FORMAT_UNKNOWN; output_uav.Buffer.NumElements=static_cast<UINT>(layout.sample_count); output_uav.Buffer.StructureByteStride=2*sizeof(float); device->CreateUnorderedAccessView(output.Get(),nullptr,&output_uav,descriptor); const uint32_t constants[]{request->sample_width,request->sample_height}; ID3D12DescriptorHeap *heaps[]{descriptor_heap.Get()}; list->SetDescriptorHeaps(1,heaps); list->SetComputeRootSignature(root_signature.Get()); list->SetComputeRoot32BitConstants(0,2,constants,0); list->SetComputeRootDescriptorTable(1,descriptor_heap->GetGPUDescriptorHandleForHeapStart()); list->Dispatch(static_cast<UINT>((layout.sample_count+63)/64),1,1); D3D12_RESOURCE_BARRIER barrier {}; barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; barrier.Transition.pResource=output.Get(); barrier.Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS; barrier.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE; barrier.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; list->ResourceBarrier(1,&barrier); list->CopyResource(readback.Get(),output.Get()); if(FAILED(list->Close())) { write_error(error_buffer,error_buffer_size,"cannot close D3D12 exposure-pair gradient command list"); return PANO_GPU_UNAVAILABLE; } ID3D12CommandList *lists[]{list.Get()}; session->device_core->queue->ExecuteCommandLists(1,lists); const uint64_t fence_value=session->device_core->next_fence_value.fetch_add(1,std::memory_order_relaxed)+1; if(FAILED(signal_fence(session->device_core.get(), fence_value))||wait_for_fence(session->device_core.get(),fence_value,error_buffer,error_buffer_size,"D3D12 exposure-pair gradient fence timed out")!=PANO_GPU_SUCCESS)return PANO_GPU_UNAVAILABLE; const D3D12_RANGE range{0,static_cast<SIZE_T>(gradient_bytes)}; if(FAILED(readback->Map(0,&range,&mapped))) { write_error(error_buffer,error_buffer_size,"cannot map D3D12 exposure-pair gradient readback"); return PANO_GPU_UNAVAILABLE; } std::memcpy(gradients,mapped,static_cast<size_t>(gradient_bytes)); readback->Unmap(0,nullptr); return PANO_GPU_SUCCESS;
 #endif
 }
 
@@ -10775,7 +11007,7 @@ pano_gpu_result pano_gpu_test_compute_exposure_pair_gradient_limits(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) ||
         wait_for_fence(
             session->device_core.get(), fence_value, error_buffer, error_buffer_size,
             "D3D12 exposure-gradient fence timed out") != PANO_GPU_SUCCESS)
@@ -10988,7 +11220,7 @@ pano_gpu_result pano_gpu_session_dispatch_exposure_pair_gradient_limits(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) ||
         wait_for_fence(
             session->device_core.get(), fence_value, error_buffer, error_buffer_size,
             "resident exposure-gradient dispatch timed out") != PANO_GPU_SUCCESS)
@@ -11067,7 +11299,7 @@ pano_gpu_result pano_gpu_test_read_resident_exposure_pair_gradient_limits(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) ||
         wait_for_fence(
             session->device_core.get(), fence_value, error_buffer, error_buffer_size,
             "resident exposure-gradient readback timed out") != PANO_GPU_SUCCESS)
@@ -11252,7 +11484,7 @@ pano_gpu_result pano_gpu_session_dispatch_exposure_pair_filter_ratios(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) ||
         wait_for_fence(
             session->device_core.get(), fence_value, error_buffer, error_buffer_size,
             "resident exposure-pair filter/ratio dispatch timed out") != PANO_GPU_SUCCESS)
@@ -11326,7 +11558,7 @@ pano_gpu_result pano_gpu_test_read_resident_exposure_pair_filter_ratios(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) ||
         wait_for_fence(
             session->device_core.get(), fence_value, error_buffer, error_buffer_size,
             "resident exposure-pair ratio readback timed out") != PANO_GPU_SUCCESS)
@@ -11583,7 +11815,7 @@ pano_gpu_result pano_gpu_session_dispatch_exposure_pair_trim(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) ||
         wait_for_fence(
             session->device_core.get(), fence_value, error_buffer, error_buffer_size,
             "resident exposure-pair trim dispatch timed out") != PANO_GPU_SUCCESS)
@@ -11663,7 +11895,7 @@ pano_gpu_result pano_gpu_test_read_resident_exposure_pair_trim(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) ||
         wait_for_fence(
             session->device_core.get(), fence_value, error_buffer, error_buffer_size,
             "resident exposure-pair trim readback timed out") != PANO_GPU_SUCCESS)
@@ -11900,7 +12132,7 @@ pano_gpu_result pano_gpu_session_reduce_exposure_pair(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) ||
         wait_for_fence(
             session->device_core.get(), fence_value, error_buffer, error_buffer_size,
             "resident exposure-pair reduction timed out") != PANO_GPU_SUCCESS)
@@ -11956,7 +12188,7 @@ pano_gpu_result pano_gpu_test_filter_exposure_pair_acceptance(
     void *mapped=nullptr; if(FAILED(gradients_resource->Map(0,nullptr,&mapped))) { write_error(error_buffer,error_buffer_size,"cannot map D3D12 exposure-pair gradients"); return PANO_GPU_UNAVAILABLE; } std::memcpy(mapped,gradients,static_cast<size_t>(gradient_bytes)); gradients_resource->Unmap(0,nullptr); if(FAILED(categories_resource->Map(0,nullptr,&mapped))) { write_error(error_buffer,error_buffer_size,"cannot map D3D12 exposure-pair categories"); return PANO_GPU_UNAVAILABLE; } const auto *const category_bytes=static_cast<const uint8_t *>(accepted); auto *const category_words=static_cast<uint32_t *>(mapped); for(uint64_t index=0;index<layout.sample_count;++index)category_words[index]=category_bytes[index] != 0 ? 1U : 0U; categories_resource->Unmap(0,nullptr);
     D3D12_DESCRIPTOR_HEAP_DESC heap {}; heap.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; heap.NumDescriptors=3; heap.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE; Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> descriptors; Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator; Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list; if(FAILED(device->CreateDescriptorHeap(&heap,IID_PPV_ARGS(&descriptors)))||FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&allocator)))||FAILED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,allocator.Get(),pipeline.Get(),IID_PPV_ARGS(&list)))) { write_error(error_buffer,error_buffer_size,"cannot create D3D12 exposure-pair filter dispatch"); return PANO_GPU_UNAVAILABLE; }
     const UINT increment=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV); auto descriptor=descriptors->GetCPUDescriptorHandleForHeapStart(); D3D12_SHADER_RESOURCE_VIEW_DESC gradient_srv {}; gradient_srv.ViewDimension=D3D12_SRV_DIMENSION_BUFFER; gradient_srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; gradient_srv.Format=DXGI_FORMAT_UNKNOWN; gradient_srv.Buffer.NumElements=static_cast<UINT>(layout.sample_count); gradient_srv.Buffer.StructureByteStride=2*sizeof(float); device->CreateShaderResourceView(gradients_resource.Get(),&gradient_srv,descriptor); descriptor.ptr+=increment; D3D12_SHADER_RESOURCE_VIEW_DESC category_srv {}; category_srv.ViewDimension=D3D12_SRV_DIMENSION_BUFFER; category_srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING; category_srv.Format=DXGI_FORMAT_R32_UINT; category_srv.Buffer.NumElements=static_cast<UINT>(layout.sample_count); device->CreateShaderResourceView(categories_resource.Get(),&category_srv,descriptor); descriptor.ptr+=increment; D3D12_UNORDERED_ACCESS_VIEW_DESC accepted_uav {}; accepted_uav.ViewDimension=D3D12_UAV_DIMENSION_BUFFER; accepted_uav.Format=DXGI_FORMAT_R32_UINT; accepted_uav.Buffer.NumElements=static_cast<UINT>(layout.sample_count); device->CreateUnorderedAccessView(accepted_resource.Get(),nullptr,&accepted_uav,descriptor);
-    const uint32_t constants[]{static_cast<uint32_t>(layout.sample_count)}; ID3D12DescriptorHeap *heaps[]{descriptors.Get()}; list->SetDescriptorHeaps(1,heaps); list->SetComputeRootSignature(root_signature.Get()); list->SetComputeRoot32BitConstants(0,1,constants,0); list->SetComputeRoot32BitConstant(0,*reinterpret_cast<const uint32_t *>(&gradient_limits[0]),1); list->SetComputeRoot32BitConstant(0,*reinterpret_cast<const uint32_t *>(&gradient_limits[1]),2); list->SetComputeRootDescriptorTable(1,descriptors->GetGPUDescriptorHandleForHeapStart()); list->Dispatch(static_cast<UINT>((layout.sample_count+63)/64),1,1); D3D12_RESOURCE_BARRIER barrier {}; barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; barrier.Transition.pResource=accepted_resource.Get(); barrier.Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS; barrier.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE; barrier.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; list->ResourceBarrier(1,&barrier); list->CopyResource(readback.Get(),accepted_resource.Get()); if(FAILED(list->Close())) { write_error(error_buffer,error_buffer_size,"cannot close D3D12 exposure-pair filter command list"); return PANO_GPU_UNAVAILABLE; } ID3D12CommandList *lists[]{list.Get()}; session->device_core->queue->ExecuteCommandLists(1,lists); const uint64_t fence_value=session->device_core->next_fence_value.fetch_add(1,std::memory_order_relaxed)+1; if(FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(),fence_value))||wait_for_fence(session->device_core.get(),fence_value,error_buffer,error_buffer_size,"D3D12 exposure-pair filter fence timed out")!=PANO_GPU_SUCCESS)return PANO_GPU_UNAVAILABLE; const D3D12_RANGE range{0,static_cast<SIZE_T>(word_bytes)}; if(FAILED(readback->Map(0,&range,&mapped))) { write_error(error_buffer,error_buffer_size,"cannot map D3D12 exposure-pair filter readback"); return PANO_GPU_UNAVAILABLE; } const auto *const result_words=static_cast<const uint32_t *>(mapped); auto *const result_bytes=static_cast<uint8_t *>(accepted); for(uint64_t index=0;index<layout.sample_count;++index)result_bytes[index]=static_cast<uint8_t>(result_words[index]!=0); readback->Unmap(0,nullptr); return PANO_GPU_SUCCESS;
+    const uint32_t constants[]{static_cast<uint32_t>(layout.sample_count)}; ID3D12DescriptorHeap *heaps[]{descriptors.Get()}; list->SetDescriptorHeaps(1,heaps); list->SetComputeRootSignature(root_signature.Get()); list->SetComputeRoot32BitConstants(0,1,constants,0); list->SetComputeRoot32BitConstant(0,*reinterpret_cast<const uint32_t *>(&gradient_limits[0]),1); list->SetComputeRoot32BitConstant(0,*reinterpret_cast<const uint32_t *>(&gradient_limits[1]),2); list->SetComputeRootDescriptorTable(1,descriptors->GetGPUDescriptorHandleForHeapStart()); list->Dispatch(static_cast<UINT>((layout.sample_count+63)/64),1,1); D3D12_RESOURCE_BARRIER barrier {}; barrier.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; barrier.Transition.pResource=accepted_resource.Get(); barrier.Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS; barrier.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE; barrier.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; list->ResourceBarrier(1,&barrier); list->CopyResource(readback.Get(),accepted_resource.Get()); if(FAILED(list->Close())) { write_error(error_buffer,error_buffer_size,"cannot close D3D12 exposure-pair filter command list"); return PANO_GPU_UNAVAILABLE; } ID3D12CommandList *lists[]{list.Get()}; session->device_core->queue->ExecuteCommandLists(1,lists); const uint64_t fence_value=session->device_core->next_fence_value.fetch_add(1,std::memory_order_relaxed)+1; if(FAILED(signal_fence(session->device_core.get(), fence_value))||wait_for_fence(session->device_core.get(),fence_value,error_buffer,error_buffer_size,"D3D12 exposure-pair filter fence timed out")!=PANO_GPU_SUCCESS)return PANO_GPU_UNAVAILABLE; const D3D12_RANGE range{0,static_cast<SIZE_T>(word_bytes)}; if(FAILED(readback->Map(0,&range,&mapped))) { write_error(error_buffer,error_buffer_size,"cannot map D3D12 exposure-pair filter readback"); return PANO_GPU_UNAVAILABLE; } const auto *const result_words=static_cast<const uint32_t *>(mapped); auto *const result_bytes=static_cast<uint8_t *>(accepted); for(uint64_t index=0;index<layout.sample_count;++index)result_bytes[index]=static_cast<uint8_t>(result_words[index]!=0); readback->Unmap(0,nullptr); return PANO_GPU_SUCCESS;
 #endif
 }
 
@@ -12030,7 +12262,7 @@ pano_gpu_result pano_gpu_test_build_exposure_pair_ratios(
     list->ResourceBarrier(2,barriers); list->CopyResource(accepted_resource.Get(),accepted_upload.Get()); list->CopyResource(readback.Get(),ratio_resource.Get());
     if (FAILED(list->Close())) { write_error(error_buffer,error_buffer_size,"cannot close D3D12 exposure-pair ratio command list"); return PANO_GPU_UNAVAILABLE; }
     ID3D12CommandList *lists[]{list.Get()}; session->device_core->queue->ExecuteCommandLists(1,lists); const uint64_t fence_value=session->device_core->next_fence_value.fetch_add(1,std::memory_order_relaxed)+1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(),fence_value)) || wait_for_fence(session->device_core.get(),fence_value,error_buffer,error_buffer_size,"D3D12 exposure-pair ratio fence timed out")!=PANO_GPU_SUCCESS) return PANO_GPU_UNAVAILABLE;
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) || wait_for_fence(session->device_core.get(),fence_value,error_buffer,error_buffer_size,"D3D12 exposure-pair ratio fence timed out")!=PANO_GPU_SUCCESS) return PANO_GPU_UNAVAILABLE;
     const D3D12_RANGE range{0,static_cast<SIZE_T>(ratio_bytes)};
     if (FAILED(readback->Map(0,&range,&mapped))) { write_error(error_buffer,error_buffer_size,"cannot map D3D12 exposure-pair ratio readback"); return PANO_GPU_UNAVAILABLE; }
     std::memcpy(log_ratios,mapped,static_cast<size_t>(ratio_bytes)); readback->Unmap(0,nullptr);
@@ -12221,7 +12453,7 @@ pano_gpu_result pano_gpu_test_prepare_exposure_pair_sort(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) ||
         wait_for_fence(
             session->device_core.get(), fence_value, error_buffer, error_buffer_size,
             "D3D12 exposure-pair sort preparation fence timed out") != PANO_GPU_SUCCESS)
@@ -12379,7 +12611,7 @@ pano_gpu_result pano_gpu_test_sort_exposure_pair(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) ||
         wait_for_fence(
             session->device_core.get(), fence_value, error_buffer, error_buffer_size,
             "D3D12 exposure-pair sort fence timed out") != PANO_GPU_SUCCESS)
@@ -12553,7 +12785,7 @@ pano_gpu_result pano_gpu_test_extract_exposure_pair_trim_bounds(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) ||
         wait_for_fence(
             session->device_core.get(), fence_value, error_buffer, error_buffer_size,
             "D3D12 exposure-pair trim-bound fence timed out") != PANO_GPU_SUCCESS)
@@ -12738,7 +12970,7 @@ pano_gpu_result pano_gpu_test_trim_exposure_pair(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) ||
         wait_for_fence(
             session->device_core.get(), fence_value, error_buffer, error_buffer_size,
             "D3D12 exposure-pair trim fence timed out") != PANO_GPU_SUCCESS)
@@ -13018,7 +13250,7 @@ pano_gpu_result pano_gpu_test_reduce_exposure_pair(
     ID3D12CommandList *lists[] {list.Get()};
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value = session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) ||
         wait_for_fence(
             session->device_core.get(), fence_value, error_buffer, error_buffer_size,
             "D3D12 exposure-pair reduction fence timed out") != PANO_GPU_SUCCESS)
@@ -13110,7 +13342,7 @@ pano_gpu_result pano_gpu_test_dispatch_one_frame_equirect_local_exposure(
     D3D12_DESCRIPTOR_HEAP_DESC heap_desc {}; heap_desc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; heap_desc.NumDescriptors = 1; heap_desc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE; Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap; Microsoft::WRL::ComPtr<ID3D12CommandAllocator> allocator; Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list; if (FAILED(device->CreateDescriptorHeap(&heap_desc, IID_PPV_ARGS(&heap))) || FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator))) || FAILED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), pipeline.Get(), IID_PPV_ARGS(&list)))) { write_error(error_buffer, error_buffer_size, "cannot create D3D12 equirectangular local-exposure dispatch"); return PANO_GPU_UNAVAILABLE; }
     D3D12_UNORDERED_ACCESS_VIEW_DESC uav {}; uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER; uav.Format = DXGI_FORMAT_UNKNOWN; uav.Buffer.NumElements = static_cast<UINT>(field_pixels); uav.Buffer.StructureByteStride = sizeof(float); device->CreateUnorderedAccessView(output.Get(), nullptr, &uav, heap->GetCPUDescriptorHandleForHeapStart());
     uint32_t constants[36] {field_width, field_height, request->output_width, request->output_height, session->source_width, session->source_height}; std::memcpy(&constants[8], &request->latitude_span_degrees, sizeof(float)); std::memcpy(&constants[12], request->world_to_camera, 3 * sizeof(float)); std::memcpy(&constants[16], request->world_to_camera + 3, 3 * sizeof(float)); std::memcpy(&constants[20], request->world_to_camera + 6, 3 * sizeof(float)); const float camera[4] {static_cast<float>(session->source_width), static_cast<float>(session->source_height), session->source_width / (2.0F * std::tan(request->horizontal_fov_degrees * 0.00872664625997165F)), session->source_height / (2.0F * std::tan(request->vertical_fov_degrees * 0.00872664625997165F))}; std::memcpy(&constants[24], camera, sizeof(camera)); const float log_gain = std::log(global_gain); std::memcpy(&constants[28], &log_gain, sizeof(log_gain)); const float rectilinear_output = request->rectilinear_output != 0 ? 1.0F : 0.0F; std::memcpy(&constants[32], &rectilinear_output, sizeof(rectilinear_output)); std::memcpy(&constants[33], &request->output_vertical_fov_degrees, sizeof(request->output_vertical_fov_degrees)); ID3D12DescriptorHeap *heaps[] = {heap.Get()}; list->SetDescriptorHeaps(1, heaps); list->SetComputeRootSignature(root.Get()); list->SetComputeRoot32BitConstants(0, 36, constants, 0); list->SetComputeRootDescriptorTable(1, heap->GetGPUDescriptorHandleForHeapStart()); list->Dispatch((field_width + 7) / 8, (field_height + 7) / 8, 1);
-    D3D12_RESOURCE_BARRIER barrier {}; barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; barrier.Transition.pResource = output.Get(); barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE; barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; list->ResourceBarrier(1, &barrier); list->CopyResource(readback.Get(), output.Get()); if (FAILED(list->Close())) { write_error(error_buffer, error_buffer_size, "cannot close D3D12 equirectangular local-exposure dispatch"); return PANO_GPU_UNAVAILABLE; } ID3D12CommandList *lists[] = {list.Get()}; session->device_core->queue->ExecuteCommandLists(1, lists); const uint64_t fence = session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1; if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence)) || wait_for_fence(session->device_core.get(), fence, error_buffer, error_buffer_size, "D3D12 equirectangular local-exposure fence timed out") != PANO_GPU_SUCCESS) return PANO_GPU_UNAVAILABLE; const D3D12_RANGE range {0, static_cast<SIZE_T>(field_bytes)}; void *mapped = nullptr; if (FAILED(readback->Map(0, &range, &mapped))) { write_error(error_buffer, error_buffer_size, "cannot map D3D12 equirectangular local-exposure readback"); return PANO_GPU_UNAVAILABLE; } std::memcpy(local_field, mapped, static_cast<size_t>(field_bytes)); readback->Unmap(0, nullptr); return PANO_GPU_SUCCESS;
+    D3D12_RESOURCE_BARRIER barrier {}; barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; barrier.Transition.pResource = output.Get(); barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE; barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; list->ResourceBarrier(1, &barrier); list->CopyResource(readback.Get(), output.Get()); if (FAILED(list->Close())) { write_error(error_buffer, error_buffer_size, "cannot close D3D12 equirectangular local-exposure dispatch"); return PANO_GPU_UNAVAILABLE; } ID3D12CommandList *lists[] = {list.Get()}; session->device_core->queue->ExecuteCommandLists(1, lists); const uint64_t fence = session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1; if (FAILED(signal_fence(session->device_core.get(), fence)) || wait_for_fence(session->device_core.get(), fence, error_buffer, error_buffer_size, "D3D12 equirectangular local-exposure fence timed out") != PANO_GPU_SUCCESS) return PANO_GPU_UNAVAILABLE; const D3D12_RANGE range {0, static_cast<SIZE_T>(field_bytes)}; void *mapped = nullptr; if (FAILED(readback->Map(0, &range, &mapped))) { write_error(error_buffer, error_buffer_size, "cannot map D3D12 equirectangular local-exposure readback"); return PANO_GPU_UNAVAILABLE; } std::memcpy(local_field, mapped, static_cast<size_t>(field_bytes)); readback->Unmap(0, nullptr); return PANO_GPU_SUCCESS;
 #endif
 }
 
@@ -13339,7 +13571,7 @@ pano_gpu_result pano_gpu_test_dispatch_feather_weights(
     ID3D12CommandList *lists[] = {list.Get()};
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value = session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)))
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)))
     {
         write_error(error_buffer, error_buffer_size, "cannot signal D3D12 feather-weight fence");
         return PANO_GPU_UNAVAILABLE;
@@ -13591,7 +13823,7 @@ pano_gpu_result pano_gpu_test_dispatch_feather_accumulation(
     ID3D12CommandList *lists[] = {list.Get()};
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value = session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)))
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)))
     {
         write_error(error_buffer, error_buffer_size, "cannot signal D3D12 feather-accumulation fence");
         return PANO_GPU_UNAVAILABLE;
@@ -14021,7 +14253,7 @@ static pano_gpu_result dispatch_feather_accumulation_chain(
     ID3D12CommandList *lists[] = {list.Get()};
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value = session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)))
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)))
     {
         write_error(error_buffer, error_buffer_size, "cannot signal D3D12 two-frame feather fence");
         return PANO_GPU_UNAVAILABLE;
@@ -14307,7 +14539,7 @@ pano_gpu_result pano_gpu_test_dispatch_feather_normalize(
     ID3D12CommandList *lists[] = {list.Get()};
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value = session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)))
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)))
     {
         write_error(error_buffer, error_buffer_size, "cannot signal D3D12 feather-normalization fence");
         return PANO_GPU_UNAVAILABLE;
@@ -14384,7 +14616,7 @@ pano_gpu_result pano_gpu_test_dispatch_global_gain(
     uint32_t constants[] = {pixel_count, 0}; std::memcpy(&constants[1], &global_gain, sizeof(global_gain)); ID3D12DescriptorHeap *heaps[] = {heap.Get()}; list->SetDescriptorHeaps(1, heaps); list->SetComputeRootSignature(root.Get()); list->SetComputeRoot32BitConstants(0, 2, constants, 0); list->SetComputeRootDescriptorTable(1, heap->GetGPUDescriptorHandleForHeapStart()); list->Dispatch((pixel_count + 63) / 64, 1, 1);
     D3D12_RESOURCE_BARRIER barrier {}; barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION; barrier.Transition.pResource = output.Get(); barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_UNORDERED_ACCESS; barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE; barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES; list->ResourceBarrier(1, &barrier); list->CopyResource(readback.Get(), output.Get());
     if (FAILED(list->Close())) { write_error(error_buffer, error_buffer_size, "cannot close D3D12 global-gain command list"); return PANO_GPU_UNAVAILABLE; } ID3D12CommandList *lists[] = {list.Get()}; session->device_core->queue->ExecuteCommandLists(1, lists); const uint64_t fence = session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence))) { write_error(error_buffer, error_buffer_size, "cannot signal D3D12 global-gain fence"); return PANO_GPU_UNAVAILABLE; }
+    if (FAILED(signal_fence(session->device_core.get(), fence))) { write_error(error_buffer, error_buffer_size, "cannot signal D3D12 global-gain fence"); return PANO_GPU_UNAVAILABLE; }
     if (wait_for_fence(session->device_core.get(), fence, error_buffer, error_buffer_size, "D3D12 global-gain fence timed out") != PANO_GPU_SUCCESS) return PANO_GPU_UNAVAILABLE;
     const D3D12_RANGE range {0, static_cast<SIZE_T>(rgb_bytes)}; mapped = nullptr; if (FAILED(readback->Map(0, &range, &mapped))) { write_error(error_buffer, error_buffer_size, "cannot map D3D12 global-gain readback"); return PANO_GPU_UNAVAILABLE; } std::memcpy(adjusted_rgb, mapped, static_cast<size_t>(rgb_bytes)); readback->Unmap(0, nullptr); return PANO_GPU_SUCCESS;
 #endif
@@ -14414,7 +14646,7 @@ pano_gpu_result pano_gpu_test_dispatch_local_exposure(
     if (FAILED(device->CreateCommittedResource(&upload,D3D12_HEAP_FLAG_NONE,&rgb_desc,D3D12_RESOURCE_STATE_GENERIC_READ,nullptr,IID_PPV_ARGS(&rgb))) || FAILED(device->CreateCommittedResource(&upload,D3D12_HEAP_FLAG_NONE,&field_desc,D3D12_RESOURCE_STATE_GENERIC_READ,nullptr,IID_PPV_ARGS(&field))) || FAILED(device->CreateCommittedResource(&def,D3D12_HEAP_FLAG_NONE,&out_desc,D3D12_RESOURCE_STATE_UNORDERED_ACCESS,nullptr,IID_PPV_ARGS(&out))) || FAILED(device->CreateCommittedResource(&read,D3D12_HEAP_FLAG_NONE,&rgb_desc,D3D12_RESOURCE_STATE_COPY_DEST,nullptr,IID_PPV_ARGS(&back)))) { write_error(error_buffer,error_buffer_size,"cannot create D3D12 local-exposure resources"); return PANO_GPU_UNAVAILABLE; }
     void *mapped = nullptr; if (FAILED(rgb->Map(0,nullptr,&mapped))) return PANO_GPU_UNAVAILABLE; std::memcpy(mapped,candidate_rgb,static_cast<size_t>(rgb_bytes)); rgb->Unmap(0,nullptr); if (FAILED(field->Map(0,nullptr,&mapped))) return PANO_GPU_UNAVAILABLE; std::memcpy(mapped,local_field,static_cast<size_t>(expected_field_bytes)); field->Unmap(0,nullptr);
     D3D12_DESCRIPTOR_RANGE ranges[2] {{D3D12_DESCRIPTOR_RANGE_TYPE_SRV,2,0,0,0},{D3D12_DESCRIPTOR_RANGE_TYPE_UAV,1,0,0,2}}; D3D12_ROOT_PARAMETER p[2] {}; p[0].ParameterType=D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;p[0].Constants={0,0,8};p[1].ParameterType=D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;p[1].DescriptorTable={2,ranges};D3D12_ROOT_SIGNATURE_DESC rs {2,p,0,nullptr,D3D12_ROOT_SIGNATURE_FLAG_NONE};Microsoft::WRL::ComPtr<ID3DBlob> blob,errors;Microsoft::WRL::ComPtr<ID3D12RootSignature> root;Microsoft::WRL::ComPtr<ID3D12PipelineState> pipe;if(FAILED(D3D12SerializeRootSignature(&rs,D3D_ROOT_SIGNATURE_VERSION_1_0,&blob,&errors))||FAILED(device->CreateRootSignature(0,blob->GetBufferPointer(),blob->GetBufferSize(),IID_PPV_ARGS(&root))))return PANO_GPU_UNAVAILABLE;D3D12_COMPUTE_PIPELINE_STATE_DESC pd {};pd.pRootSignature=root.Get();pd.CS={pano_gpu_local_exposure_shader,sizeof(pano_gpu_local_exposure_shader)};if(FAILED(device->CreateComputePipelineState(&pd,IID_PPV_ARGS(&pipe))))return PANO_GPU_UNAVAILABLE;
-    D3D12_DESCRIPTOR_HEAP_DESC hd {};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;hd.NumDescriptors=3;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;Microsoft::WRL::ComPtr<ID3D12CommandAllocator> alloc;Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;if(FAILED(device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap)))||FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&alloc)))||FAILED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,alloc.Get(),pipe.Get(),IID_PPV_ARGS(&list))))return PANO_GPU_UNAVAILABLE;const UINT inc=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);auto h=heap->GetCPUDescriptorHandleForHeapStart();D3D12_SHADER_RESOURCE_VIEW_DESC srv {};srv.ViewDimension=D3D12_SRV_DIMENSION_BUFFER;srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;srv.Format=DXGI_FORMAT_UNKNOWN;srv.Buffer.NumElements=static_cast<UINT>(pixels);srv.Buffer.StructureByteStride=12;device->CreateShaderResourceView(rgb.Get(),&srv,h);h.ptr+=inc;srv.Buffer.NumElements=static_cast<UINT>(field_pixels);srv.Buffer.StructureByteStride=4;device->CreateShaderResourceView(field.Get(),&srv,h);h.ptr+=inc;D3D12_UNORDERED_ACCESS_VIEW_DESC u {};u.ViewDimension=D3D12_UAV_DIMENSION_BUFFER;u.Format=DXGI_FORMAT_UNKNOWN;u.Buffer.NumElements=static_cast<UINT>(pixels);u.Buffer.StructureByteStride=12;device->CreateUnorderedAccessView(out.Get(),nullptr,&u,h);uint32_t c[8]{output_width,output_height,row_start,row_count,field_width,field_height};ID3D12DescriptorHeap *hs[]{heap.Get()};list->SetDescriptorHeaps(1,hs);list->SetComputeRootSignature(root.Get());list->SetComputeRoot32BitConstants(0,8,c,0);list->SetComputeRootDescriptorTable(1,heap->GetGPUDescriptorHandleForHeapStart());list->Dispatch((static_cast<UINT>(pixels)+63)/64,1,1);D3D12_RESOURCE_BARRIER b {};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition.pResource=out.Get();b.Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;b.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;b.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;list->ResourceBarrier(1,&b);list->CopyResource(back.Get(),out.Get());if(FAILED(list->Close()))return PANO_GPU_UNAVAILABLE;ID3D12CommandList *ls[]{list.Get()};session->device_core->queue->ExecuteCommandLists(1,ls);const uint64_t f=session->device_core->next_fence_value.fetch_add(1,std::memory_order_relaxed)+1;if(FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(),f))||wait_for_fence(session->device_core.get(),f,error_buffer,error_buffer_size,"D3D12 local-exposure fence timed out")!=PANO_GPU_SUCCESS)return PANO_GPU_UNAVAILABLE;const D3D12_RANGE r{0,static_cast<SIZE_T>(rgb_bytes)};if(FAILED(back->Map(0,&r,&mapped)))return PANO_GPU_UNAVAILABLE;std::memcpy(adjusted_rgb,mapped,static_cast<size_t>(rgb_bytes));back->Unmap(0,nullptr);return PANO_GPU_SUCCESS;
+    D3D12_DESCRIPTOR_HEAP_DESC hd {};hd.Type=D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;hd.NumDescriptors=3;hd.Flags=D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;Microsoft::WRL::ComPtr<ID3D12DescriptorHeap> heap;Microsoft::WRL::ComPtr<ID3D12CommandAllocator> alloc;Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> list;if(FAILED(device->CreateDescriptorHeap(&hd,IID_PPV_ARGS(&heap)))||FAILED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,IID_PPV_ARGS(&alloc)))||FAILED(device->CreateCommandList(0,D3D12_COMMAND_LIST_TYPE_DIRECT,alloc.Get(),pipe.Get(),IID_PPV_ARGS(&list))))return PANO_GPU_UNAVAILABLE;const UINT inc=device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);auto h=heap->GetCPUDescriptorHandleForHeapStart();D3D12_SHADER_RESOURCE_VIEW_DESC srv {};srv.ViewDimension=D3D12_SRV_DIMENSION_BUFFER;srv.Shader4ComponentMapping=D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;srv.Format=DXGI_FORMAT_UNKNOWN;srv.Buffer.NumElements=static_cast<UINT>(pixels);srv.Buffer.StructureByteStride=12;device->CreateShaderResourceView(rgb.Get(),&srv,h);h.ptr+=inc;srv.Buffer.NumElements=static_cast<UINT>(field_pixels);srv.Buffer.StructureByteStride=4;device->CreateShaderResourceView(field.Get(),&srv,h);h.ptr+=inc;D3D12_UNORDERED_ACCESS_VIEW_DESC u {};u.ViewDimension=D3D12_UAV_DIMENSION_BUFFER;u.Format=DXGI_FORMAT_UNKNOWN;u.Buffer.NumElements=static_cast<UINT>(pixels);u.Buffer.StructureByteStride=12;device->CreateUnorderedAccessView(out.Get(),nullptr,&u,h);uint32_t c[8]{output_width,output_height,row_start,row_count,field_width,field_height};ID3D12DescriptorHeap *hs[]{heap.Get()};list->SetDescriptorHeaps(1,hs);list->SetComputeRootSignature(root.Get());list->SetComputeRoot32BitConstants(0,8,c,0);list->SetComputeRootDescriptorTable(1,heap->GetGPUDescriptorHandleForHeapStart());list->Dispatch((static_cast<UINT>(pixels)+63)/64,1,1);D3D12_RESOURCE_BARRIER b {};b.Type=D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;b.Transition.pResource=out.Get();b.Transition.StateBefore=D3D12_RESOURCE_STATE_UNORDERED_ACCESS;b.Transition.StateAfter=D3D12_RESOURCE_STATE_COPY_SOURCE;b.Transition.Subresource=D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;list->ResourceBarrier(1,&b);list->CopyResource(back.Get(),out.Get());if(FAILED(list->Close()))return PANO_GPU_UNAVAILABLE;ID3D12CommandList *ls[]{list.Get()};session->device_core->queue->ExecuteCommandLists(1,ls);const uint64_t f=session->device_core->next_fence_value.fetch_add(1,std::memory_order_relaxed)+1;if(FAILED(signal_fence(session->device_core.get(), f))||wait_for_fence(session->device_core.get(),f,error_buffer,error_buffer_size,"D3D12 local-exposure fence timed out")!=PANO_GPU_SUCCESS)return PANO_GPU_UNAVAILABLE;const D3D12_RANGE r{0,static_cast<SIZE_T>(rgb_bytes)};if(FAILED(back->Map(0,&r,&mapped)))return PANO_GPU_UNAVAILABLE;std::memcpy(adjusted_rgb,mapped,static_cast<size_t>(rgb_bytes));back->Unmap(0,nullptr);return PANO_GPU_SUCCESS;
 #endif
 }
 
@@ -14564,7 +14796,7 @@ pano_gpu_result pano_gpu_test_dispatch_mark_incomplete(
     ID3D12CommandList *lists[] = {list.Get()};
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence = session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence)) ||
         wait_for_fence(session->device_core.get(), fence, error_buffer, error_buffer_size,
                        "D3D12 incomplete-marking fence timed out") != PANO_GPU_SUCCESS)
         return PANO_GPU_UNAVAILABLE;
@@ -14826,7 +15058,7 @@ pano_gpu_result pano_gpu_test_dispatch_hard_selection(
     ID3D12CommandList *lists[] = {list.Get()};
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value = session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)))
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)))
     {
         write_error(error_buffer, error_buffer_size, "cannot signal D3D12 hard-selection fence");
         return PANO_GPU_UNAVAILABLE;
@@ -15188,7 +15420,7 @@ static pano_gpu_result dispatch_one_frame_typed_hard_selection(
     ID3D12CommandList *lists[] = {list.Get()};
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value = session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)) ||
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)) ||
         wait_for_fence(session->device_core.get(), fence_value, error_buffer, error_buffer_size,
                        "D3D12 typed hard-selection fence timed out") != PANO_GPU_SUCCESS)
     {
@@ -15512,7 +15744,7 @@ static pano_gpu_result dispatch_one_frame_typed_candidates(
     ID3D12CommandList *lists[] = {list.Get()};
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value = session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)))
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)))
     {
         write_error(error_buffer, error_buffer_size, "cannot signal D3D12 typed candidate fence");
         return PANO_GPU_UNAVAILABLE;
@@ -15860,7 +16092,7 @@ static pano_gpu_result sample_integer(
     ID3D12CommandList *lists[] = {list.Get()};
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value = session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)))
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)))
     {
         write_error(error_buffer, error_buffer_size, "cannot signal D3D12 uint8 sampling fence");
         return PANO_GPU_UNAVAILABLE;
@@ -16209,22 +16441,14 @@ pano_gpu_result pano_gpu_test_read_session_rotations(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)))
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)))
     {
         write_error(error_buffer, error_buffer_size, "cannot signal D3D12 rotation readback fence");
         return PANO_GPU_UNAVAILABLE;
     }
-    HANDLE event_handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (event_handle == nullptr ||
-        FAILED(session->device_core->fence->SetEventOnCompletion(fence_value, event_handle)) ||
-        WaitForSingleObject(event_handle, 10000) != WAIT_OBJECT_0)
-    {
-        if (event_handle != nullptr)
-            CloseHandle(event_handle);
-        write_error(error_buffer, error_buffer_size, "D3D12 rotation readback fence timed out");
+    if (wait_for_fence(session->device_core.get(), fence_value, error_buffer, error_buffer_size,
+                       "D3D12 rotation readback fence timed out") != PANO_GPU_SUCCESS)
         return PANO_GPU_UNAVAILABLE;
-    }
-    CloseHandle(event_handle);
     const D3D12_RANGE range {0, static_cast<SIZE_T>(rotation_bytes)};
     void *mapped = nullptr;
     if (FAILED(readback->Map(0, &range, &mapped)))
@@ -16294,22 +16518,14 @@ pano_gpu_result pano_gpu_test_read_session_encoding_metadata(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)))
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)))
     {
         write_error(error_buffer, error_buffer_size, "cannot signal D3D12 encoding metadata readback fence");
         return PANO_GPU_UNAVAILABLE;
     }
-    HANDLE event_handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (event_handle == nullptr ||
-        FAILED(session->device_core->fence->SetEventOnCompletion(fence_value, event_handle)) ||
-        WaitForSingleObject(event_handle, 10000) != WAIT_OBJECT_0)
-    {
-        if (event_handle != nullptr)
-            CloseHandle(event_handle);
-        write_error(error_buffer, error_buffer_size, "D3D12 encoding metadata readback fence timed out");
+    if (wait_for_fence(session->device_core.get(), fence_value, error_buffer, error_buffer_size,
+                       "D3D12 encoding metadata readback fence timed out") != PANO_GPU_SUCCESS)
         return PANO_GPU_UNAVAILABLE;
-    }
-    CloseHandle(event_handle);
     const D3D12_RANGE range {0, static_cast<SIZE_T>(encoding_metadata_bytes)};
     void *mapped = nullptr;
     if (FAILED(readback->Map(0, &range, &mapped)))
@@ -16377,22 +16593,14 @@ pano_gpu_result pano_gpu_test_read_session_frame(
     session->device_core->queue->ExecuteCommandLists(1, lists);
     const uint64_t fence_value =
         session->device_core->next_fence_value.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (FAILED(session->device_core->queue->Signal(session->device_core->fence.Get(), fence_value)))
+    if (FAILED(signal_fence(session->device_core.get(), fence_value)))
     {
         write_error(error_buffer, error_buffer_size, "cannot signal D3D12 source readback fence");
         return PANO_GPU_UNAVAILABLE;
     }
-    HANDLE event_handle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (event_handle == nullptr ||
-        FAILED(session->device_core->fence->SetEventOnCompletion(fence_value, event_handle)) ||
-        WaitForSingleObject(event_handle, 10000) != WAIT_OBJECT_0)
-    {
-        if (event_handle != nullptr)
-            CloseHandle(event_handle);
-        write_error(error_buffer, error_buffer_size, "D3D12 source readback fence timed out");
+    if (wait_for_fence(session->device_core.get(), fence_value, error_buffer, error_buffer_size,
+                       "D3D12 source readback fence timed out") != PANO_GPU_SUCCESS)
         return PANO_GPU_UNAVAILABLE;
-    }
-    CloseHandle(event_handle);
     const D3D12_RANGE range {0, static_cast<SIZE_T>(data_bytes)};
     void *mapped = nullptr;
     if (FAILED(readback->Map(0, &range, &mapped)))
