@@ -1,4 +1,4 @@
-local MOD_VERSION = "1.1.6"
+local MOD_VERSION = "1.1.7"
 local DEVELOPMENT_MODE = false
 
 local function log(message)
@@ -370,6 +370,31 @@ local function refreshBridgeCaptureRange()
     else
         bridgeCaptureRange = "unknown"
     end
+end
+
+local freezeStatePath
+local function requestFreeze(action, id)
+    if action == "release" then
+        if not freezeStatePath then return true end
+        local removed = os.remove(freezeStatePath)
+        if removed then freezeStatePath = nil end
+        return removed
+    end
+    local launch = io.open(bridgeFile("freeze.launch"), "rb")
+    local token = launch and launch:read("*l")
+    if launch then launch:close() end
+    if not token or not token:match("^%d+%-%d+$") then return false end
+    local path = bridgeFile("freeze.state." .. token)
+    local temp = path .. ".tmp"
+    local output = io.open(temp, "wb")
+    if not output then return false end
+    local written = output:write(id, "\n")
+    local closed = output:close()
+    if not written or not closed then return false end
+    os.remove(path)
+    if not os.rename(temp, path) then return false end
+    freezeStatePath = path
+    return true
 end
 
 local function writeBridgeRequest(sessionId, poseIndex, token)
@@ -1262,6 +1287,9 @@ local function applyEnvironmentControls(environment)
 end
 
 local function restoreEnvironmentControls(environment)
+    if productionSession and not requestFreeze("release", productionSession.sessionId) then
+        log("Could not remove the animation freeze state file.")
+    end
     hudRehideFrames = 0
     restoreInputRestrictions(environment)
     restoreCaptureMeshes(environment)
@@ -1567,7 +1595,13 @@ local function beginProductionCapture(environment)
         referencePosition = nil,
         spawnElapsed = 0.0,
     }
-    environment.state = "camera_spawn_pending"
+    os.remove(bridgeFile("freeze.ack"))
+    environment.freezeWait = 0
+    environment.state = "freeze_pending"
+    if not requestFreeze("hold", sessionId) then
+        environment.abortReason = "cannot publish animation freeze request"
+        environment.restoreRequested = true
+    end
     local exposureMode = environment.instantAutoExposureTarget and "instant" or "normal"
     log(
         string.format(
@@ -1803,6 +1837,13 @@ local function abortEnvironment(reason, suppressNotification)
 end
 
 local function requestProductionScreenshot()
+    local ack = io.open(bridgeFile("freeze.ack"), "rb")
+    local line = ack and ack:read("*l")
+    if ack then ack:close() end
+    if not productionSession or line ~= productionSession.sessionId .. "\theld" then
+        requestEnvironmentRestore("animation freeze acknowledgement lost")
+        return
+    end
     if productionSession == nil or environmentSequence == nil then
         return
     end
@@ -1898,6 +1939,20 @@ registerForEvent("onUpdate", function(deltaTime)
         local currentPlayer = Game.GetPlayer()
         if currentPlayer == nil or entityHash(currentPlayer) ~= environmentSequence.playerHash then
             abortEnvironment("player changed or became unavailable during session transition")
+            return
+        end
+        if environmentSequence.state == "freeze_pending" and not environmentSequence.restoreRequested then
+            environmentSequence.freezeWait = environmentSequence.freezeWait + (deltaTime or 0)
+            local f = io.open(bridgeFile("freeze.ack"), "rb")
+            local line = f and f:read("*l")
+            if f then f:close() end
+            local id, status
+            if line then id, status = line:match("^([^\t]+)\t([^\r]+)") end
+            if id == productionSession.sessionId and status == "held" then
+                environmentSequence.state = "camera_spawn_pending"
+            elseif id == productionSession.sessionId or environmentSequence.freezeWait > 10 then
+                abortEnvironment("animation freeze " .. (status or "timed out"))
+            end
             return
         end
         if environmentSequence.state == "camera_spawn_pending" then

@@ -157,6 +157,7 @@ if ($AddonPath) {
     $cetDestination = Join-Path $modStage "bin\x64\plugins\cyber_engine_tweaks\mods\PanoramaCaptureProbe"
     $reshadeDestination = Join-Path $modStage "bin\x64"
     New-Item -ItemType Directory -Force -Path $cetDestination, $reshadeDestination | Out-Null
+    Copy-Item (Join-Path $projectRoot "reshade-addon/deps/MinHook-LICENSE.txt") $modStage
     Copy-Item $cetSource $cetDestination
     Copy-Item $addon (Join-Path $reshadeDestination "PanoramaCaptureReShade.addon64")
     Copy-Item (Join-Path $projectRoot "README.md") (Join-Path $cetDestination "README.md")

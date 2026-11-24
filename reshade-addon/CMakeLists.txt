@@ -14,7 +14,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-add_library(PanoramaCaptureReShade SHARED src/addon.cpp)
+include(FetchContent)
+FetchContent_Declare(minhook GIT_REPOSITORY https://github.com/TsudaKageyu/minhook.git
+  GIT_TAG c3fcafdc10146beb5919319d0683e44e3c30d537)
+FetchContent_MakeAvailable(minhook)
+add_library(PanoramaCaptureReShade SHARED src/addon.cpp src/freeze.cpp)
+target_link_libraries(PanoramaCaptureReShade PRIVATE minhook)
 target_include_directories(PanoramaCaptureReShade PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}/deps/reshade-api")
 target_compile_definitions(PanoramaCaptureReShade PRIVATE

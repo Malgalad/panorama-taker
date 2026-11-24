@@ -11,7 +11,7 @@ on:
         description: "Version to package; must match stitcher/native/VERSION (without v)"
         required: true
         type: string
-        default: "1.1.6"
+        default: "1.1.7"
       publish:
         description: "Publish archives to the matching GitHub Release"
         required: true
@@ -83,6 +83,7 @@ jobs:
           $required = [ordered]@{
             cet = $cet
             reshade_addon = $addon
+            minhook_notice = Join-Path $verify "mod/MinHook-LICENSE.txt"
             stitcher = $stitcher
             d3d12_backend = $nativeDll
           }

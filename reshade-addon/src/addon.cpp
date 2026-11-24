@@ -12,6 +12,8 @@
 #include <string>
 #include <thread>
 
+namespace freeze { bool install(); void set(bool); bool ready(); unsigned long matches(); }
+
 #ifndef PANORAMA_ADDON_TEST_KEY
 #define PANORAMA_ADDON_TEST_KEY 0x79 // F10
 #endif
@@ -147,8 +149,74 @@ void write_capture_range_status(reshade::api::color_space color_space)
         log_error("PanoramaCaptureReShade: cannot publish bridge status file");
 }
 
+std::filesystem::path freeze_path(const char *suffix)
+{
+    return g_bridge_request_path.parent_path() / (std::string("PanoramaCaptureBridge.freeze.") + suffix);
+}
+
+std::filesystem::path publish_freeze_launch()
+{
+    FILETIME created{}, exited{}, kernel{}, user{};
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user))
+        return {};
+    ULARGE_INTEGER timestamp{};
+    timestamp.LowPart = created.dwLowDateTime;
+    timestamp.HighPart = created.dwHighDateTime;
+    const auto token = std::to_string(GetCurrentProcessId()) + "-" + std::to_string(timestamp.QuadPart);
+    const auto temporary = freeze_path("launch.tmp");
+    std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
+    output << token << '\n';
+    output.close();
+    if (!output || !MoveFileExW(temporary.c_str(), freeze_path("launch").c_str(), MOVEFILE_REPLACE_EXISTING))
+        return {};
+    return freeze_path(("state." + token).c_str());
+}
+
+void poll_freeze(const std::filesystem::path &state, std::string &owner, bool &published)
+{
+    if (state.empty()) return;
+    std::string desired;
+    // Allow CET to unlink the state while this poll has it open.
+    HANDLE file = CreateFileW(state.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE |
+        FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        char bytes[80];
+        DWORD count{};
+        const bool read = ReadFile(file, bytes, sizeof(bytes), &count, nullptr) != FALSE;
+        CloseHandle(file);
+        if (!read || count < 2 || count == sizeof(bytes) || bytes[count - 1] != '\n') return;
+        desired.assign(bytes, count - 1);
+        if (desired.find_first_not_of("0123456789-") != std::string::npos) return;
+    }
+    else if (GetLastError() != ERROR_FILE_NOT_FOUND) return;
+
+    if (desired != owner)
+    {
+        if (!owner.empty())
+        {
+            log_info(("PanoramaCapture freeze released; matching ink jobs " + std::to_string(freeze::matches())).c_str());
+            freeze::set(false);
+        }
+        owner = desired;
+        published = false;
+        if (!owner.empty() && freeze::install()) freeze::set(true);
+    }
+    if (!owner.empty() && !published && (freeze::ready() || !freeze::install()))
+    {
+        std::ofstream ack(freeze_path("ack.tmp"), std::ios::binary | std::ios::trunc);
+        ack << owner << '\t' << (freeze::ready() ? "held" : "unsupported") << '\n';
+        ack.close();
+        if (ack && MoveFileExW(freeze_path("ack.tmp").c_str(), freeze_path("ack").c_str(), MOVEFILE_REPLACE_EXISTING))
+            published = true;
+    }
+}
+
 void bridge_worker_loop()
 {
+    const auto freeze_state = publish_freeze_launch();
+    std::string freeze_owner;
+    bool freeze_published = false;
     bool poll_error_reported = false;
     while (true)
     {
@@ -163,6 +231,7 @@ void bridge_worker_loop()
             completion = std::move(g_completion);
             g_completion.reset();
         }
+        poll_freeze(freeze_state, freeze_owner, freeze_published);
         if (completion.has_value())
             write_ack(*completion);
 
@@ -356,6 +425,7 @@ extern "C" __declspec(dllexport) bool AddonInit(HMODULE, HMODULE)
 extern "C" __declspec(dllexport) void AddonUninit(HMODULE, HMODULE)
 {
     stop_bridge_worker(true);
+    freeze::set(false);
 }
 
 BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
