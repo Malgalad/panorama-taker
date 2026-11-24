@@ -375,24 +375,38 @@ end
 local freezeStatePath
 local function requestFreeze(action, id)
     if action == "release" then
-        if not freezeStatePath then return true end
+        if not freezeStatePath then
+            return true
+        end
         local removed = os.remove(freezeStatePath)
-        if removed then freezeStatePath = nil end
+        if removed then
+            freezeStatePath = nil
+        end
         return removed
     end
     local launch = io.open(bridgeFile("freeze.launch"), "rb")
     local token = launch and launch:read("*l")
-    if launch then launch:close() end
-    if not token or not token:match("^%d+%-%d+$") then return false end
+    if launch then
+        launch:close()
+    end
+    if not token or not token:match("^%d+%-%d+$") then
+        return false
+    end
     local path = bridgeFile("freeze.state." .. token)
     local temp = path .. ".tmp"
     local output = io.open(temp, "wb")
-    if not output then return false end
+    if not output then
+        return false
+    end
     local written = output:write(id, "\n")
     local closed = output:close()
-    if not written or not closed then return false end
+    if not written or not closed then
+        return false
+    end
     os.remove(path)
-    if not os.rename(temp, path) then return false end
+    if not os.rename(temp, path) then
+        return false
+    end
     freezeStatePath = path
     return true
 end
@@ -1839,7 +1853,9 @@ end
 local function requestProductionScreenshot()
     local ack = io.open(bridgeFile("freeze.ack"), "rb")
     local line = ack and ack:read("*l")
-    if ack then ack:close() end
+    if ack then
+        ack:close()
+    end
     if not productionSession or line ~= productionSession.sessionId .. "\theld" then
         requestEnvironmentRestore("animation freeze acknowledgement lost")
         return
@@ -1945,9 +1961,13 @@ registerForEvent("onUpdate", function(deltaTime)
             environmentSequence.freezeWait = environmentSequence.freezeWait + (deltaTime or 0)
             local f = io.open(bridgeFile("freeze.ack"), "rb")
             local line = f and f:read("*l")
-            if f then f:close() end
+            if f then
+                f:close()
+            end
             local id, status
-            if line then id, status = line:match("^([^\t]+)\t([^\r]+)") end
+            if line then
+                id, status = line:match("^([^\t]+)\t([^\r]+)")
+            end
             if id == productionSession.sessionId and status == "held" then
                 environmentSequence.state = "camera_spawn_pending"
             elseif id == productionSession.sessionId or environmentSequence.freezeWait > 10 then
